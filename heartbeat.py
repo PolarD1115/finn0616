@@ -110,8 +110,10 @@ async def _perform_deep_dreaming():
         now_bj = _get_now_bj()
         yesterday = (now_bj - datetime.timedelta(days=1)).date()
         # 精确范围：[昨天0点, 今天0点)，避免拉到今天的数据
-        iso_start = f"{yesterday.isoformat()} 00:00:00"
-        iso_end = f"{now_bj.date().isoformat()} 00:00:00"
+        # ⚠️ created_at 是 timestamptz 列：查询字符串必须带时区(+08:00)，
+        # 否则无时区字符串会被按会话时区(UTC)解释，导致日记日期错 8 小时。
+        iso_start = f"{yesterday.isoformat()}T00:00:00+08:00"
+        iso_end = f"{now_bj.date().isoformat()}T00:00:00+08:00"
 
         # 拉取昨日全部记忆（流水 + 已归档总结）
         def _fetch_yesterday():
@@ -163,7 +165,7 @@ async def _perform_deep_dreaming():
         # 清理 2 天前的低重要度记录（防止流水单调累积）
         try:
             def _clean_old():
-                del_time = (now_bj - datetime.timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+                del_time = (now_bj - datetime.timedelta(days=2)).isoformat() + "+08:00"
                 supabase.table("memories").delete().lt("importance", 4).lt("created_at", del_time).execute()
             await asyncio.to_thread(_clean_old)
         except Exception as e:
@@ -174,7 +176,7 @@ async def _perform_deep_dreaming():
         # 1. 周度总结 (每周日触发)
         if now_bj.weekday() == 6:
             try:
-                week_ago = (now_bj - datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+                week_ago = (now_bj - datetime.timedelta(days=7)).isoformat() + "+08:00"
                 week_res = await asyncio.to_thread(
                     lambda: supabase.table("memories").select("id, content").eq("tags", "Core_Cognition").gt("created_at", week_ago).execute()
                 )
@@ -199,7 +201,7 @@ async def _perform_deep_dreaming():
         tomorrow = now_bj + datetime.timedelta(days=1)
         if tomorrow.day == 1:
             try:
-                month_ago = (now_bj - datetime.timedelta(days=32)).strftime("%Y-%m-%d %H:%M:%S")
+                month_ago = (now_bj - datetime.timedelta(days=32)).isoformat() + "+08:00"
                 month_res = await asyncio.to_thread(
                     lambda: supabase.table("memories").select("id, content").eq("tags", "Core_Cognition_Weekly").gt("created_at", month_ago).execute()
                 )
@@ -226,7 +228,7 @@ async def _perform_deep_dreaming():
         # 3. 年度总结 (每年 12 月 31 日触发)
         if now_bj.month == 12 and now_bj.day == 31:
             try:
-                year_ago = (now_bj - datetime.timedelta(days=366)).strftime("%Y-%m-%d %H:%M:%S")
+                year_ago = (now_bj - datetime.timedelta(days=366)).isoformat() + "+08:00"
                 year_res = await asyncio.to_thread(
                     lambda: supabase.table("memories").select("id, content").eq("tags", "Core_Cognition_Monthly").gt("created_at", year_ago).execute()
                 )

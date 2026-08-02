@@ -300,7 +300,10 @@ def _save_memory_to_db(title: str, content: str, category: str = "流水", mood:
             "mood": mood,
             "tags": tags,
             "importance": importance,
-            "created_at": _get_now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+            # ⚠️ created_at 是 timestamptz 列：必须写"显式带时区"的 ISO 字符串，
+            # 否则无时区字符串会被 Postgres 按会话时区(UTC)解释导致 8 小时错位。
+            # 统一写 UTC 时刻，与旧网关数据 (2026-08-02T13:52:24+00:00) 完全兼容。
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         supabase.table("memories").insert(data).execute()
     except Exception as e:
@@ -980,7 +983,7 @@ async def manage_memory_house(action: str, room: str = "", activity: str = "", c
             "action_type": activity,
             "content": content or "",
             "is_locked": False,
-            "created_at": _get_now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),  # timestamptz 列，显式带时区
         }
         await asyncio.to_thread(lambda: supabase.table("memory_house").insert(data).execute())
         return f"✅ AI 在【{room}】开始{activity}了。"

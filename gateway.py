@@ -465,7 +465,9 @@ class HostFixMiddleware:
         user_name = os.environ.get("USER_NAME", "用户")
         user_id = os.environ.get("USER_ID", "default")
         chat_tag = os.environ.get("CHAT_TAG", "Web_Chat")
-        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        # ⚠️ timestamptz 列必须写显式带时区 ISO，否则无时区字符串按会话时区(UTC)解释
+        # 统一写 UTC 时刻，与旧网关数据兼容
+        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         final_save_text = ai_msg
         if reasoning:
