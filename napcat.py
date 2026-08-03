@@ -255,7 +255,7 @@ async def _send_disconnect_notification():
 # ==========================================
 
 async def _process_napcat_message(data: dict, send):
-    """处理一条收到的 QQ 消息。"""
+    """处理一条收到的 QQ 消息：解析 + 喂入聚合器（连发多条会合并再回）。"""
     try:
         post_type = data.get("post_type")
         if post_type != "message":
@@ -284,27 +284,55 @@ async def _process_napcat_message(data: dict, send):
         if not clean_text:
             return
 
-        # 调用 LLM 生成回复
+        target_id = data.get("group_id") if message_type == "group" else sender_id
+        # 聚合 key：同一会话(群/私聊对象)合并；带上处理所需的元信息
+        agg = _get_qq_aggregator(send)
+        await agg.feed(
+            target_id,
+            clean_text,
+            meta={
+                "message_type": message_type,
+                "target_id": target_id,
+                "sender_nick": sender.get("nickname", "未知"),
+            },
+        )
+    except Exception as e:
+        _naplog(f"❌ 处理 QQ 消息失败: {e}")
+
+
+# ── QQ 消息聚合器（单例，绑定当前 send 通道） ──
+_qq_aggregator = None
+
+
+def _get_qq_aggregator(send):
+    """取/建 QQ 聚合器单例。handler 里真正调 LLM 并回复。"""
+    global _qq_aggregator
+    from aggregator import get_aggregator
+
+    async def _handle_merged(session_key, text, items):
+        meta = items[-1][1] if items else {}
+        message_type = meta.get("message_type", "private")
+        target_id = meta.get("target_id", session_key)
+        sender_nick = meta.get("sender_nick", "未知")
+        is_group = (message_type == "group")
+
+        if len(items) > 1:
+            _naplog(f"聚合触发 QQ target={target_id} 合并{len(items)}条 → 共{len(text)}字")
+
         dep = _get_deps()
         if not dep:
             return
 
         client = dep._get_llm_client("main_chat")
         if not client:
-            await send_qq_message(
-                group_id if message_type == "group" else sender_id,
-                "（AI 服务暂未配置，无法回复）",
-                is_group=(message_type == "group")
-            )
+            await send_qq_message(target_id, "（AI 服务暂未配置，无法回复）", is_group=is_group)
             return
 
-        # 构造 prompt（🧠 注入记忆/画像/设备等完整上下文，与网页渠道对齐）
-        target_id = group_id if message_type == "group" else sender_id
         try:
-            system_ctx = await dep._build_channel_context(clean_text, channel_tag="QQ_MSG")
+            system_ctx = await dep._build_channel_context(text, channel_tag="QQ_MSG")
             prompt = f"""
-            收到一条 QQ 消息: {clean_text}
-            发送者: {sender.get('nickname', '未知')}
+            收到一条 QQ 消息: {text}
+            发送者: {sender_nick}
 
             请用符合人设的口吻回复。纯文本，简洁自然。
             """
@@ -314,33 +342,34 @@ async def _process_napcat_message(data: dict, send):
             reply = ""
 
         if not reply:
-            # LLM 失败/空回复：兜底回一句 + 记录入库，不再静默吞消息
             await send_qq_message(target_id, "（刚才信号不太好，好像没接住你的话……再说一遍好不好？）",
-                                  is_group=(message_type == "group"))
+                                  is_group=is_group)
             if hasattr(dep, "_save_memory_to_db"):
                 await asyncio.to_thread(
                     dep._save_memory_to_db,
                     "⚠️ QQ 未回复",
-                    f"{sender.get('nickname', '未知')}: {clean_text}\n[LLM 未返回内容，已兜底]",
+                    f"{sender_nick}: {text}\n[LLM 未返回内容，已兜底]",
                     "流水", "平静", "QQ_MSG"
                 )
             return
 
-        await send_qq_message(target_id, reply, is_group=(message_type == "group"))
+        await send_qq_message(target_id, reply, is_group=is_group)
 
         # 记忆入库
         if hasattr(dep, "_save_memory_to_db"):
             await asyncio.to_thread(
                 dep._save_memory_to_db,
                 "🤖 QQ 互动",
-                f"{sender.get('nickname', '未知')}: {clean_text}\n回复: {reply}",
+                f"{sender_nick}: {text}\n回复: {reply}",
                 "流水", "温柔", "QQ_MSG"
             )
 
         # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
         asyncio.create_task(check_and_summarize_all())
-    except Exception as e:
-        _naplog(f"❌ 处理 QQ 消息失败: {e}")
+
+    if _qq_aggregator is None:
+        _qq_aggregator = get_aggregator("QQ", _handle_merged)
+    return _qq_aggregator
 
 
 # ==========================================

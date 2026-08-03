@@ -399,6 +399,78 @@ async def async_telegram_polling():
     base_url = f"https://api.telegram.org/bot{token}"
     offset = 0
 
+    # ── 消息聚合 handler：用户停手后，把连发的多条合并成一轮再处理 ──
+    async def _handle_merged(chat_id, text, items):
+        """真正的"调 LLM + 回复 + 存记忆"逻辑；text 已是合并后的多条消息。"""
+        chat_label = _masked_chat_id(chat_id)
+        if len(items) > 1:
+            _tg_log(f"聚合触发 chat={chat_label} 合并{len(items)}条 → 共{len(text)}字")
+
+        client = _get_llm_client("main_chat")
+        if not client:
+            await asyncio.to_thread(
+                _send_message, base_url, chat_id, "（AI 服务暂未配置，暂时没法回话哦）", 10
+            )
+            saved = await asyncio.to_thread(
+                _save_memory_to_db, "⚠️ TG 未配置AI",
+                f"用户: {text}\n[未回复：AI 服务未配置]", "流水", "平静", "TG_MSG"
+            )
+            _tg_log(f"AI未配置 chat={chat_label} 兜底已发送 memories写入={'成功' if saved else '失败'}")
+            return
+
+        try:
+            system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
+            _tg_log(f"准备调用主模型 chat={chat_label} system上下文={len(system_ctx)}字")
+            prompt = f"""
+            用户发来消息: {text}
+
+            请用符合人设的口吻回复用户。纯文本，自然真诚。
+            Telegram 会把每个非空换行段落作为一个独立气泡发送，因此请用换行自然划分气泡。
+            只包含在中文括号（）或英文括号()内的动作描写不得作为独立段落；必须和紧随其后的台词写在同一段。若动作位于结尾，则与前一句写在同一段。
+            """
+            reply = await _ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
+        except Exception as e:
+            _tg_log(f"回复生成失败 chat={chat_label}: {e}")
+            reply = ""
+
+        if not reply:
+            await asyncio.to_thread(
+                _send_message, base_url, chat_id,
+                "（刚才信号不太好，好像没接住你的话……再说一遍给我听好不好？）", 10
+            )
+            saved = await asyncio.to_thread(
+                _save_memory_to_db, "⚠️ TG 未回复",
+                f"用户: {text}\n[LLM 未返回内容，已兜底]", "流水", "平静", "TG_MSG"
+            )
+            _tg_log(f"模型空回复 chat={chat_label} 兜底已发送 memories写入={'成功' if saved else '失败'}")
+            return
+
+        bubbles = await _send_bubbles(base_url, chat_id, reply, 15)
+        _tg_log(f"回复已发送 chat={chat_label} 回复字数={len(reply)} 气泡数={len(bubbles)}")
+
+        saved = await asyncio.to_thread(
+            _save_memory_to_db, "🤖 互动记录",
+            f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
+        )
+        _tg_log(f"memories写入={'成功' if saved else '失败'} chat={chat_label} tag=TG_MSG")
+
+        if pinecone_memory and pinecone_memory.index:
+            try:
+                def _add_mem():
+                    return pinecone_memory.add([
+                        {"role": "user", "content": text},
+                        {"role": "assistant", "content": reply}
+                    ], user_id=os.environ.get("MEM0_USER_ID", "default"))
+                vector_saved = await asyncio.to_thread(_add_mem)
+                _tg_log(f"Pinecone写入={'成功' if vector_saved else '失败'} chat={chat_label}")
+            except Exception as e:
+                _tg_log(f"Pinecone写入报错 chat={chat_label}: {e}")
+        else:
+            _tg_log(f"Pinecone未启用 chat={chat_label}")
+
+    from aggregator import get_aggregator
+    _tg_agg = get_aggregator("TG", _handle_merged)
+
     while True:
         try:
             def _get_updates():
@@ -427,7 +499,7 @@ async def async_telegram_polling():
                 chat_label = _masked_chat_id(chat_id)
                 _tg_log(f"收到消息 update_id={update.get('update_id')} chat={chat_label} 字数={len(text)}")
 
-                # 简单的指令拦截
+                # 简单的指令拦截（指令不进聚合，立即确认）
                 if text.startswith("/"):
                     await asyncio.to_thread(
                         _send_message, base_url, chat_id, "收到指令，正在处理...", 10
@@ -435,77 +507,8 @@ async def async_telegram_polling():
                     _tg_log(f"指令已确认 chat={chat_label}")
                     continue
 
-                # 调用 LLM 生成回复
-                client = _get_llm_client("main_chat")
-                if not client:
-                    # AI 服务未配置：也要有回音，避免"石沉大海"
-                    await asyncio.to_thread(
-                        _send_message, base_url, chat_id, "（AI 服务暂未配置，暂时没法回话哦）", 10
-                    )
-                    saved = await asyncio.to_thread(
-                        _save_memory_to_db, "⚠️ TG 未配置AI",
-                        f"用户: {text}\n[未回复：AI 服务未配置]", "流水", "平静", "TG_MSG"
-                    )
-                    _tg_log(f"AI未配置 chat={chat_label} 兜底已发送 memories写入={'成功' if saved else '失败'}")
-                    continue
-
-                try:
-                    # 注入记忆/画像/设备等完整上下文（与网页渠道对齐）
-                    system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
-                    _tg_log(f"准备调用主模型 chat={chat_label} system上下文={len(system_ctx)}字")
-
-                    prompt = f"""
-                    用户发来消息: {text}
-
-                    请用符合人设的口吻回复用户。纯文本，自然真诚。
-                    Telegram 会把每个非空换行段落作为一个独立气泡发送，因此请用换行自然划分气泡。
-                    只包含在中文括号（）或英文括号()内的动作描写不得作为独立段落；必须和紧随其后的台词写在同一段。若动作位于结尾，则与前一句写在同一段。
-                    """
-                    reply = await _ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
-                except Exception as e:
-                    _tg_log(f"回复生成失败 chat={chat_label}: {e}")
-                    reply = ""
-
-                if not reply:
-                    # LLM 失败/空回复：兜底回一句 + 记录入库，不再静默吞消息
-                    await asyncio.to_thread(
-                        _send_message, base_url, chat_id,
-                        "（刚才信号不太好，好像没接住你的话……再说一遍给我听好不好？）", 10
-                    )
-                    saved = await asyncio.to_thread(
-                        _save_memory_to_db, "⚠️ TG 未回复",
-                        f"用户: {text}\n[LLM 未返回内容，已兜底]", "流水", "平静", "TG_MSG"
-                    )
-                    _tg_log(f"模型空回复 chat={chat_label} 兜底已发送 memories写入={'成功' if saved else '失败'}")
-                    continue
-
-                # 按非空换行拆成多个气泡；纯动作段由拆分器并入相邻台词。
-                bubbles = await _send_bubbles(base_url, chat_id, reply, 15)
-                _tg_log(
-                    f"回复已发送 chat={chat_label} 回复字数={len(reply)} "
-                    f"气泡数={len(bubbles)}"
-                )
-
-                saved = await asyncio.to_thread(
-                    _save_memory_to_db, "🤖 互动记录",
-                    f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
-                )
-                _tg_log(f"memories写入={'成功' if saved else '失败'} chat={chat_label} tag=TG_MSG")
-
-                # 写入 Pinecone 长期记忆
-                if pinecone_memory and pinecone_memory.index:
-                    try:
-                        def _add_mem():
-                            return pinecone_memory.add([
-                                {"role": "user", "content": text},
-                                {"role": "assistant", "content": reply}
-                            ], user_id=os.environ.get("MEM0_USER_ID", "default"))
-                        vector_saved = await asyncio.to_thread(_add_mem)
-                        _tg_log(f"Pinecone写入={'成功' if vector_saved else '失败'} chat={chat_label}")
-                    except Exception as e:
-                        _tg_log(f"Pinecone写入报错 chat={chat_label}: {e}")
-                else:
-                    _tg_log(f"Pinecone未启用 chat={chat_label}")
+                # 喂入聚合器：用户停手后由 _handle_merged 统一处理（连发多条会合并）
+                await _tg_agg.feed(chat_id, text)
         except Exception as e:
             _tg_log(f"轮询错误: {e}")
             await asyncio.sleep(5)
