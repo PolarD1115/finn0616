@@ -1469,7 +1469,7 @@ async def cover_existing_song(song_url: str):
 # ==========================================
 
 from gateway import HostFixMiddleware
-from heartbeat import start_autonomous_life
+from heartbeat import start_message_process_bg, start_autonomous_life
 
 
 def _print_config_report():
@@ -1514,8 +1514,19 @@ def _print_config_report():
 
 if __name__ == "__main__":
     _print_config_report()
-    # 启动后台心跳协程
-    start_autonomous_life()
+
+    # ── 进程角色判定 ──────────────────────────────────────────────
+    # GATEWAY_ROLE=message  → 由 run.py 拉起的「进程 A · 消息进程」，只跑实时收发，
+    #                          后台任务交给独立的 background.py (进程 B)。
+    # 未设置 (直接 python server.py) → 单进程模式，A+B 全跑，便于本地调试。
+    _role = os.environ.get("GATEWAY_ROLE", "").strip().lower()
+    if _role == "message":
+        start_message_process_bg()   # 仅 TG 实时轮询 (+ QQ 由 WS 端点被动处理)
+        print("🟢 [进程A · 消息进程] 已启动 (后台任务由 background.py 独立运行)")
+    else:
+        start_autonomous_life()       # 单进程兼容模式：A+B 全部任务
+        print("🟡 [单进程模式] 已启动 (生产建议用 python run.py 走双进程)")
+
     port = int(os.environ.get("PORT", 10000))
 
     # 🛡️ 获取可挂载的 MCP HTTP app（v1 用 sse_app；若未来 v1 内更名则自动切换）

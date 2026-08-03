@@ -814,28 +814,77 @@ async def async_env_sync():
 # 8. 启动入口
 # ==========================================
 
-def start_autonomous_life():
-    """启动所有后台心跳线程 (daemon 模式，主进程退出时自动结束)。"""
-    def _run_heartbeat(): asyncio.run(async_autonomous_life())
-    def _run_diary(): asyncio.run(async_diary_worker())
+# ==========================================
+# 启动入口 (双进程架构)
+# ==========================================
+# 说明：
+#   进程 A (消息进程 / server.py)：只负责"活人在等着"的实时场景。
+#       -> start_message_process_bg()  只拉起 TG 轮询 (实时收消息)
+#   进程 B (后台进程 / background.py)：负责所有"没人催"的自主任务。
+#       -> run_background_process()     跑主动思考/日记/总结/提醒/日程/邮件/热同步
+#
+#   两个进程通过 run.py 统一拉起，只通过数据库共享状态，各自独立事件循环/内存。
+#   保留 start_autonomous_life() 作为「单进程模式」兼容入口 (直接 python server.py 时全跑)。
+
+
+def start_message_process_bg():
+    """进程 A (消息进程) 的后台线程：仅启动 Telegram 实时轮询。
+
+    QQ (NapCat 反向 WS) 由 gateway/napcat 在主事件循环里处理，无需在此起线程。
+    """
     def _run_tg_polling(): asyncio.run(async_telegram_polling())
-    def _run_msg_sum(): asyncio.run(async_message_summarizer())
-    def _run_reminders(): asyncio.run(async_reminder_worker())
-    def _run_email(): asyncio.run(async_email_secretary())
-    def _run_env_sync(): asyncio.run(async_env_sync())
-    def _run_schedule(): asyncio.run(async_schedule_secretary())
 
-    threading.Thread(target=_run_env_sync, daemon=True).start()
-    threading.Thread(target=_run_heartbeat, daemon=True).start()
-    threading.Thread(target=_run_diary, daemon=True).start()
-    threading.Thread(target=_run_tg_polling, daemon=True).start()
-    threading.Thread(target=_run_msg_sum, daemon=True).start()
-    threading.Thread(target=_run_reminders, daemon=True).start()
-    threading.Thread(target=_run_schedule, daemon=True).start()
-
-    # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)
-    # 如需启用，取消下一行注释
-    # threading.Thread(target=_run_email, daemon=True).start()
+    if os.environ.get("TG_BOT_TOKEN", "").strip():
+        threading.Thread(target=_run_tg_polling, daemon=True).start()
+        print("📨 [进程A] Telegram 实时轮询已启动")
+    else:
+        print("📨 [进程A] 未配置 TG_BOT_TOKEN，跳过 Telegram 轮询")
 
     print("🐱 NapCat QQ 端点已就绪 (被动模式)，等待本地 NapCat 通过反向 WS 连接...")
+
+
+async def run_background_process():
+    """进程 B (后台进程) 主协程：把所有自主/定时任务跑在同一个事件循环里。
+
+    与旧版 daemon 线程 + asyncio.run 不同，这里用 asyncio.gather 统一调度，
+    任一任务异常退出会向上抛，交给 run.py 感知并整体重启 (不留半残状态)。
+    """
+    tasks = [
+        asyncio.create_task(async_env_sync(),           name="env_sync"),
+        asyncio.create_task(async_autonomous_life(),    name="autonomous_life"),
+        asyncio.create_task(async_diary_worker(),       name="diary"),
+        asyncio.create_task(async_message_summarizer(), name="msg_summarizer"),
+        asyncio.create_task(async_reminder_worker(),    name="reminder"),
+        asyncio.create_task(async_schedule_secretary(), name="schedule"),
+    ]
+
+    # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)；配了才启用
+    if os.environ.get("GMAIL_BRIDGE_URL", "").strip():
+        tasks.append(asyncio.create_task(async_email_secretary(), name="email"))
+        print("📮 [进程B] 信箱巡视器已启用")
+
+    print(f"🌙 [进程B] 后台进程已启动，共 {len(tasks)} 个自主任务")
+
+    # 任一任务先结束 (通常意味着崩溃)，就取消其余任务并抛出异常，让 run.py 整体重启
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    for t in pending:
+        t.cancel()
+    # 把先结束任务的异常暴露出来 (若正常结束则不会有异常)
+    for t in done:
+        exc = t.exception()
+        if exc is not None:
+            raise exc
+
+
+def start_autonomous_life():
+    """[兼容] 单进程模式：在 daemon 线程里把 A+B 的所有任务全部拉起。
+
+    仅当直接 `python server.py` (不走 run.py 双进程) 时使用，便于本地快速调试。
+    生产环境请用 `python run.py` 走双进程。
+    """
+    def _run_all(): asyncio.run(run_background_process())
+
+    start_message_process_bg()
+    threading.Thread(target=_run_all, daemon=True).start()
+    print("⚙️  [单进程模式] 后台任务已在 daemon 线程中启动 (生产建议用 run.py 双进程)")
     print("🌾 所有后台心跳线程已启动。")

@@ -1,4 +1,4 @@
-# 通用 MCP 网关 Docker 镜像
+# 通用 MCP 网关 Docker 镜像 (双进程架构)
 FROM python:3.11-slim
 
 # 时区 (提醒/日记等调度功能依赖北京时间)
@@ -25,4 +25,6 @@ EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:10000/health', timeout=5)"
 
-CMD ["python", "server.py"]
+# 双进程入口：run.py 拉起「进程A(消息)」+「进程B(后台)」并互相守护。
+# 单进程调试可临时改回 CMD ["python", "server.py"]。
+CMD ["python", "run.py"]
