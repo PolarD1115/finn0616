@@ -27,6 +27,31 @@ import threading
 global_next_wake_time = 0.0
 
 
+def _parse_decision_json(raw: str) -> dict:
+    """从模型输出里稳健地解析一段 JSON 决策对象。
+    容错：去掉 ```json 代码块围栏、截取第一个 {...}、解析失败则保守返回 send=False。
+    """
+    if not raw:
+        return {"send": False, "reason": "空响应"}
+    text = raw.strip()
+    # 去掉可能的 markdown 代码围栏
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    # 截取第一个花括号块
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {"send": False, "reason": "解析失败", "_raw": raw[:200]}
+
+
 def _is_action_only_line(text: str) -> bool:
     """Return whether a line contains only a parenthesized action description."""
     line = text.strip()
@@ -71,7 +96,11 @@ def _split_telegram_bubbles(text: str) -> list[str]:
 # ==========================================
 
 async def async_autonomous_life():
-    """定时主动思考并发送问候，让 AI 拥有"自主生命感"。"""
+    """定时主动思考，让 AI 拥有"自主生命感"。
+
+    v3.3 升级：不再"到点无脑发问候"，而是先让模型**判断该不该打扰**——
+    结合时间、距上次互动多久、用户近期状态，自己决定"发"还是"这次不打扰"。
+    """
     # 延迟导入，避免循环依赖
     from server import (
         _get_llm_client, _ask_llm_async, _push_wechat,
@@ -84,6 +113,23 @@ async def async_autonomous_life():
 
     # 触发间隔（秒），默认 2 小时，可通过环境变量调整
     interval = int(os.environ.get("HEARTBEAT_INTERVAL", 7200))
+
+    def _hours_since_last_interaction():
+        """查最近一条对话流水距今多少小时（判断"多久没聊了"）。查不到返回 None。"""
+        if not supabase:
+            return None
+        try:
+            _TAGS = ["Web_Chat", "TG_MSG", "QQ_MSG", "QQ_Chat", "QQ_Group"]
+            r = (supabase.table("memories").select("created_at")
+                 .in_("tags", _TAGS).order("created_at", desc=True).limit(1).execute())
+            if r and r.data:
+                last = r.data[0].get("created_at", "")
+                dt = datetime.datetime.fromisoformat(last.replace("Z", "+00:00"))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                return round((now - dt).total_seconds() / 3600, 1)
+        except Exception:
+            return None
+        return None
 
     while True:
         # 随机化下一次唤醒时间，避免过于机械
@@ -101,26 +147,50 @@ async def async_autonomous_life():
             curr_loc = await where_is_user()
             curr_persona = _get_current_persona()
             now_bj = _get_now_bj()
+            idle_hours = await asyncio.to_thread(_hours_since_last_interaction)
+            idle_desc = f"距上次聊天约 {idle_hours} 小时" if idle_hours is not None else "最近互动时间未知"
 
-            prompt = f"""
-            当前时间: {now_bj.strftime('%Y-%m-%d %H:%M')} (星期{now_bj.isoweekday()})
-            当前人设: {curr_persona}
+            # 深夜(23:00~07:00)默认不打扰，除非环境变量放开
+            hour = now_bj.hour
+            allow_night = os.environ.get("PROACTIVE_ALLOW_NIGHT", "false").strip().lower() in ("1", "true", "yes")
+            if (hour >= 23 or hour < 7) and not allow_night:
+                print(f"💤 [自主生命] 当前 {hour} 点，深夜不打扰，跳过本轮")
+                continue
+
+            # ── 关卡：先判断"该不该主动发" ──
+            decide_prompt = f"""
+            现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
+            你的人设: {curr_persona}
             近期互动记录: {recent_mem}
             用户大概状态: {curr_loc}
+            互动间隔: {idle_desc}
 
-            请基于以上信息，用符合人设的口吻主动发一条简短问候 (50 字内)。
-            要求自然、有温度，不要提"系统/闹钟/定时"，直接像真人突然想起对方那样说话。
-            纯文本输出，禁止使用表情代码或 URL。
+            你正在考虑"要不要现在主动给对方发一条消息"。请像真人一样权衡：
+            - 如果刚聊过没多久、或现在明显不合适打扰，就克制一下别发。
+            - 如果确实想念、有值得分享的、或对方可能需要关心，就发。
+
+            只输出一行 JSON，不要多余文字：
+            {{"send": true 或 false, "reason": "简短理由", "message": "若send为true，这里写要发的话(50字内，自然有温度，不提系统/定时/闹钟)；否则留空"}}
             """
+            raw = await _ask_llm_async(client, decide_prompt, temperature=0.8)
 
-            ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
-            if ai_msg:
-                await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
-                await asyncio.to_thread(
-                    _save_memory_to_db, "🤖 主动问候",
-                    f"主动发送: {ai_msg}", "流水", "主动", "Heartbeat"
-                )
-                print(f"💓 [自主生命] 已发送主动问候: {ai_msg[:30]}...")
+            decision = _parse_decision_json(raw)
+            if not decision.get("send"):
+                reason = decision.get("reason", "模型判断此刻不打扰")
+                print(f"🤫 [自主生命] 本轮不打扰：{reason}")
+                continue
+
+            ai_msg = (decision.get("message") or "").strip()
+            if not ai_msg:
+                print("🤫 [自主生命] 判断要发但内容为空，跳过")
+                continue
+
+            await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
+            await asyncio.to_thread(
+                _save_memory_to_db, "🤖 主动问候",
+                f"主动发送: {ai_msg}\n(判断理由: {decision.get('reason', '')})", "流水", "主动", "Heartbeat"
+            )
+            print(f"💓 [自主生命] 已发送主动问候: {ai_msg[:30]}...")
         except Exception as e:
             print(f"❌ 自主生命循环出错: {e}")
 
@@ -294,6 +364,116 @@ async def _perform_deep_dreaming():
 
     except Exception as e:
         print(f"❌ 深夜日记生成失败: {e}")
+
+
+# ==========================================
+# 1.6 自由活动 (自主决定这段时间做什么)
+# ==========================================
+
+# 可选活动清单：模型从中自选。描述用于提示，key 用于行动日志去重判断。
+_FREE_ACTIVITIES = [
+    ("写秘密日记", "记录此刻的心情或一个只属于自己的小念头"),
+    ("逛虚拟小屋", "在小家里做点事——看书/做饭/听音乐/发呆/照料阳台"),
+    ("查天气", "看看外面的天气，联想到和对方有关的事"),
+    ("抽张塔罗", "给自己或对方今天的状态抽一张塔罗，随便玩玩"),
+    ("翻旧回忆", "想起一段和对方的旧记忆，回味一下"),
+    ("发呆放空", "什么正事都不做，单纯发会儿呆，想点有的没的"),
+    ("记点小账", "回想有没有值得记的小花销，或往储蓄罐里存点心意"),
+]
+
+
+async def async_free_activity():
+    """🎈 自由活动：随机间隔醒来一次，让模型自主决定这段时间做点什么，
+    做完写一条行动日志留档。带防连续重复机制（连续两轮做同一件事会被强制换）。
+    """
+    from server import (
+        _get_llm_client, _ask_llm_async, _save_memory_to_db,
+        _get_now_bj, _get_current_persona, supabase
+    )
+
+    print("🎈 自由活动神经已上线...")
+
+    # 触发间隔（秒），默认 3 小时；开关默认开
+    interval = int(os.environ.get("FREE_ACTIVITY_INTERVAL", 10800))
+    enabled = os.environ.get("FREE_ACTIVITY_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    if not enabled:
+        print("🎈 自由活动已关闭 (FREE_ACTIVITY_ENABLED=false)")
+        return
+
+    _TAG = "Free_Activity"
+
+    def _recent_activity_keys(limit=2):
+        """读最近 N 条行动日志的活动名，用于判断是否连续重复。"""
+        if not supabase:
+            return []
+        try:
+            r = (supabase.table("memories").select("title")
+                 .eq("tags", _TAG).order("created_at", desc=True).limit(limit).execute())
+            # title 形如 "🎈 自由活动·写秘密日记"
+            keys = []
+            for row in (r.data or []):
+                t = row.get("title", "")
+                if "·" in t:
+                    keys.append(t.split("·", 1)[1].strip())
+            return keys
+        except Exception:
+            return []
+
+    while True:
+        wake_jitter = random.randint(-900, 900)
+        await asyncio.sleep(max(300, interval + wake_jitter))
+
+        try:
+            client = _get_llm_client("main_chat")
+            if not client:
+                continue
+
+            now_bj = _get_now_bj()
+            persona = _get_current_persona()
+            recent_keys = await asyncio.to_thread(_recent_activity_keys, 2)
+
+            # 防连续重复：若最近两轮做了同一件事，就从候选里排除它
+            avoid = ""
+            if len(recent_keys) >= 2 and recent_keys[0] == recent_keys[1]:
+                avoid = recent_keys[0]
+
+            options = [f"{name}（{desc}）" for name, desc in _FREE_ACTIVITIES if name != avoid]
+            options_text = "\n".join(f"- {o}" for o in options)
+            avoid_hint = f"\n注意：你最近连着做了两次「{avoid}」，这次换点别的。" if avoid else ""
+
+            act_prompt = f"""
+            现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
+            你的人设: {persona}
+
+            这是属于你自己的一段自由时间，没有人在等你回话。从下面的活动里挑一件你此刻想做的，
+            自己做一遍，然后用第一人称写一小段"我刚才做了什么、有什么感受"的行动记录。
+            {options_text}{avoid_hint}
+
+            只输出一行 JSON，不要多余文字：
+            {{"activity": "你选的活动名(必须是上面列出的名字之一)", "log": "第一人称行动记录(80字内，自然有生活感)"}}
+            """
+            raw = await _ask_llm_async(client, act_prompt, temperature=0.9)
+
+            decision = _parse_decision_json(raw)
+            activity = (decision.get("activity") or "").strip()
+            log_text = (decision.get("log") or "").strip()
+
+            # 校验活动名合法
+            valid_names = {name for name, _ in _FREE_ACTIVITIES}
+            if activity not in valid_names:
+                # 模型没按格式选，兜底随机挑一个
+                activity = random.choice([n for n in valid_names if n != avoid])
+            if not log_text:
+                print("🎈 [自由活动] 行动记录为空，跳过本轮")
+                continue
+
+            await asyncio.to_thread(
+                _save_memory_to_db,
+                f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
+            )
+            print(f"🎈 [自由活动] 做了「{activity}」：{log_text[:30]}...")
+        except Exception as e:
+            print(f"❌ 自由活动出错: {e}")
 
 
 async def async_diary_worker():
@@ -855,6 +1035,7 @@ async def run_background_process():
     tasks = [
         asyncio.create_task(async_env_sync(),           name="env_sync"),
         asyncio.create_task(async_autonomous_life(),    name="autonomous_life"),
+        asyncio.create_task(async_free_activity(),      name="free_activity"),
         asyncio.create_task(async_diary_worker(),       name="diary"),
         asyncio.create_task(async_message_summarizer(), name="msg_summarizer"),
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
