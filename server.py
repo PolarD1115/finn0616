@@ -274,7 +274,7 @@ def _get_now_bj() -> datetime.datetime:
 def _save_memory_to_db(title: str, content: str, category: str = "流水", mood: str = "平静", tags: str = ""):
     """将一条记忆/事件写入 Supabase memories 表，自动计算重要度权重并推断标签。"""
     if not supabase:
-        return
+        return False
     try:
         if category not in WEIGHT_MAP:
             mapping = {"日记": MemoryType.EPISODIC, "Note": MemoryType.IDEA,
@@ -306,8 +306,10 @@ def _save_memory_to_db(title: str, content: str, category: str = "流水", mood:
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         supabase.table("memories").insert(data).execute()
+        return True
     except Exception as e:
         print(f"⚠️ 写入记忆失败: {e}")
+        return False
 
 
 def _get_embedding(text: str):
@@ -526,6 +528,26 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
         parts.append(f"【近期对话回顾】:\n{history_text}")
     if device_snapshot:
         parts.append(device_snapshot)
+
+    # Feed injection statistics into the shared gateway buffer without logging private context.
+    try:
+        import gateway as _gw
+        profile_rows = len(pr.data) if pr and pr.data else 0
+        summary_rows = len(sr.data) if sr and sr.data else 0
+        history_rows = len(hr.data) if hr and hr.data else 0
+        pinecone_rows = 0
+        if mr:
+            memory_results = mr.get("results", mr) if isinstance(mr, dict) else mr
+            pinecone_rows = len(memory_results) if isinstance(memory_results, list) else 0
+        _gw._log(
+            f"🧠 [{_channel_display_name(channel_tag)}] 上下文注入完成："
+            f"人设={bool(persona)}({len(persona)}字) "
+            f"画像={profile_rows}条 阶段总结={summary_rows}条 "
+            f"Pinecone={pinecone_rows}条 跨渠道历史={history_rows}条 "
+            f"设备快照={'是' if device_snapshot else '否'}({len(device_snapshot)}字)"
+        )
+    except Exception:
+        pass
 
     return f"{persona}\n\n" + "\n\n".join(parts)
 
