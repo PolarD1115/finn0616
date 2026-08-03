@@ -60,6 +60,109 @@ def _get_supabase():
     return _supabase_client
 
 
+# ==========================================
+# 🎛️ 多模型注册表（前端可自由添加 / 切换）
+# ==========================================
+# 存储位置：user_facts 表，key='llm_models'，value 为 JSON 字符串：
+#   {
+#     "models": [
+#       {"id": "gpt-4o", "label": "GPT-4o", "base_url": "https://api.openai.com/v1",
+#        "api_key": "sk-xxx", "model": "gpt-4o", "enabled": true},
+#       ...
+#     ],
+#     "default": "gpt-4o"     # 默认模型 id（前端不传 model 时用）
+#   }
+# 设计要点：
+#   - 每个模型自带 base_url + api_key + 真实 model 名，路由时按前端传入的 model(id) 命中对应上游
+#   - 未命中或注册表为空时，回退到环境变量（完全向后兼容旧部署）
+#   - GET /api/models 返回时会屏蔽 api_key（只留前几位），避免密钥泄露
+
+_LLM_REGISTRY_KEY = "llm_models"
+
+
+def _load_llm_registry():
+    """从 Supabase 读取模型注册表；无表/无数据/未配库时返回空结构。"""
+    sb = _get_supabase()
+    if not sb:
+        return {"models": [], "default": ""}
+    try:
+        res = sb.table("user_facts").select("value").eq("key", _LLM_REGISTRY_KEY).execute()
+        if res.data and res.data[0].get("value"):
+            reg = json.loads(res.data[0]["value"])
+            if isinstance(reg, dict) and isinstance(reg.get("models"), list):
+                return {"models": reg["models"], "default": reg.get("default", "")}
+    except Exception as e:
+        _log(f"⚠️ 读取模型注册表失败: {e}")
+    return {"models": [], "default": ""}
+
+
+def _save_llm_registry(reg: dict) -> bool:
+    """把模型注册表写回 Supabase（upsert）。"""
+    sb = _get_supabase()
+    if not sb:
+        return False
+    try:
+        payload = {
+            "key": _LLM_REGISTRY_KEY,
+            "value": json.dumps({
+                "models": reg.get("models", []),
+                "default": reg.get("default", ""),
+            }, ensure_ascii=False),
+        }
+        sb.table("user_facts").upsert(payload).execute()
+        return True
+    except Exception as e:
+        _log(f"❌ 保存模型注册表失败: {e}")
+        return False
+
+
+def _resolve_model(model_id: str):
+    """按前端传入的 model(id) 解析出真实上游三元组。
+    返回 (base_url, api_key, real_model, matched)；matched=False 表示未命中注册表。
+    """
+    reg = _load_llm_registry()
+    models = [m for m in reg.get("models", []) if m.get("enabled", True)]
+    if not models:
+        return ("", "", "", False)
+
+    target = None
+    # 1) 精确匹配 id
+    if model_id:
+        for m in models:
+            if m.get("id") == model_id:
+                target = m
+                break
+        # 2) 退而匹配真实 model 名（有些客户端直接发 model 名）
+        if not target:
+            for m in models:
+                if m.get("model") == model_id:
+                    target = m
+                    break
+    # 3) 用默认模型
+    if not target:
+        default_id = reg.get("default", "")
+        for m in models:
+            if m.get("id") == default_id:
+                target = m
+                break
+    # 4) 兜底取第一个启用的
+    if not target:
+        target = models[0]
+
+    base_url = str(target.get("base_url", "")).strip()
+    api_key = str(target.get("api_key", "")).strip()
+    real_model = str(target.get("model", "")).strip() or target.get("id", "")
+    return (base_url, api_key, real_model, True)
+
+
+def _mask_key(k: str) -> str:
+    """屏蔽 api_key，仅保留前缀用于识别。"""
+    k = str(k or "")
+    if len(k) <= 8:
+        return "***" if k else ""
+    return f"{k[:6]}...{k[-2:]}"
+
+
 def _get_pinecone_memory():
     """惰性获取 server 模块的 Pinecone 记忆客户端（延迟导入避免循环依赖）"""
     try:
@@ -304,6 +407,16 @@ class HostFixMiddleware:
             await self._handle_logs(send)
             return
 
+        # ---------- 🎛️ 多模型管理接口 ----------
+        if scope["path"] == "/api/models":
+            await self._handle_models_api(scope, receive, send)
+            return
+
+        # ---------- 🎛️ 内置模型管理网页 ----------
+        if scope["path"] == "/admin/models":
+            await self._handle_admin_page(send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -327,6 +440,29 @@ class HostFixMiddleware:
 
         # ---- /v1/models ----
         if path == "/v1/models" and method == "GET":
+            # 优先返回数据库模型注册表（前端可自由增删改）
+            reg = _load_llm_registry()
+            reg_models = [m for m in reg.get("models", []) if m.get("enabled", True)]
+            if reg_models:
+                default_id = reg.get("default", "")
+                data = []
+                for m in reg_models:
+                    mid = m.get("id") or m.get("model")
+                    if not mid:
+                        continue
+                    data.append({
+                        "id": mid,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "mcp-gateway",
+                        # 附带展示名与是否默认，方便自定义前端渲染；标准客户端会忽略多余字段
+                        "label": m.get("label", mid),
+                        "is_default": (mid == default_id),
+                    })
+                await _send_json_resp(send, 200, {"object": "list", "data": data})
+                return
+
+            # 回退：注册表为空时沿用环境变量（向后兼容）
             default_model = os.environ.get("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
             models = [{"id": default_model, "object": "model", "created": int(time.time()), "owned_by": "mcp-gateway"}]
             for prefix in ("CHAT_", "SILICON1_", "VISION_", "VOICE_"):
@@ -359,17 +495,27 @@ class HostFixMiddleware:
             await _send_json_resp(send, 400, {"error": {"message": "Invalid JSON body"}})
             return
 
-        # 解析上游配置（统一用 OPENAI_*，兼容旧 CHAT_*）
-        upstream_base = os.environ.get("OPENAI_BASE_URL", os.environ.get("CHAT_BASE_URL", os.environ.get("DEFAULT_BASE_URL", ""))).strip()
-        upstream_key = os.environ.get("OPENAI_API_KEY", os.environ.get("CHAT_API_KEY", os.environ.get("DEFAULT_API_KEY", ""))).strip()
-        default_model = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("CHAT_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo")))
+        # 解析上游配置：优先走多模型注册表（前端传入 model 命中对应上游），
+        # 未命中或注册表为空时回退到环境变量（统一用 OPENAI_*，兼容旧 CHAT_*）。
+        requested_model = str(req_data.get("model", "")).strip()
+        reg_base, reg_key, reg_model, matched = _resolve_model(requested_model)
+
+        if matched and reg_key:
+            upstream_base = reg_base
+            upstream_key = reg_key
+            # 命中注册表：把请求体里的 model 换成该条目的"真实模型名"再转发给上游
+            req_data["model"] = reg_model
+            _log(f"🎛️ [路由] 前端模型={requested_model or '(空)'} → 上游模型={reg_model} @ {reg_base[:32]}")
+        else:
+            upstream_base = os.environ.get("OPENAI_BASE_URL", os.environ.get("CHAT_BASE_URL", os.environ.get("DEFAULT_BASE_URL", ""))).strip()
+            upstream_key = os.environ.get("OPENAI_API_KEY", os.environ.get("CHAT_API_KEY", os.environ.get("DEFAULT_API_KEY", ""))).strip()
+            default_model = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("CHAT_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo")))
+            if not req_data.get("model"):
+                req_data["model"] = default_model
 
         if not upstream_key:
-            await _send_json_resp(send, 500, {"error": {"message": "Server 未配置 OPENAI_API_KEY"}})
+            await _send_json_resp(send, 500, {"error": {"message": "Server 未配置模型上游（注册表为空且未设置 OPENAI_API_KEY）"}})
             return
-
-        if not req_data.get("model"):
-            req_data["model"] = default_model
 
         # 构造上游 URL（兼容用户填或不填 /v1 后缀）
         base = upstream_base.rstrip("/") or "https://api.openai.com/v1"
@@ -733,6 +879,156 @@ class HostFixMiddleware:
         except Exception as e:
             await _send_json_resp(send, 500, {"error": str(e)})
 
+    # ------------------------------------------
+    # 🎛️ 多模型管理接口 /api/models
+    # ------------------------------------------
+    async def _handle_models_api(self, scope, receive, send):
+        """
+        多模型注册表 CRUD（已经过 API_SECRET 鉴权）：
+          GET    /api/models              列出全部模型（api_key 脱敏）+ default
+          POST   /api/models              新增/更新一个模型（按 id upsert）
+                 body: {id,label,base_url,api_key,model,enabled}
+          POST   /api/models  {action:"set_default", id:"xxx"}   设默认
+          DELETE /api/models?id=xxx       删除一个模型
+        说明：删除仅移除注册表里的一条 JSON 项，不触碰其它数据库表。
+        """
+        method = scope["method"]
+
+        # ---- GET：列出 ----
+        if method == "GET":
+            reg = _load_llm_registry()
+            safe = []
+            for m in reg.get("models", []):
+                safe.append({
+                    "id": m.get("id", ""),
+                    "label": m.get("label", m.get("id", "")),
+                    "base_url": m.get("base_url", ""),
+                    "api_key_masked": _mask_key(m.get("api_key", "")),
+                    "has_key": bool(str(m.get("api_key", "")).strip()),
+                    "model": m.get("model", ""),
+                    "enabled": m.get("enabled", True),
+                })
+            await _send_json_resp(send, 200, {"models": safe, "default": reg.get("default", "")})
+            return
+
+        # ---- 读 body（POST/DELETE 可能带）----
+        body = b""
+        if method in ("POST", "DELETE", "PUT"):
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+        payload = {}
+        if body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+                return
+
+        # ---- DELETE：删一个 ----
+        if method == "DELETE":
+            # id 可来自 body 或 query string
+            del_id = str(payload.get("id", "")).strip()
+            if not del_id:
+                qs = scope.get("query_string", b"").decode("utf-8")
+                for part in qs.split("&"):
+                    if part.startswith("id="):
+                        from urllib.parse import unquote
+                        del_id = unquote(part[3:]).strip()
+            if not del_id:
+                await _send_json_resp(send, 400, {"error": "缺少 id"})
+                return
+            reg = _load_llm_registry()
+            before = len(reg.get("models", []))
+            reg["models"] = [m for m in reg.get("models", []) if m.get("id") != del_id]
+            if reg.get("default") == del_id:
+                reg["default"] = reg["models"][0]["id"] if reg["models"] else ""
+            if len(reg["models"]) == before:
+                await _send_json_resp(send, 404, {"error": f"未找到模型 id={del_id}"})
+                return
+            ok = _save_llm_registry(reg)
+            await _send_json_resp(send, 200 if ok else 500,
+                                  {"ok": ok, "deleted": del_id, "count": len(reg["models"])})
+            return
+
+        # ---- POST ----
+        if method == "POST":
+            action = str(payload.get("action", "")).strip()
+
+            # 设默认
+            if action == "set_default":
+                did = str(payload.get("id", "")).strip()
+                reg = _load_llm_registry()
+                if not any(m.get("id") == did for m in reg.get("models", [])):
+                    await _send_json_resp(send, 404, {"error": f"未找到模型 id={did}"})
+                    return
+                reg["default"] = did
+                ok = _save_llm_registry(reg)
+                await _send_json_resp(send, 200 if ok else 500, {"ok": ok, "default": did})
+                return
+
+            # 新增 / 更新（按 id upsert）
+            mid = str(payload.get("id", "")).strip()
+            if not mid:
+                await _send_json_resp(send, 400, {"error": "缺少 id（模型的唯一标识，也是前端下拉框显示的值）"})
+                return
+            base_url = str(payload.get("base_url", "")).strip()
+            real_model = str(payload.get("model", "")).strip() or mid
+            new_key = str(payload.get("api_key", "")).strip()
+
+            reg = _load_llm_registry()
+            existing = next((m for m in reg["models"] if m.get("id") == mid), None)
+            entry = {
+                "id": mid,
+                "label": str(payload.get("label", "")).strip() or (existing.get("label") if existing else mid),
+                "base_url": base_url or (existing.get("base_url") if existing else ""),
+                "model": real_model,
+                "enabled": bool(payload.get("enabled", existing.get("enabled", True) if existing else True)),
+            }
+            # api_key：留空表示"沿用旧值"（避免脱敏回传时误清空）
+            if new_key:
+                entry["api_key"] = new_key
+            elif existing:
+                entry["api_key"] = existing.get("api_key", "")
+            else:
+                entry["api_key"] = ""
+
+            if not entry["api_key"]:
+                await _send_json_resp(send, 400, {"error": "缺少 api_key"})
+                return
+            if not entry["base_url"]:
+                await _send_json_resp(send, 400, {"error": "缺少 base_url"})
+                return
+
+            if existing:
+                idx = reg["models"].index(existing)
+                reg["models"][idx] = entry
+            else:
+                reg["models"].append(entry)
+            # 第一个加入的模型自动设为默认
+            if not reg.get("default"):
+                reg["default"] = mid
+
+            ok = _save_llm_registry(reg)
+            await _send_json_resp(send, 200 if ok else 500, {
+                "ok": ok,
+                "saved": {**entry, "api_key": _mask_key(entry["api_key"])},
+                "default": reg.get("default", ""),
+            })
+            return
+
+        await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+
+    async def _handle_admin_page(self, send):
+        """返回内置模型管理网页（纯静态 HTML，逻辑走 /api/models）。"""
+        html = _ADMIN_MODELS_HTML
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/html; charset=utf-8"),
+                                (b"access-control-allow-origin", b"*")]})
+        await send({"type": "http.response.body", "body": html.encode("utf-8")})
+
 
 # ==========================================
 # 辅助函数
@@ -762,8 +1058,8 @@ async def _send_json_resp(send, status: int, data: dict):
         "headers": [
             (b"content-type", b"application/json; charset=utf-8"),
             (b"access-control-allow-origin", b"*"),
-            (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
-            (b"access-control-allow-headers", b"Content-Type, Authorization"),
+            (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+            (b"access-control-allow-headers", b"Content-Type, Authorization, X-Api-Key"),
         ]
     })
     await send({"type": "http.response.body", "body": body})
@@ -775,9 +1071,266 @@ async def _send_cors_preflight(send):
         "status": 204,
         "headers": [
             (b"access-control-allow-origin", b"*"),
-            (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
-            (b"access-control-allow-headers", b"Content-Type, Authorization"),
+            (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+            (b"access-control-allow-headers", b"Content-Type, Authorization, X-Api-Key"),
             (b"access-control-max-age", b"86400"),
         ]
     })
     await send({"type": "http.response.body", "body": b""})
+
+# ==========================================
+# 🎛️ 内置模型管理网页（/admin/models）
+# ==========================================
+# 纯静态单页：读取/新增/编辑/删除模型、设默认、发消息实测。
+# 所有写操作都带 API_SECRET（页面里填一次，存 localStorage）。
+_ADMIN_MODELS_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>模型管理 · MCP Gateway</title>
+<style>
+  :root { --bg:#0f1117; --card:#1a1d27; --line:#2a2e3a; --fg:#e6e8ee; --mut:#8a90a2; --acc:#6ea8fe; --ok:#4ade80; --err:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; font-size:14px; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:600; }
+  .wrap { max-width:960px; margin:0 auto; padding:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; margin:0 0 12px; color:var(--mut); font-weight:600; letter-spacing:.3px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 4px; }
+  input, textarea, select { width:100%; background:#0f1219; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:9px 11px; font-size:13px; font-family:inherit; }
+  input:focus, textarea:focus, select:focus { outline:none; border-color:var(--acc); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+  button { cursor:pointer; border:none; border-radius:8px; padding:9px 14px; font-size:13px; font-weight:500; background:var(--acc); color:#0b1220; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  button.danger { background:transparent; border:1px solid #5b2330; color:var(--err); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .btns { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); font-size:13px; vertical-align:middle; }
+  th { color:var(--mut); font-weight:500; font-size:12px; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px; }
+  .tag.def { background:rgba(110,168,254,.15); color:var(--acc); }
+  .tag.on { background:rgba(74,222,128,.13); color:var(--ok); }
+  .tag.off { background:rgba(248,113,113,.13); color:var(--err); }
+  .mut { color:var(--mut); }
+  .toast { position:fixed; right:16px; bottom:16px; background:var(--card); border:1px solid var(--line); padding:11px 15px; border-radius:10px; font-size:13px; max-width:320px; opacity:0; transform:translateY(8px); transition:.2s; pointer-events:none; }
+  .toast.show { opacity:1; transform:none; }
+  .toast.ok { border-color:#2b5d3a; } .toast.err { border-color:#5b2330; }
+  code { background:#0f1219; padding:1px 6px; border-radius:5px; font-size:12px; }
+  #chatOut { white-space:pre-wrap; background:#0f1219; border:1px solid var(--line); border-radius:8px; padding:12px; min-height:64px; font-size:13px; line-height:1.6; }
+  .hint { font-size:12px; color:var(--mut); margin-top:6px; line-height:1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎛️ 模型管理</h1>
+  <span class="mut">MCP Gateway · 多模型注册与切换</span>
+  <span style="flex:1"></span>
+  <span class="mut" id="baseHint"></span>
+</header>
+<div class="wrap">
+
+  <div class="card">
+    <h2>🔑 访问密钥（API_SECRET）</h2>
+    <div class="row">
+      <div>
+        <input id="secret" type="password" placeholder="若服务端设了 API_SECRET，填这里"/>
+        <div class="hint">保存在浏览器本地，用于调用 /api/models。没设 API_SECRET 可留空。</div>
+      </div>
+      <div style="display:flex;align-items:flex-start;gap:8px">
+        <button onclick="saveSecret()">保存密钥</button>
+        <button class="ghost" onclick="reload()">刷新列表</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>➕ 新增 / 编辑模型</h2>
+    <div class="row3">
+      <div>
+        <label>ID（前端下拉框显示值，唯一）*</label>
+        <input id="f_id" placeholder="如 gpt-4o / my-glm"/>
+      </div>
+      <div>
+        <label>显示名 label</label>
+        <input id="f_label" placeholder="如 GPT-4o（可留空）"/>
+      </div>
+      <div>
+        <label>真实模型名 model *</label>
+        <input id="f_model" placeholder="供应商实际的 model，如 gpt-4o"/>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Base URL *</label>
+        <input id="f_base" placeholder="如 https://api.openai.com/v1"/>
+      </div>
+      <div>
+        <label>API Key *（编辑时留空=不改）</label>
+        <input id="f_key" type="password" placeholder="sk-..."/>
+      </div>
+    </div>
+    <div class="btns">
+      <button onclick="saveModel()">💾 保存模型</button>
+      <button class="ghost" onclick="clearForm()">清空表单</button>
+    </div>
+    <div class="hint">ID 是给前端选的名字；model 是真正发给上游的模型名。两者可相同。base_url 填到 <code>/v1</code> 或不带都行。</div>
+  </div>
+
+  <div class="card">
+    <h2>📋 已注册模型</h2>
+    <table>
+      <thead><tr><th>ID / 显示名</th><th>真实模型</th><th>Base URL</th><th>Key</th><th>状态</th><th></th></tr></thead>
+      <tbody id="tbody"><tr><td colspan="6" class="mut">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>💬 发消息实测</h2>
+    <div class="row">
+      <div>
+        <label>选择模型</label>
+        <select id="testModel"></select>
+      </div>
+      <div>
+        <label>消息</label>
+        <input id="testMsg" placeholder="你好" value="你好，用一句话介绍你自己"/>
+      </div>
+    </div>
+    <div class="btns"><button onclick="testChat()" id="testBtn">🚀 发送（流式）</button></div>
+    <label>回复</label>
+    <div id="chatOut" class="mut">（结果显示在这里）</div>
+  </div>
+
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const ORIGIN = location.origin;
+$("#baseHint").textContent = ORIGIN;
+
+function getSecret(){ return localStorage.getItem("mcp_secret") || ""; }
+function saveSecret(){ localStorage.setItem("mcp_secret", $("#secret").value.trim()); toast("密钥已保存", "ok"); reload(); }
+function headers(json){
+  const h = {}; if(json) h["Content-Type"]="application/json";
+  const s = getSecret(); if(s){ h["Authorization"]="Bearer "+s; h["X-Api-Key"]=s; }
+  return h;
+}
+function toast(msg, kind){
+  const t=$("#toast"); t.textContent=msg; t.className="toast show "+(kind||"");
+  setTimeout(()=>{ t.className="toast "+(kind||""); }, 2600);
+}
+
+async function reload(){
+  try{
+    const r = await fetch(ORIGIN+"/api/models", {headers:headers(false)});
+    if(r.status===401){ renderErr("鉴权失败：请填写正确的 API_SECRET"); return; }
+    const d = await r.json();
+    renderTable(d.models||[], d.default||"");
+    fillTestSelect(d.models||[], d.default||"");
+  }catch(e){ renderErr("加载失败："+e.message); }
+}
+function renderErr(m){ $("#tbody").innerHTML = '<tr><td colspan="6" class="mut">'+m+'</td></tr>'; }
+
+function renderTable(models, def){
+  if(!models.length){ $("#tbody").innerHTML='<tr><td colspan="6" class="mut">还没有模型，用上面表单添加一个吧</td></tr>'; return; }
+  $("#tbody").innerHTML = models.map(m=>{
+    const isDef = m.id===def;
+    const st = m.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">停用</span>';
+    const dt = isDef ? ' <span class="tag def">默认</span>' : '';
+    return `<tr>
+      <td><b>${esc(m.id)}</b>${dt}<br><span class="mut">${esc(m.label||"")}</span></td>
+      <td>${esc(m.model||"")}</td>
+      <td class="mut" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(m.base_url||"")}</td>
+      <td class="mut">${esc(m.api_key_masked||(m.has_key?"***":"—"))}</td>
+      <td>${st}</td>
+      <td style="white-space:nowrap">
+        <button class="ghost" onclick='editRow(${JSON.stringify(m).replace(/'/g,"&#39;")})'>编辑</button>
+        ${isDef?'':`<button class="ghost" onclick="setDefault('${esc(m.id)}')">设默认</button>`}
+        <button class="danger" onclick="delModel('${esc(m.id)}')">删除</button>
+      </td></tr>`;
+  }).join("");
+}
+function fillTestSelect(models, def){
+  const sel=$("#testModel");
+  sel.innerHTML = models.filter(m=>m.enabled).map(m=>`<option value="${esc(m.id)}" ${m.id===def?"selected":""}>${esc(m.label||m.id)}</option>`).join("");
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function editRow(m){
+  $("#f_id").value=m.id||""; $("#f_label").value=m.label||"";
+  $("#f_model").value=m.model||""; $("#f_base").value=m.base_url||""; $("#f_key").value="";
+  toast("已载入到表单，Key 留空表示不修改", "ok");
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+function clearForm(){ ["f_id","f_label","f_model","f_base","f_key"].forEach(i=>$("#"+i).value=""); }
+
+async function saveModel(){
+  const body = {
+    id: $("#f_id").value.trim(), label: $("#f_label").value.trim(),
+    model: $("#f_model").value.trim(), base_url: $("#f_base").value.trim(),
+    api_key: $("#f_key").value.trim(), enabled: true,
+  };
+  if(!body.id){ toast("请填 ID", "err"); return; }
+  try{
+    const r = await fetch(ORIGIN+"/api/models", {method:"POST", headers:headers(true), body:JSON.stringify(body)});
+    const d = await r.json();
+    if(r.ok && d.ok){ toast("已保存 "+body.id, "ok"); clearForm(); reload(); }
+    else toast("保存失败："+(d.error||JSON.stringify(d)), "err");
+  }catch(e){ toast("请求失败："+e.message, "err"); }
+}
+async function setDefault(id){
+  try{
+    const r = await fetch(ORIGIN+"/api/models", {method:"POST", headers:headers(true), body:JSON.stringify({action:"set_default", id})});
+    const d = await r.json();
+    if(r.ok && d.ok){ toast("默认已设为 "+id, "ok"); reload(); } else toast("失败："+(d.error||""), "err");
+  }catch(e){ toast("请求失败："+e.message, "err"); }
+}
+async function delModel(id){
+  if(!confirm("确认删除模型 "+id+" ？（只删注册表这一条，不影响其它数据）")) return;
+  try{
+    const r = await fetch(ORIGIN+"/api/models", {method:"DELETE", headers:headers(true), body:JSON.stringify({id})});
+    const d = await r.json();
+    if(r.ok && d.ok){ toast("已删除 "+id, "ok"); reload(); } else toast("删除失败："+(d.error||""), "err");
+  }catch(e){ toast("请求失败："+e.message, "err"); }
+}
+
+async function testChat(){
+  const model = $("#testModel").value;
+  const msg = $("#testMsg").value.trim() || "你好";
+  const out = $("#chatOut"); out.className=""; out.textContent="";
+  $("#testBtn").disabled = true;
+  try{
+    const r = await fetch(ORIGIN+"/v1/chat/completions", {
+      method:"POST", headers:headers(true),
+      body: JSON.stringify({model, messages:[{role:"user",content:msg}], stream:true}),
+    });
+    if(!r.ok){ out.textContent = "HTTP "+r.status+" "+(await r.text()); $("#testBtn").disabled=false; return; }
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf="";
+    while(true){
+      const {value, done} = await reader.read(); if(done) break;
+      buf += dec.decode(value, {stream:true});
+      let idx;
+      while((idx = buf.indexOf("\n\n")) >= 0){
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
+        for(const line of chunk.split("\n")){
+          const s = line.trim(); if(!s.startsWith("data:")) continue;
+          const data = s.slice(5).trim(); if(data==="[DONE]") continue;
+          try{ const j=JSON.parse(data); const dc=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content; if(dc) out.textContent += dc; }catch(_){}
+        }
+      }
+    }
+    if(!out.textContent) out.textContent="（无内容返回）";
+  }catch(e){ out.textContent = "请求失败："+e.message; }
+  $("#testBtn").disabled = false;
+}
+
+$("#secret").value = getSecret();
+reload();
+</script>
+</body>
+</html>"""
