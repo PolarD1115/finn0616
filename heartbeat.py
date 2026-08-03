@@ -367,44 +367,74 @@ async def async_telegram_polling():
 
                 # 调用 LLM 生成回复
                 client = _get_llm_client("main_chat")
-                if client:
+                if not client:
+                    # AI 服务未配置：也要有回音，避免"石沉大海"
+                    await asyncio.to_thread(
+                        lambda: requests.post(
+                            f"{base_url}/sendMessage",
+                            json={"chat_id": chat_id, "text": "（AI 服务暂未配置，暂时没法回话哦）"},
+                            timeout=10
+                        )
+                    )
+                    await asyncio.to_thread(
+                        _save_memory_to_db, "⚠️ TG 未配置AI",
+                        f"用户: {text}\n[未回复：AI 服务未配置]", "流水", "平静", "TG_MSG"
+                    )
+                    continue
+
+                try:
+                    # 🧠 注入记忆/画像/设备等完整上下文（与网页渠道对齐）
+                    system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
+
+                    prompt = f"""
+                    用户发来消息: {text}
+
+                    请用符合人设的口吻回复用户。纯文本，自然真诚。
+                    """
+                    reply = await _ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
+                except Exception as e:
+                    print(f"❌ TG 回复生成失败: {e}")
+                    reply = ""
+
+                if not reply:
+                    # LLM 失败/空回复：兜底回一句 + 记录入库，不再静默吞消息
+                    await asyncio.to_thread(
+                        lambda: requests.post(
+                            f"{base_url}/sendMessage",
+                            json={"chat_id": chat_id, "text": "（刚才信号不太好，好像没接住你的话……再说一遍给我听好不好？）"},
+                            timeout=10
+                        )
+                    )
+                    await asyncio.to_thread(
+                        _save_memory_to_db, "⚠️ TG 未回复",
+                        f"用户: {text}\n[LLM 未返回内容，已兜底]", "流水", "平静", "TG_MSG"
+                    )
+                    continue
+
+                # 成功：发送回复
+                await asyncio.to_thread(
+                    lambda: requests.post(
+                        f"{base_url}/sendMessage",
+                        json={"chat_id": chat_id, "text": reply},
+                        timeout=15
+                    )
+                )
+                await asyncio.to_thread(
+                    _save_memory_to_db, "🤖 互动记录",
+                    f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
+                )
+
+                # 写入 Pinecone 长期记忆
+                if pinecone_memory:
                     try:
-                        # 🧠 注入记忆/画像/设备等完整上下文（与网页渠道对齐）
-                        system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
-
-                        prompt = f"""
-                        用户发来消息: {text}
-
-                        请用符合人设的口吻回复用户。纯文本，自然真诚。
-                        """
-                        reply = await _ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
-
-                        if reply:
-                            await asyncio.to_thread(
-                                lambda: requests.post(
-                                    f"{base_url}/sendMessage",
-                                    json={"chat_id": chat_id, "text": reply},
-                                    timeout=15
-                                )
-                            )
-                            await asyncio.to_thread(
-                                _save_memory_to_db, "🤖 互动记录",
-                                f"用户: {text}\n回复: {reply}", "流水", "温柔", "TG_MSG"
-                            )
-
-                            # 写入 Pinecone 长期记忆
-                            if pinecone_memory:
-                                try:
-                                    def _add_mem():
-                                        pinecone_memory.add([
-                                            {"role": "user", "content": text},
-                                            {"role": "assistant", "content": reply}
-                                        ], user_id=os.environ.get("MEM0_USER_ID", "default"))
-                                    await asyncio.to_thread(_add_mem)
-                                except Exception as e:
-                                    print(f"Pinecone 写入报错: {e}")
+                        def _add_mem():
+                            pinecone_memory.add([
+                                {"role": "user", "content": text},
+                                {"role": "assistant", "content": reply}
+                            ], user_id=os.environ.get("MEM0_USER_ID", "default"))
+                        await asyncio.to_thread(_add_mem)
                     except Exception as e:
-                        print(f"❌ TG 回复生成失败: {e}")
+                        print(f"Pinecone 写入报错: {e}")
         except Exception as e:
             print(f"❌ TG 轮询错误: {e}")
             await asyncio.sleep(5)

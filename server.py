@@ -205,7 +205,7 @@ def _get_llm_client(provider: str = "openai"):
     if provider == "silicon1":
         api_key = os.environ.get("SILICON1_API_KEY", "").strip()
         base_url = os.environ.get("SILICON1_BASE_URL", "https://api.siliconflow.cn/v1")
-        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
         model_name = os.environ.get("SILICON1_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
     elif provider == "main_chat":
         # 优先从数据库读取动态配置，回退到环境变量
@@ -219,21 +219,21 @@ def _get_llm_client(provider: str = "openai"):
         api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
         base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
         model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
-        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
     elif provider == "vision":
         api_key = os.environ.get("VISION_API_KEY", "").strip()
         base_url = os.environ.get("VISION_BASE_URL", "").strip()
-        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None, timeout=60.0) if api_key else None
         model_name = os.environ.get("VISION_MODEL_NAME", "gpt-4o-mini")
     elif provider == "voice":
         api_key = os.environ.get("VOICE_API_KEY", os.environ.get("OPENAI_API_KEY", "")).strip()
         base_url = os.environ.get("VOICE_BASE_URL", "https://api.openai.com/v1")
-        client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
     else:
         # 默认 openai provider
         api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("DEFAULT_API_KEY", "").strip()
         base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("DEFAULT_BASE_URL", "")).strip()
-        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None) if api_key else None
+        client = OpenAI(api_key=api_key, base_url=base_url if base_url else None, timeout=60.0) if api_key else None
         model_name = os.environ.get("OPENAI_MODEL_NAME", os.environ.get("DEFAULT_MODEL_NAME", "gpt-3.5-turbo"))
 
     if client:
@@ -439,79 +439,81 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
     now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     time_str = now_bj.strftime("%Y-%m-%d %H:%M")
 
+    # ⚡ 并行化：人设 / 画像 / 阶段总结 / 向量记忆 / 历史流水 / 设备快照 全部并发拉取，
+    #    总耗时 ≈ 最慢的一个请求（原串行 6 连发，Supabase 抖动时容易整体失败拖垮回复）
+    async def _safe(fn):
+        """把阻塞调用丢到线程池，任何失败都降级为 None（不阻断回复）。"""
+        try:
+            return await asyncio.to_thread(fn)
+        except Exception:
+            return None
+
+    tasks = {}
+
     # 1. 人设（数据库动态人设优先）
-    persona = _get_current_persona()
+    tasks["persona"] = _safe(_get_current_persona)
 
-    # 2. 用户画像
-    user_prof = "暂无"
     if supabase:
-        try:
-            def _fetch_profile():
-                return supabase.table("user_facts").select("key, value") \
-                    .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona").execute()
-            pr = await asyncio.to_thread(_fetch_profile)
-            if pr and pr.data:
-                user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in pr.data[:30]])
-        except Exception:
-            pass
-
-    # 3. 阶段总结（长期记忆 Core_Cognition）
-    core_summaries = "无长期记忆"
-    if supabase:
-        try:
-            def _fetch_summaries():
-                return supabase.table("memories").select("content") \
-                    .eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute()
-            sr = await asyncio.to_thread(_fetch_summaries)
-            if sr and sr.data:
-                core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
-        except Exception:
-            pass
+        # 2. 用户画像
+        tasks["profile"] = _safe(lambda: supabase.table("user_facts").select("key, value")
+                                 .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona").execute())
+        # 3. 阶段总结（长期记忆 Core_Cognition）
+        tasks["summaries"] = _safe(lambda: supabase.table("memories").select("content")
+                                   .eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
+        # 5. 近期跨渠道对话流水（最近 8 条）
+        _TAGS = [channel_tag, "Web_Chat", "TG_MSG", "QQ_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
+        _TAGS = list(dict.fromkeys(_TAGS))  # 去重保序
+        tasks["history"] = _safe(lambda: supabase.table("memories").select("content, tags")
+                                 .in_("tags", _TAGS).order("created_at", desc=True).limit(8).execute())
 
     # 4. Pinecone 向量记忆（可选）
-    pinecone_context = "无相关深层记忆"
     if query and pinecone_memory:
-        try:
-            def _search_pc():
-                return pinecone_memory.search(query=str(query), user_id=user_id,
-                                              filters={"user_id": user_id}, limit=5)
-            mr = await asyncio.to_thread(_search_pc)
-            if mr:
-                rl = mr.get("results", mr) if isinstance(mr, dict) else mr
-                if isinstance(rl, list) and rl:
-                    pinecone_context = "\n".join(
-                        [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl]
-                    )
-        except Exception:
-            pass
-
-    # 5. 近期跨渠道对话流水（最近 8 条，按时间正序）
-    history_text = ""
-    if supabase:
-        try:
-            _TAGS = [channel_tag, "Web_Chat", "TG_MSG", "QQ_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
-            _TAGS = list(dict.fromkeys(_TAGS))  # 去重保序
-            def _fetch_history():
-                return supabase.table("memories").select("content, tags") \
-                    .in_("tags", _TAGS).order("created_at", desc=True).limit(8).execute()
-            hr = await asyncio.to_thread(_fetch_history)
-            if hr and hr.data:
-                lines = [f"- {str(row.get('content', '')).strip()[:300]}" for row in reversed(hr.data)
-                         if str(row.get('content', '')).strip()]
-                if lines:
-                    history_text = "\n".join(lines)
-        except Exception:
-            pass
+        tasks["pinecone"] = _safe(lambda: pinecone_memory.search(query=str(query), user_id=user_id,
+                                 filters={"user_id": user_id}, limit=5))
 
     # 6. 设备状态快照（复用 gateway 渲染，可开关）
-    device_snapshot = ""
     if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
         try:
             import gateway as _gw
             if supabase:
-                device_snapshot = _gw._fetch_device_snapshot(supabase)
+                tasks["device"] = _safe(lambda: _gw._fetch_device_snapshot(supabase))
         except Exception:
-            device_snapshot = ""
+            pass
+
+    results = await asyncio.gather(*tasks.values()) if tasks else []
+    r = dict(zip(tasks.keys(), results))
+
+    # ---- 组装（全部带默认值，失败优雅降级） ----
+    persona = r.get("persona") or "你是一个通用智能助手。"
+
+    user_prof = "暂无"
+    pr = r.get("profile")
+    if pr and pr.data:
+        user_prof = "\n".join([f"- {row['key']}: {str(row['value'])[:200]}" for row in pr.data[:30]])
+
+    core_summaries = "无长期记忆"
+    sr = r.get("summaries")
+    if sr and sr.data:
+        core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
+
+    pinecone_context = "无相关深层记忆"
+    mr = r.get("pinecone")
+    if mr:
+        rl = mr.get("results", mr) if isinstance(mr, dict) else mr
+        if isinstance(rl, list) and rl:
+            pinecone_context = "\n".join(
+                [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl]
+            )
+
+    history_text = ""
+    hr = r.get("history")
+    if hr and hr.data:
+        lines = [f"- {str(row.get('content', '')).strip()[:300]}" for row in reversed(hr.data)
+                 if str(row.get('content', '')).strip()]
+        if lines:
+            history_text = "\n".join(lines)
+
+    device_snapshot = r.get("device") or ""
 
     parts = [
         f"[系统当前状态] 当前时间:{time_str}(北京时间)。当前聊天渠道：{_channel_display_name(channel_tag)}。",

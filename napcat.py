@@ -299,30 +299,46 @@ async def _process_napcat_message(data: dict, send):
             return
 
         # 构造 prompt（🧠 注入记忆/画像/设备等完整上下文，与网页渠道对齐）
-        system_ctx = await dep._build_channel_context(clean_text, channel_tag="QQ_MSG")
-        prompt = f"""
-        收到一条 QQ 消息: {clean_text}
-        发送者: {sender.get('nickname', '未知')}
+        target_id = group_id if message_type == "group" else sender_id
+        try:
+            system_ctx = await dep._build_channel_context(clean_text, channel_tag="QQ_MSG")
+            prompt = f"""
+            收到一条 QQ 消息: {clean_text}
+            发送者: {sender.get('nickname', '未知')}
 
-        请用符合人设的口吻回复。纯文本，简洁自然。
-        """
-        reply = await dep._ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
+            请用符合人设的口吻回复。纯文本，简洁自然。
+            """
+            reply = await dep._ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
+        except Exception as e:
+            _naplog(f"❌ QQ 回复生成失败: {e}")
+            reply = ""
 
-        if reply:
-            target_id = group_id if message_type == "group" else sender_id
-            await send_qq_message(target_id, reply, is_group=(message_type == "group"))
-
-            # 记忆入库
+        if not reply:
+            # LLM 失败/空回复：兜底回一句 + 记录入库，不再静默吞消息
+            await send_qq_message(target_id, "（刚才信号不太好，好像没接住你的话……再说一遍好不好？）",
+                                  is_group=(message_type == "group"))
             if hasattr(dep, "_save_memory_to_db"):
                 await asyncio.to_thread(
                     dep._save_memory_to_db,
-                    "🤖 QQ 互动",
-                    f"{sender.get('nickname', '未知')}: {clean_text}\n回复: {reply}",
-                    "流水", "温柔", "QQ_MSG"
+                    "⚠️ QQ 未回复",
+                    f"{sender.get('nickname', '未知')}: {clean_text}\n[LLM 未返回内容，已兜底]",
+                    "流水", "平静", "QQ_MSG"
                 )
+            return
 
-            # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
-            asyncio.create_task(check_and_summarize_all())
+        await send_qq_message(target_id, reply, is_group=(message_type == "group"))
+
+        # 记忆入库
+        if hasattr(dep, "_save_memory_to_db"):
+            await asyncio.to_thread(
+                dep._save_memory_to_db,
+                "🤖 QQ 互动",
+                f"{sender.get('nickname', '未知')}: {clean_text}\n回复: {reply}",
+                "流水", "温柔", "QQ_MSG"
+            )
+
+        # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
+        asyncio.create_task(check_and_summarize_all())
     except Exception as e:
         _naplog(f"❌ 处理 QQ 消息失败: {e}")
 
