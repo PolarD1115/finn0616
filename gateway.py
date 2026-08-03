@@ -417,6 +417,11 @@ class HostFixMiddleware:
             await self._handle_admin_page(send)
             return
 
+        # ---------- 📱 Mini App 配置面板（前端直连 Supabase） ----------
+        if scope["path"] == "/miniapp" or scope["path"] == "/miniapp/":
+            await self._handle_miniapp_page(send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -1028,6 +1033,25 @@ class HostFixMiddleware:
                     "headers": [(b"content-type", b"text/html; charset=utf-8"),
                                 (b"access-control-allow-origin", b"*")]})
         await send({"type": "http.response.body", "body": html.encode("utf-8")})
+
+    async def _handle_miniapp_page(self, send):
+        """返回 Mini App 配置面板（纯静态 HTML，前端直连 Supabase）。
+        页面从同目录 miniapp.html 读取；找不到则返回提示。
+        """
+        try:
+            import os as _os
+            _here = _os.path.dirname(_os.path.abspath(__file__))
+            with open(_os.path.join(_here, "miniapp.html"), "r", encoding="utf-8") as f:
+                html = f.read()
+            body = html.encode("utf-8")
+            status = 200
+        except Exception as e:
+            body = f"miniapp.html 未找到: {e}".encode("utf-8")
+            status = 500
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/html; charset=utf-8"),
+                                (b"access-control-allow-origin", b"*")]})
+        await send({"type": "http.response.body", "body": body})
 
 
 # ==========================================
