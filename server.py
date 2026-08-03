@@ -115,6 +115,28 @@ class PineconeMemoryClient:
             print(f"❌ Pinecone 搜索失败: {e}")
             return []
 
+    def find_similar(self, text, top_k=3):
+        """返回与 text 最相似的已有记忆及相似度分数：[(text, score), ...]，按分数降序。
+        用于写入前的语义去重判断。无索引或失败时返回 []。
+        """
+        if not self.index:
+            return []
+        try:
+            vec = _get_embedding(text)
+            if not vec:
+                return []
+            r = self.index.query(vector=vec, top_k=top_k, include_metadata=True)
+            out = []
+            for m in r.matches:
+                score = getattr(m, "score", None)
+                mem_text = (m.metadata or {}).get("text", "") if m.metadata else ""
+                if score is not None:
+                    out.append((mem_text, float(score)))
+            return out
+        except Exception as e:
+            print(f"❌ Pinecone 相似度查询失败: {e}")
+            return []
+
     def add(self, messages, user_id=None):
         user_id = user_id or MEM0_USER_ID
         if not self.index:
@@ -333,6 +355,80 @@ def _get_embedding(text: str):
         return []
     except Exception:
         return []
+
+
+# ==========================================
+# 🧠 长期记忆写入前的「判断 + 去重」（自建轻量 Mem0 逻辑）
+# ==========================================
+# 目标：AI 主动记事 (save_memory 工具) 时，避免两类垃圾进长期记忆库：
+#   1. 没长期价值的碎碎念 (太短 / 明显闲聊)
+#   2. 和已有记忆语义重复的内容 (换个说法又存一遍)
+# 说明：只作用于 save_memory 这个"AI 主动判断值得记"的入口；
+#       对话流水 / 阶段总结等自动写入不走这里 (它们本就该全存或已是压缩结果)。
+
+# 判定为"闲聊/无长期价值"的关键词特征（命中且内容很短时跳过）
+_LOW_VALUE_HINTS = (
+    "哈哈", "嗯嗯", "好的", "在吗", "早安", "晚安", "谢谢", "不客气",
+    "ok", "okay", "收到", "😂", "🤣", "?", "？", "。。。", "...",
+)
+
+
+def _memory_value_ok(title: str, content: str) -> tuple[bool, str]:
+    """价值判断（轻量规则版，零延迟零成本）。返回 (是否值得记, 原因)。"""
+    text = f"{title} {content}".strip()
+    n = len(content.strip())
+
+    # 阈值可配
+    min_len = 0
+    try:
+        min_len = int(os.environ.get("MEMORY_MIN_LEN", "8"))
+    except (ValueError, TypeError):
+        min_len = 8
+
+    if n < min_len:
+        return False, f"内容过短({n}字<{min_len})"
+
+    # 很短 + 命中闲聊特征 → 判为无长期价值
+    if n < 20:
+        low = text.lower()
+        if any(h in low for h in _LOW_VALUE_HINTS):
+            return False, "疑似日常闲聊(短且命中闲聊特征)"
+
+    return True, "ok"
+
+
+def _memory_is_duplicate(title: str, content: str) -> tuple[bool, str]:
+    """语义去重：与已有记忆做向量相似度比对。返回 (是否重复, 说明)。
+    需要 Pinecone 可用；不可用时不拦截（返回 False）。
+    """
+    # 去重开关 + 阈值（0~1，越高越严格；默认 0.90 只拦几乎重复的）
+    if os.environ.get("MEMORY_DEDUP_ENABLED", "true").strip().lower() in ("0", "false", "no"):
+        return False, "去重已关闭"
+    try:
+        threshold = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.90"))
+    except (ValueError, TypeError):
+        threshold = 0.90
+
+    probe = f"{title}: {content}"
+    similar = pinecone_memory.find_similar(probe, top_k=3)
+    if not similar:
+        return False, "无相似历史或向量库不可用"
+
+    top_text, top_score = similar[0]
+    if top_score >= threshold:
+        return True, f"与已有记忆高度相似(score={top_score:.3f}≥{threshold}): {top_text[:60]}"
+    return False, f"最高相似度{top_score:.3f}<{threshold}"
+
+
+def _should_save_memory(title: str, content: str) -> tuple[bool, str]:
+    """写入前总判断：先价值判断，再语义去重。返回 (是否写入, 原因)。"""
+    ok, why = _memory_value_ok(title, content)
+    if not ok:
+        return False, why
+    dup, why = _memory_is_duplicate(title, content)
+    if dup:
+        return False, why
+    return True, "值得保存"
 
 
 def _push_wechat(text: str, title: str = "通知"):
@@ -705,7 +801,14 @@ async def echo(text: str):
 @mcp.tool()
 @mcp_error_handler
 async def save_memory(title: str, content: str, category: str = "事件"):
-    """【保存记忆】将一条信息持久化到数据库，同时写入 Pinecone 向量库。"""
+    """【保存记忆】将一条信息持久化到数据库，同时写入 Pinecone 向量库。
+    写入前会做「价值判断 + 语义去重」：太短/闲聊的、与已有记忆几乎重复的会被跳过。
+    """
+    # 🧠 写入前判断：不值得记 or 语义重复 → 跳过（自建轻量 Mem0 逻辑）
+    ok, reason = await asyncio.to_thread(_should_save_memory, title, content)
+    if not ok:
+        return f"⏭️ 已跳过（{reason}）：{title}"
+
     await asyncio.to_thread(_save_memory_to_db, title, content, category)
     try:
         await asyncio.to_thread(pinecone_memory.add, [{"role": "assistant", "content": f"{title}: {content}"}])
