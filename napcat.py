@@ -298,16 +298,15 @@ async def _process_napcat_message(data: dict, send):
             )
             return
 
-        # 构造 prompt
-        curr_persona = dep._get_current_persona()
+        # 构造 prompt（🧠 注入记忆/画像/设备等完整上下文，与网页渠道对齐）
+        system_ctx = await dep._build_channel_context(clean_text, channel_tag="QQ_MSG")
         prompt = f"""
         收到一条 QQ 消息: {clean_text}
         发送者: {sender.get('nickname', '未知')}
-        当前人设: {curr_persona}
 
         请用符合人设的口吻回复。纯文本，简洁自然。
         """
-        reply = await dep._ask_llm_async(client, prompt, temperature=0.8)
+        reply = await dep._ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
 
         if reply:
             target_id = group_id if message_type == "group" else sender_id

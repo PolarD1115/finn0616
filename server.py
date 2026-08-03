@@ -394,6 +394,140 @@ def _get_current_persona() -> str:
     return f"{base_persona}\n\n{weave_instruction}"
 
 
+# 渠道标签 → 显示名（用于在 system prompt 中告诉 AI 当前聊天渠道）
+# 可用环境变量 CHANNEL_DISPLAY_MAP（JSON）覆盖，例如：
+#   CHANNEL_DISPLAY_MAP={"Web_Chat":"橘子岛","QQ_MSG":"QQ","TG_MSG":"TG"}
+DEFAULT_CHANNEL_DISPLAY = {
+    "Web_Chat": "橘子岛",
+    "QQ_MSG": "QQ",
+    "QQ_Chat": "QQ",
+    "QQ_Group": "QQ",
+    "TG_MSG": "TG",
+    "Email_Process": "邮件",
+}
+
+
+def _channel_display_name(tag: str) -> str:
+    """渠道标签 → 展示名。优先读 CHANNEL_DISPLAY_MAP 环境变量（JSON），未命中则用内置默认。"""
+    if tag:
+        try:
+            overrides = json.loads(os.environ.get("CHANNEL_DISPLAY_MAP", "{}") or "{}")
+            if isinstance(overrides, dict) and tag in overrides:
+                return str(overrides[tag])
+        except Exception:
+            pass
+        if tag in DEFAULT_CHANNEL_DISPLAY:
+            return DEFAULT_CHANNEL_DISPLAY[tag]
+    return tag or "未知渠道"
+
+
+async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -> str:
+    """
+    🧠 全渠道智能体上下文（TG / QQ 渠道注入用）
+    与网页渠道 /v1/chat/completions 的 _inject_context 对齐，统一注入：
+    - AI 人设（AI_PERSONA，含数据库动态人设 sys_ai_persona）
+    - 用户画像（user_facts，排除系统配置键）
+    - 阶段总结（memories tags=Core_Cognition 最近 3 条）
+    - Pinecone 向量记忆（按 query 检索，可选）
+    - 近期跨渠道对话流水（Web/TG/QQ/邮件，最近 8 条）
+    - 设备状态快照（device_data 最新一条，复用 gateway 渲染，可开关）
+    任何环节失败均优雅降级，返回可直接作为 system prompt 的文本。
+    """
+    user_name = os.environ.get("USER_NAME", "用户")
+    user_id = os.environ.get("USER_ID", "default")
+
+    now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    time_str = now_bj.strftime("%Y-%m-%d %H:%M")
+
+    # 1. 人设（数据库动态人设优先）
+    persona = _get_current_persona()
+
+    # 2. 用户画像
+    user_prof = "暂无"
+    if supabase:
+        try:
+            def _fetch_profile():
+                return supabase.table("user_facts").select("key, value") \
+                    .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona").execute()
+            pr = await asyncio.to_thread(_fetch_profile)
+            if pr and pr.data:
+                user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in pr.data[:30]])
+        except Exception:
+            pass
+
+    # 3. 阶段总结（长期记忆 Core_Cognition）
+    core_summaries = "无长期记忆"
+    if supabase:
+        try:
+            def _fetch_summaries():
+                return supabase.table("memories").select("content") \
+                    .eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute()
+            sr = await asyncio.to_thread(_fetch_summaries)
+            if sr and sr.data:
+                core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
+        except Exception:
+            pass
+
+    # 4. Pinecone 向量记忆（可选）
+    pinecone_context = "无相关深层记忆"
+    if query and pinecone_memory:
+        try:
+            def _search_pc():
+                return pinecone_memory.search(query=str(query), user_id=user_id,
+                                              filters={"user_id": user_id}, limit=5)
+            mr = await asyncio.to_thread(_search_pc)
+            if mr:
+                rl = mr.get("results", mr) if isinstance(mr, dict) else mr
+                if isinstance(rl, list) and rl:
+                    pinecone_context = "\n".join(
+                        [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl]
+                    )
+        except Exception:
+            pass
+
+    # 5. 近期跨渠道对话流水（最近 8 条，按时间正序）
+    history_text = ""
+    if supabase:
+        try:
+            _TAGS = [channel_tag, "Web_Chat", "TG_MSG", "QQ_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
+            _TAGS = list(dict.fromkeys(_TAGS))  # 去重保序
+            def _fetch_history():
+                return supabase.table("memories").select("content, tags") \
+                    .in_("tags", _TAGS).order("created_at", desc=True).limit(8).execute()
+            hr = await asyncio.to_thread(_fetch_history)
+            if hr and hr.data:
+                lines = [f"- {str(row.get('content', '')).strip()[:300]}" for row in reversed(hr.data)
+                         if str(row.get('content', '')).strip()]
+                if lines:
+                    history_text = "\n".join(lines)
+        except Exception:
+            pass
+
+    # 6. 设备状态快照（复用 gateway 渲染，可开关）
+    device_snapshot = ""
+    if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
+        try:
+            import gateway as _gw
+            if supabase:
+                device_snapshot = _gw._fetch_device_snapshot(supabase)
+        except Exception:
+            device_snapshot = ""
+
+    parts = [
+        f"[系统当前状态] 当前时间:{time_str}(北京时间)。当前聊天渠道：{_channel_display_name(channel_tag)}。",
+        f"【{user_name}的核心画像】:\n{user_prof}",
+        "--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---",
+        f"【深层关联记忆】:\n{pinecone_context}",
+        f"【近3次阶段总结】:\n{core_summaries}",
+    ]
+    if history_text:
+        parts.append(f"【近期对话回顾】:\n{history_text}")
+    if device_snapshot:
+        parts.append(device_snapshot)
+
+    return f"{persona}\n\n" + "\n\n".join(parts)
+
+
 def _format_time_cn(iso_str: str) -> str:
     """UTC ISO 字符串 → 北京时间 (MM-DD HH:MM)。"""
     if not iso_str:

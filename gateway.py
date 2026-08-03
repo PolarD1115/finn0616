@@ -69,6 +69,184 @@ def _get_pinecone_memory():
         return None
 
 
+# ==========================================
+# 🆕 设备状态快照（device_data 最新一条 → 注入 system prompt）
+# ==========================================
+
+def _parse_json_field(v):
+    """PostgREST 可能把 jsonb 以 JSON 字符串返回，统一归一化成 dict/list"""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+    return v
+
+
+def _fmt_duration_cn(ms):
+    """毫秒 → 'x小时y分'"""
+    total_min = round((ms or 0) / 60000)
+    h, m = divmod(total_min, 60)
+    if h == 0:
+        return f"{m}分钟"
+    if m == 0:
+        return f"{h}小时"
+    return f"{h}小时{m}分"
+
+
+def _fmt_age_cn(local_wall, now_bj):
+    """两者都是北京时间墙钟（naive），相减即真实时长 → 'x 分钟前'"""
+    if not local_wall:
+        return ""
+    mins = max(0, int((now_bj - local_wall).total_seconds() // 60))
+    if mins < 1:
+        return "刚刚"
+    if mins < 60:
+        return f"{mins} 分钟前"
+    h = mins // 60
+    if h < 24:
+        return f"{h} 小时前"
+    return f"{h // 24} 天前"
+
+
+def _parse_device_ts(s):
+    """device_data.timestamp 是 'YYYY-MM-DD HH:mm:ss'（设备本地=北京时间）"""
+    try:
+        return datetime.datetime.strptime(str(s)[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _app_name_of(app_usage, pkg):
+    """通过 packageName 在 app_usage 里找中文应用名"""
+    if isinstance(app_usage, list) and pkg:
+        for a in app_usage:
+            if isinstance(a, dict) and a.get("packageName") == pkg and a.get("appName"):
+                return a["appName"]
+    return pkg
+
+
+def _dedupe_notifs(notifs, max_n):
+    """通知去重（appName|title|content），按 timestamp 倒序取最近 N 条"""
+    if not isinstance(notifs, list) or not notifs or max_n <= 0:
+        return []
+    sorted_n = sorted(notifs, key=lambda n: (n or {}).get("timestamp", 0) or 0, reverse=True)
+    seen, out = set(), []
+    for n in sorted_n:
+        if len(out) >= max_n:
+            break
+        n = n or {}
+        key = f"{n.get('appName') or n.get('packageName') or ''}|{n.get('title') or ''}|{n.get('content') or ''}"
+        if key in seen:
+            continue
+        seen.add(key)
+        label = n.get("appName") or n.get("packageName") or ""
+        text = "：".join([x for x in (n.get("title"), n.get("content")) if x])
+        out.append(f'{label}「{text}」' if label else f'「{text}」')
+    return out
+
+
+def _fetch_device_snapshot(sb):
+    """
+    拉取 device_data 最新一条，渲染成可注入 prompt 的文本块。
+    只注入最新一条，并标注数据更新时间（设备时间 + 距今多久前）。
+    失败/无数据时返回空串，由调用方优雅降级。
+    """
+    top_apps = int(os.environ.get("DEVICE_CONTEXT_TOP_APPS", "5") or "5")
+    max_notifs = int(os.environ.get("DEVICE_CONTEXT_MAX_NOTIFS", "3") or "3")
+
+    res = sb.table("device_data").select("*").order("id", desc=True).limit(1).execute()
+    try:
+        rows = res.data or []
+    except Exception:
+        rows = (res or {}).get("data", []) if isinstance(res, dict) else []
+    if not rows:
+        return ""
+
+    row = rows[0]
+    app_usage = _parse_json_field(row.get("app_usage"))
+    notifications = _parse_json_field(row.get("notifications"))
+    health = _parse_json_field(row.get("health_data")) or {}
+
+    ts_raw = str(row.get("timestamp") or "")[:16]
+    parsed = _parse_device_ts(row.get("timestamp"))
+    now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    age = _fmt_age_cn(parsed, now_bj) if parsed else ""
+    updated = f"{ts_raw}（{age}）" if ts_raw and age else (ts_raw or "--")
+
+    lines = [f"【设备状态快照】更新时间：{updated}"]
+
+    # 位置
+    loc = "".join([x or "" for x in (row.get("location_city"), row.get("location_district"), row.get("location_street"))])
+    if row.get("location_address"):
+        lines.append(f"📍 位置：{row['location_address']}")
+    elif loc:
+        lines.append(f"📍 位置：{loc}")
+
+    # 前台应用
+    if row.get("foreground_app"):
+        lines.append(f"📱 前台应用：{_app_name_of(app_usage, row.get('foreground_app'))}")
+
+    # 健康数据
+    health_parts = []
+    if health.get("heartRate") is not None:
+        health_parts.append(f"心率 {health['heartRate']}bpm")
+    if health.get("stepsToday") is not None:
+        health_parts.append(f"步数 {health['stepsToday']}")
+    if health.get("caloriesToday") is not None:
+        health_parts.append(f"卡路里 {health['caloriesToday']}kcal")
+    if health.get("spo2") is not None:
+        health_parts.append(f"血氧 {health['spo2']}%")
+    if health.get("stress") is not None:
+        health_parts.append(f"压力 {health['stress']}")
+    if health_parts:
+        lines.append("💓 健康：" + "｜".join(health_parts))
+
+    if health.get("sleepTotalMinutes") is not None:
+        sleep_bits = []
+        if health.get("sleepDeepMinutes"):
+            sleep_bits.append(f"深睡{round(health['sleepDeepMinutes'] / 60)}h")
+        if health.get("sleepLightMinutes"):
+            sleep_bits.append(f"浅睡{round(health['sleepLightMinutes'] / 60)}h")
+        if health.get("sleepRemMinutes"):
+            sleep_bits.append(f"REM {round(health['sleepRemMinutes'] / 60)}h")
+        sleep_line = f"😴 睡眠：{_fmt_duration_cn(health['sleepTotalMinutes'] * 60000)}"
+        if sleep_bits:
+            sleep_line += "（" + " / ".join(sleep_bits) + "）"
+
+        def _hm(ms):
+            # 睡眠起止是 epoch 毫秒，转北京时间（UTC+8）展示
+            try:
+                return (datetime.datetime.utcfromtimestamp(ms / 1000) + datetime.timedelta(hours=8)).strftime("%H:%M")
+            except Exception:
+                return None
+
+        st, wk = _hm(health.get("sleepStartMs")), _hm(health.get("sleepWakeupMs"))
+        if st and wk:
+            sleep_line += f" {st}–{wk}"
+        lines.append(sleep_line)
+
+    # 应用使用 Top
+    if isinstance(app_usage, list) and app_usage:
+        apps = sorted(app_usage, key=lambda a: (a or {}).get("totalTimeInForeground", 0) or 0, reverse=True)[:top_apps]
+        apps_txt = "、".join([
+            f"{a.get('appName') or a.get('packageName') or '未知'}({_fmt_duration_cn(a.get('totalTimeInForeground'))})"
+            for a in apps
+        ])
+        lines.append(f"📊 应用使用 Top{len(apps)}：{apps_txt}")
+
+    # 通知（去重后最近 N 条）
+    notifs = _dedupe_notifs(notifications, max_notifs)
+    if notifs:
+        lines.append("🔔 最近通知：" + "；".join(notifs))
+
+    # 设备事件
+    if row.get("device_event"):
+        lines.append(f"⚡ 设备事件：{row['device_event']}")
+
+    return "\n".join(lines)
+
+
 class HostFixMiddleware:
     """ASGI 中间件：路由分发 + OpenAI 兼容代理 + MCP 下游转发"""
 
@@ -422,14 +600,33 @@ class HostFixMiddleware:
             _log(f"拉取上文失败（跳过）: {e}")
 
         # 拼装 system prompt
+        # 渠道显示名：懒加载 server 模块的映射（避免模块级循环依赖）
+        try:
+            import server as _srv
+            channel_display = _srv._channel_display_name(chat_tag)
+        except Exception:
+            channel_display = chat_tag
+
         status_inject = (
             f"\n\n[系统当前状态]\n当前时间:{time_str}(北京时间),距离上次聊天:{silence_hours}h。\n"
+            f"当前聊天渠道：{channel_display}\n"
             f"【{user_name}的核心画像】:\n{user_prof}\n\n"
             f"--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---\n"
             f"【深层关联记忆】:\n{pinecone_context}\n"
             f"【近3次阶段总结】:\n{core_summaries}\n"
             f"------------------------------------------------\n"
         )
+
+        # 🆕 设备状态快照（device_data 最新一条，含更新时间标注；可开关）
+        device_snapshot = ""
+        if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
+            try:
+                device_snapshot = _fetch_device_snapshot(sb)
+                if device_snapshot:
+                    status_inject += f"\n{device_snapshot}\n"
+            except Exception as e:
+                _log(f"⚠️ 设备快照注入失败（跳过）: {e}")
+
         if persona:
             status_inject = f"{persona}\n{status_inject}"
 
@@ -457,7 +654,7 @@ class HostFixMiddleware:
             for j, hm in enumerate(history_msgs):
                 req_data["messages"].insert(sys_idx + j, hm)
 
-        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条")
+        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else ""))
 
     async def _save_conversation(self, sb, user_msg, ai_msg, reasoning, tool_calls):
         """异步把本轮对话存到 Supabase memories 表 + Pinecone"""

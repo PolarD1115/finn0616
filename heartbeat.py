@@ -314,7 +314,8 @@ async def async_telegram_polling():
     from server import (
         _get_llm_client, _ask_llm_async, _push_wechat,
         _save_memory_to_db, _get_current_persona,
-        get_latest_diary, where_is_user, pinecone_memory
+        get_latest_diary, where_is_user, pinecone_memory,
+        _build_channel_context
     )
 
     import requests
@@ -368,18 +369,15 @@ async def async_telegram_polling():
                 client = _get_llm_client("main_chat")
                 if client:
                     try:
-                        recent_mem = await get_latest_diary()
-                        curr_loc = await where_is_user()
-                        curr_persona = _get_current_persona()
+                        # 🧠 注入记忆/画像/设备等完整上下文（与网页渠道对齐）
+                        system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
 
                         prompt = f"""
                         用户发来消息: {text}
-                        当前人设: {curr_persona}
-                        近期记录: {recent_mem}
 
                         请用符合人设的口吻回复用户。纯文本，自然真诚。
                         """
-                        reply = await _ask_llm_async(client, prompt, temperature=0.8)
+                        reply = await _ask_llm_async(client, prompt, system_prompt=system_ctx, temperature=0.8)
 
                         if reply:
                             await asyncio.to_thread(
