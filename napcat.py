@@ -355,6 +355,14 @@ def _get_qq_aggregator(send):
 
         await send_qq_message(target_id, reply, is_group=is_group)
 
+        # 欲望驱动：用户消息（分类）+ AI 已回复 两个事件入队。全部吞异常，不影响聊天。
+        try:
+            import desire_bridge
+            await desire_bridge.record_user_message(text)
+            await desire_bridge.record_assistant_message()
+        except Exception as _dee:
+            print(f"💗 [欲望驱动] QQ 事件入队跳过：{_dee}")
+
         # 记忆入库
         if hasattr(dep, "_save_memory_to_db"):
             await asyncio.to_thread(

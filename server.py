@@ -242,6 +242,14 @@ def _get_llm_client(provider: str = "openai"):
         base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
         model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
+    elif provider == "deepseek":
+        # DeepSeek V4 Flash：专用于消息情感分类（便宜、快）。
+        # 注意：V4 默认开启 thinking，关闭方式是调用 create 时传
+        #       extra_body={"thinking": {"type": "disabled"}}（见 desire_bridge.classify_message_sync）。
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
+        model_name = os.environ.get("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
     elif provider == "vision":
         api_key = os.environ.get("VISION_API_KEY", "").strip()
         base_url = os.environ.get("VISION_BASE_URL", "").strip()
@@ -431,11 +439,14 @@ def _should_save_memory(title: str, content: str) -> tuple[bool, str]:
     return True, "值得保存"
 
 
-def _push_wechat(text: str, title: str = "通知"):
+def _push_wechat(text: str, title: str = "通知", plain: bool = False):
     """
     通用消息推送函数。
     默认通过 Telegram Bot 推送，可扩展为其他渠道。
     所有凭证从环境变量读取。
+
+    plain=True 时：不加 *title* 前缀、不用 Markdown，直接发正文——
+    用于"主动问候"这类希望像真人聊天、而非系统通知的场景。
     """
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TG_CHAT_ID", "").strip()
@@ -444,11 +455,15 @@ def _push_wechat(text: str, title: str = "通知"):
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={
-            "chat_id": chat_id,
-            "text": f"*{title}*\n\n{text}",
-            "parse_mode": "Markdown"
-        }, timeout=15)
+        if plain:
+            payload = {"chat_id": chat_id, "text": text}
+        else:
+            payload = {
+                "chat_id": chat_id,
+                "text": f"*{title}*\n\n{text}",
+                "parse_mode": "Markdown",
+            }
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"⚠️ 推送失败: {e}")
 

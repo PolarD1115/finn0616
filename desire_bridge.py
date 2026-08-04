@@ -51,6 +51,8 @@ EVENTS_QUEUE_KEY = "desire_events_queue"
 REFRACTORY_KEY = "desire_refractory"          # v2② 不应期计数 Dict[str,int]
 LAST_ACTION_KEY = "desire_last_action"        # v2③ 上一拍 want_action
 ACTION_REPEAT_KEY = "desire_action_repeat"    # v2③ 连续相同动作拍数
+NEXT_HEARTBEAT_KEY = "desire_next_heartbeat_at"  # v2⑤ 下次心跳醒来的时间戳（毫秒）
+ATTACHMENT_BASELINE_KEY = "desire_attachment_baseline"  # v2④ attachment 当前地板值（初始=HOME）
 
 # pulse 增量：主人来的情感冲击 vs 自经历（对齐攻略：自经历更小）
 PULSE_FROM_USER = 0.18
@@ -65,6 +67,16 @@ def is_desire_driven() -> bool:
 def is_desire_coupling() -> bool:
     """v2① 耦合网开关。默认关（关着时 tick 跳过 apply_coupling）。"""
     return os.environ.get("DESIRE_COUPLING", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_heartbeat_autonomy() -> bool:
+    """v2⑤ 自主心跳开关。默认关（关着时返回固定 BASE 间隔，不做动态计算）。"""
+    return os.environ.get("HEARTBEAT_AUTONOMY", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_baseline_drift() -> bool:
+    """v2④ 基线漂移开关。默认关（关着时 attachment 地板固定在 HOME，不漂移）。"""
+    return os.environ.get("DESIRE_BASELINE_DRIFT", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _tz_offset() -> float:
@@ -113,6 +125,123 @@ def _save_fact(key: str, value: Any) -> None:
         print(f"[Desire] save {key} failed: {e}")
 
 
+# =============================================================================
+# 消息语义分类（LLM）—— 情感引擎的事件入口
+# =============================================================================
+# emotion_engine 只消费 {label, confidence}，不自己分类。这里补上「生产」这一环：
+# 调一个便宜的 LLM 把用户消息判成 16 类之一 + 置信度，再塞进事件队列。
+# 设计原则：
+#   - 失败绝不阻塞正常回复：任何异常 → 降级为 ("neutral", 0.5)。
+#   - 用便宜模型（默认 silicon1），分类不值得烧主对话模型的钱。
+#   - 只做语义判断，不做关键词匹配（标签本身就是语义级的）。
+
+# 16 个合法标签（必须与 emotion_engine.LABEL_DELTAS 的键完全一致）
+CLASSIFY_LABELS = tuple(ee.LABEL_DELTAS.keys())
+
+# 分类用的 LLM provider。默认 deepseek（V4 Flash，便宜快）。
+# 可用环境变量 CLASSIFY_PROVIDER 覆盖（如改回 silicon1 / main_chat）。
+def _classify_provider() -> str:
+    return os.environ.get("CLASSIFY_PROVIDER", "deepseek").strip() or "deepseek"
+
+_CLASSIFY_SYSTEM = (
+    "你是一个消息情感分类器。给定用户发来的一条（或合并的多条）消息，"
+    "判断它相对于亲密伴侣关系的情感基调，从下面固定的标签集合里选**恰好一个**最贴切的：\n"
+    "- affectionate 亲昵示爱 / playful 玩闹调侃 / vulnerable 示弱倾诉 / reassuring 安抚承诺\n"
+    "- cold 冷淡敷衍 / conflict 争执冲突 / distant 疏远回避 / struggling 自己正陷入困境\n"
+    "- intimate_reference 提及亲密 / intimate_event 描述亲密行为\n"
+    "- neutral 中性日常 / hostile 敌意攻击\n"
+    "- fear_separation 害怕分离被抛弃 / fear_death 害怕生死 / fear_concern 担心对方安危 / fear_general 泛化的害怕不安\n"
+    "只输出一行 JSON，不要任何多余文字：\n"
+    '{"label": "上面标签之一的英文名", "confidence": 0.0到1.0之间的小数}\n'
+    "confidence 表示你有多确定：语气明确给 0.8~1.0，含糊或中性给 0.4~0.6。"
+)
+
+
+def _thinking_extra_body(model_name: str) -> Dict[str, Any]:
+    """
+    DeepSeek V4 系列（v4-flash / v4-pro / deepseek-chat 等）默认开启 thinking，
+    分类任务不需要思维链，显式关闭以省钱提速。
+    官方写法：OpenAI SDK 下 extra_body={"thinking": {"type": "disabled"}}。
+    仅对 deepseek 系模型下发该字段，其他模型不传（免得报未知参数）。
+    """
+    m = (model_name or "").lower()
+    if "deepseek" in m or "v4-flash" in m or "v4-pro" in m:
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
+def classify_message_sync(text: str, provider: Optional[str] = None) -> Dict[str, Any]:
+    """
+    同步版消息分类（供 asyncio.to_thread 包裹调用）。
+    返回 {"label": <str>, "confidence": <float>}；任何失败降级为中性。
+    text 为空 → 直接返回中性，不调模型。
+
+    provider 默认取环境变量 CLASSIFY_PROVIDER（默认 "deepseek"）。
+    DeepSeek V4 默认开 thinking，本函数会显式关闭（见 _thinking_extra_body）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"label": "neutral", "confidence": 0.5}
+
+    prov = provider or _classify_provider()
+    try:
+        from server import _get_llm_client
+        client = _get_llm_client(prov)
+        # 分类模型没配就回退主对话模型；再没有就降级中性
+        if not client:
+            client = _get_llm_client("main_chat")
+        if not client:
+            return {"label": "neutral", "confidence": 0.5}
+
+        model_name = getattr(client, "custom_model_name", "gpt-3.5-turbo")
+        # 截断超长消息，分类只需前若干字符即可判基调
+        snippet = text[:500]
+        create_kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": _CLASSIFY_SYSTEM},
+                {"role": "user", "content": snippet},
+            ],
+            "temperature": 0.0,
+        }
+        # DeepSeek V4 关闭 thinking（非思考模式支持 temperature，安全）
+        extra = _thinking_extra_body(model_name)
+        if extra:
+            create_kwargs["extra_body"] = extra
+        resp = client.chat.completions.create(**create_kwargs)
+        raw = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        return _parse_classification(raw)
+    except Exception as e:
+        print(f"[Desire] classify failed, fallback neutral: {e}")
+        return {"label": "neutral", "confidence": 0.5}
+
+
+def _parse_classification(raw: str) -> Dict[str, Any]:
+    """从 LLM 原始输出里抠出 {label, confidence}，容错到底：解析不出就中性。"""
+    import re as _re
+    if not raw:
+        return {"label": "neutral", "confidence": 0.5}
+    # 剥离可能的 <think> 块与 ```json 围栏
+    raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL | _re.IGNORECASE)
+    m = _re.search(r"\{.*\}", raw, flags=_re.DOTALL)
+    label = "neutral"
+    confidence = 0.5
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            label = str(obj.get("label", "neutral")).strip()
+            confidence = float(obj.get("confidence", 0.5))
+        except Exception:
+            pass
+    # 校验标签合法，非法则降级中性（confidence 也压低）
+    if label not in CLASSIFY_LABELS:
+        label = "neutral"
+        confidence = min(confidence, 0.5)
+    # 夹到 [0,1]
+    confidence = max(0.0, min(1.0, confidence))
+    return {"label": label, "confidence": confidence}
+
+
 def enqueue_event(etype: str, payload: Optional[Dict[str, Any]] = None,
                   classified: Optional[Dict[str, Any]] = None) -> None:
     """
@@ -132,6 +261,40 @@ def enqueue_event(etype: str, payload: Optional[Dict[str, Any]] = None,
     _save_fact(EVENTS_QUEUE_KEY, q)
 
 
+async def record_user_message(text: str, message_id: Optional[str] = None) -> None:
+    """
+    收到用户消息时调用（异步，供消息处理路径 await）：
+      分类（LLM，跑在线程池里不阻塞事件循环）→ enqueue 一个 msg_user 事件（带分类结果）。
+    任何失败都吞掉、只打日志——分类挂了绝不能影响正常回复。
+    """
+    import asyncio as _asyncio
+    try:
+        classified = await _asyncio.to_thread(classify_message_sync, text)
+        await _asyncio.to_thread(
+            enqueue_event, "msg_user",
+            {"message_id": message_id, "text_len": len((text or ""))},
+            classified,
+        )
+        print(f"💗 [欲望驱动] 用户消息已分类入队 label={classified['label']} "
+              f"conf={classified['confidence']:.2f}")
+    except Exception as e:
+        print(f"💗 [欲望驱动] record_user_message 跳过：{e}")
+
+
+async def record_assistant_message(message_id: Optional[str] = None) -> None:
+    """
+    AI 回复发出后调用（异步）：enqueue 一个 msg_assistant 事件。
+    情感引擎用它开「未回复线程」计时（超时逐级加焦虑）。失败吞掉。
+    """
+    import asyncio as _asyncio
+    try:
+        await _asyncio.to_thread(
+            enqueue_event, "msg_assistant", {"message_id": message_id}, None
+        )
+    except Exception as e:
+        print(f"💗 [欲望驱动] record_assistant_message 跳过：{e}")
+
+
 # =============================================================================
 # 快照数据
 # =============================================================================
@@ -142,13 +305,19 @@ class DesireSnapshot:
     def __init__(self, driven: bool, drive: Dict[str, float],
                  scores: Dict[str, float], intent: de.Intent,
                  display: Dict[str, float],
-                 refractory: Optional[Dict[str, int]] = None):
+                 refractory: Optional[Dict[str, int]] = None,
+                 heartbeat_interval: Optional[int] = None,
+                 next_heartbeat_at: Optional[float] = None,
+                 attachment_baseline: Optional[float] = None):
         self.driven = driven          # DESIRE_DRIVEN 是否开
         self.drive = drive            # 8 维驱动条当前值
         self.scores = scores          # 各维召唤力（fatigue 不计）
         self.intent = intent          # pick_intent 结果
         self.display = display        # 16 维情感 display（来源）
         self.refractory = refractory or {}   # v2② 当前冷却中的维度 -> 剩余拍数
+        self.heartbeat_interval = heartbeat_interval  # v2⑤ 下次心跳间隔（秒）
+        self.next_heartbeat_at = next_heartbeat_at    # v2⑤ 下次醒来时间戳（毫秒）
+        self.attachment_baseline = attachment_baseline  # v2④ attachment 当前地板
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -165,6 +334,9 @@ class DesireSnapshot:
             },
             "display": self.display,
             "refractory": self.refractory,
+            "heartbeat_interval": self.heartbeat_interval,
+            "next_heartbeat_at": self.next_heartbeat_at,
+            "attachment_baseline": self.attachment_baseline,
         }
 
 
@@ -210,6 +382,33 @@ def tick(now_ms: Optional[float] = None,
     if consume_events:
         events = _load_fact(EVENTS_QUEUE_KEY) or []
 
+    # 1.5) v2④ 基线漂移（只作用于 attachment 地板；默认关）。
+    # 🛑 设计红线：想念可以涨，但永远不许变成压人的东西。只影响 attachment 地板。
+    #    - 开关关：地板固定在 HOME，不漂移。
+    #    - 开关开：按「距上次互动的小时数」抬高地板（drift_baseline 内含 clamp 安全阀）；
+    #             本拍若有 msg_user 事件（主人来了），一抱拉回大半（pullback_baseline）。
+    #    只读观测（consume_events=False）不写回，避免污染地板。
+    try:
+        att_baseline = float(_load_fact(ATTACHMENT_BASELINE_KEY))
+    except (TypeError, ValueError):
+        att_baseline = de.BASELINE_HOME
+
+    if is_baseline_drift():
+        # 距上次互动多久（小时）。用情感引擎里维护的 last_interaction_at。
+        last_it = emo_state.get("last_interaction_at")
+        if last_it:
+            hours_since = max(0.0, (now_ms - ee._ms(last_it)) / ee.MS_PER_HOUR)
+        else:
+            hours_since = 0.0
+        att_baseline = de.drift_baseline(att_baseline, hours_since)
+        # 本拍收到用户消息 → 拉回（在 drift 之后应用，"一抱拉回大半"）
+        has_user_msg = any(ev.get("type") == "msg_user" for ev in events)
+        if has_user_msg:
+            att_baseline = de.pullback_baseline(att_baseline)
+    else:
+        # 开关关：地板固定在 HOME（安全默认）
+        att_baseline = de.BASELINE_HOME
+
     # 2) 情感引擎推进（纯函数）→ 拿 16 维 display
     new_emo = ee.tick_evolve(emo_state, events, now_ms, tz_offset=tz)
     display = new_emo["display"]
@@ -244,6 +443,12 @@ def tick(now_ms: Optional[float] = None,
     if is_desire_coupling():
         drive_state = de.apply_coupling(drive_state, prev_drive_state)
 
+    # 4.6) v2④ 地板兜底：attachment 不许低于当前地板 att_baseline（这就是「地板」的意义）。
+    # 🛑 只作用于 attachment 一维；开关关时 att_baseline == HOME，仍保证不跌破 HOME。
+    #    放在 pulse + 耦合之后：无论前面把 attachment 拉到多低，都被地板托住。
+    if drive_state.attachment < att_baseline:
+        drive_state = de.replace(drive_state, attachment=att_baseline)
+
     # 5) pick_intent（带不应期跳过 + wildcard 判定）
     intent = de.pick_intent(
         drive_state,
@@ -261,6 +466,20 @@ def tick(now_ms: Optional[float] = None,
         action_repeat = 1
     last_action = intent.want_action
 
+    # 5.5) v2⑤ 自主心跳：算下次醒来的间隔。
+    #      开关关（默认）→ 固定 BASE 间隔，不做动态计算。
+    if is_heartbeat_autonomy():
+        local_hr = int(ee.local_hour(now_ms, tz))
+        heartbeat_interval = de.compute_heartbeat_interval(
+            drive_state,
+            fatigue=display.get("fatigue", drive_state.fatigue),
+            local_hour=local_hr,
+            refractory=refractory,
+        )
+    else:
+        heartbeat_interval = de.HEARTBEAT_BASE_INTERVAL
+    next_heartbeat_at = now_ms + heartbeat_interval * 1000.0
+
     # 6) 存回状态
     if consume_events:
         _save_fact(EMOTION_STATE_KEY, new_emo)
@@ -268,6 +487,8 @@ def tick(now_ms: Optional[float] = None,
         _save_fact(REFRACTORY_KEY, refractory)
         _save_fact(LAST_ACTION_KEY, last_action)
         _save_fact(ACTION_REPEAT_KEY, action_repeat)
+        _save_fact(NEXT_HEARTBEAT_KEY, next_heartbeat_at)
+        _save_fact(ATTACHMENT_BASELINE_KEY, att_baseline)  # v2④ 写回当前地板
     _save_fact(DRIVE_STATE_KEY, {
         "drive": drive_state.as_dict(),
         "snapshot_at": ee._ms_to_iso(now_ms),
@@ -280,6 +501,9 @@ def tick(now_ms: Optional[float] = None,
         intent=intent,
         display=display,
         refractory=refractory,
+        heartbeat_interval=heartbeat_interval,
+        next_heartbeat_at=next_heartbeat_at,
+        attachment_baseline=att_baseline,
     )
 
 
@@ -311,6 +535,32 @@ def read_snapshot(now_ms: Optional[float] = None,
                   has_pending_task: bool = False) -> DesireSnapshot:
     """只读观测：不消费事件、不改情感状态（供 /state 接口 / 前端面板）。"""
     return tick(now_ms=now_ms, has_pending_task=has_pending_task, consume_events=False)
+
+
+# =============================================================================
+# v2⑤ 自主心跳调度辅助
+# =============================================================================
+
+def seconds_until_next_heartbeat(now_ms: Optional[float] = None) -> Optional[int]:
+    """
+    心跳调度器用：读上一拍存的 desire_next_heartbeat_at，算出「还需 sleep 多少秒」。
+
+    - HEARTBEAT_AUTONOMY 关：返回 None（调用方回退到固定间隔）。
+    - 没有存过 next_heartbeat_at（首次）：返回 None。
+    - 已过期（now ≥ next）：返回 0（该醒了）。
+    - 否则返回剩余秒数，并夹在 [MIN, MAX] 内（防脏数据把调度器卡死）。
+    """
+    if not is_heartbeat_autonomy():
+        return None
+    nxt = _load_fact(NEXT_HEARTBEAT_KEY)
+    if not isinstance(nxt, (int, float)):
+        return None
+    if now_ms is None:
+        now_ms = time.time() * 1000.0
+    remaining = (nxt - now_ms) / 1000.0
+    if remaining <= 0:
+        return 0
+    return int(min(max(remaining, de.HEARTBEAT_MIN_INTERVAL), de.HEARTBEAT_MAX_INTERVAL))
 
 
 # =============================================================================

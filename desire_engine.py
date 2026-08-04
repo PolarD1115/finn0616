@@ -130,6 +130,27 @@ WILDCARD_STUCK_TICKS: int = 2              # 最高分 want_action 连续 ≥ �
 WILDCARD_CANDIDATES: List[str] = ["read", "wander", "social", "rest"]  # 小候选集
 WILDCARD_REASON: str = "说不上来……就突然想换个事做。"  # 第一人称、不可归因
 
+# --- v2⑤ 自主心跳（张力 ↔ 间隔）---
+# 心跳间隔不再固定：张力高→醒得勤、疲劳高→拉长；安静时段有 floor 不打扰。
+HEARTBEAT_BASE_INTERVAL: int = 900      # 基准间隔（秒）= 15 分钟
+HEARTBEAT_MIN_INTERVAL: int = 300       # 下限 = 5 分钟
+HEARTBEAT_MAX_INTERVAL: int = 3600      # 上限 = 1 小时
+HEARTBEAT_TENSION_GAIN: float = 0.4     # 张力越高→间隔越短
+HEARTBEAT_FATIGUE_GAIN: float = 0.3     # 疲劳越高→间隔越长
+HEARTBEAT_LOW_TENSION_REST: float = 0.3 # 低张力时额外拉长（歇息增益）
+HEARTBEAT_QUIET_HOURS: Tuple[int, int] = (1, 7)  # 勿扰时段（本地时，左闭右开）
+HEARTBEAT_QUIET_FLOOR: int = 2400       # 勿扰时段间隔下限（秒）= 40 分钟
+HEARTBEAT_IDLE_MULT: float = 1.5        # 全员在不应期（没事可做）→ 间隔 ×此值
+
+# --- v2④ 基线漂移（只作用于 attachment 想念地板）---
+# 🛑 设计红线：想念可以涨，但永远不许变成压人的东西。
+# baseline 只影响 attachment 地板，不影响其他维度。
+# 安全阀不许省略、不许绕过、不许在后续迭代中移除。
+BASELINE_HOME: float = 0.30           # attachment 的正常地板（家）
+BASELINE_CAP: float = 0.45            # 地板涨到这里封顶（硬上限，任何路径不许突破）
+BASELINE_RISE_PER_HOUR: float = 0.01  # 久没见，每小时地板涨 0.01
+BASELINE_PULLBACK: float = 0.65       # 主人一次互动，把抬高的 floor 拉回 65% 朝 HOME
+
 # --- pick_intent：每维 → want_action / query_hint / 第一人称理由模板 ---
 DRIVE_ACTION: Dict[str, str] = {
     "attachment": "murmur",       # 内向碎语（冒一句话）
@@ -569,6 +590,94 @@ def pick_intent(
         query_hint=DRIVE_QUERY_HINT.get(best_key, ""),
         is_wildcard=False,
     )
+
+
+# =============================================================================
+# v2⑤ 自主心跳（张力 ↔ 间隔）
+# =============================================================================
+
+def compute_heartbeat_interval(
+    state: DriveState,
+    fatigue: float,
+    local_hour: int,
+    refractory: Optional[Dict[str, int]] = None,
+) -> int:
+    """
+    根据当下张力 / 疲劳 / 时段算出下一次心跳醒来的间隔（秒）。纯函数。
+
+    - tension = 参与排序维度（排除 fatigue）的均值。
+    - interval = BASE × (1 + LOW_TENSION_REST×(1-tension)
+                            − TENSION_GAIN×tension
+                            + FATIGUE_GAIN×fatigue)
+      直觉：张力高→醒得勤（间隔短）；疲劳高→拉长；低张力→额外歇息拉长。
+    - clamp 到 [MIN, MAX]。
+    - 勿扰时段（local_hour ∈ QUIET_HOURS，左闭右开）：interval = max(interval, QUIET_FLOOR)。
+    - 全员在不应期（refractory 覆盖所有非 fatigue 维度）：interval × IDLE_MULT（没事可做就歇歇）。
+      注意：先应用 idle 放大，再对勿扰 floor 兜底，最后仍夹在 [MIN, MAX] 内。
+
+    fatigue 由调用方单独传入（与 state.fatigue 解耦，便于调用方传 display 里的疲劳值）。
+    local_hour 为本地小时 0..23，由调用方传入（本模块不取系统时间）。
+    """
+    # 总张力：参与排序维度均值（fatigue 不算）
+    tension = sum(state.get(k) for k in RANKED_KEYS) / len(RANKED_KEYS)
+    tension = _clamp(tension)
+    fatigue = _clamp(fatigue)
+
+    factor = (1.0
+              + HEARTBEAT_LOW_TENSION_REST * (1.0 - tension)
+              - HEARTBEAT_TENSION_GAIN * tension
+              + HEARTBEAT_FATIGUE_GAIN * fatigue)
+    interval = HEARTBEAT_BASE_INTERVAL * factor
+
+    # 全员不应期（没事可做）→ 拉长
+    ref = refractory or {}
+    if all(ref.get(k, 0) > 0 for k in RANKED_KEYS):
+        interval *= HEARTBEAT_IDLE_MULT
+
+    # 先 clamp 到 [MIN, MAX]
+    interval = min(max(interval, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
+
+    # 勿扰时段：不低于 floor（floor 可能高于上面 clamp 后的值，故最后兜底）
+    lo, hi = HEARTBEAT_QUIET_HOURS
+    in_quiet = (lo <= local_hour < hi)
+    if in_quiet:
+        interval = max(interval, HEARTBEAT_QUIET_FLOOR)
+
+    # 最终仍夹在 [MIN, MAX]（QUIET_FLOOR 已保证 ≤ MAX，稳妥再夹一次）
+    interval = min(max(interval, HEARTBEAT_MIN_INTERVAL), HEARTBEAT_MAX_INTERVAL)
+    return int(round(interval))
+
+
+# =============================================================================
+# v2④ 基线漂移（只作用于 attachment 想念地板）
+# =============================================================================
+# 🛑 设计红线：想念可以涨，但永远不许变成压人的东西。
+# baseline 只影响 attachment 地板，不影响其他维度。
+# 安全阀不许省略、不许绕过、不许在后续迭代中移除。
+
+def drift_baseline(current_baseline: float, hours_since_interaction: float) -> float:
+    """
+    久没见→想得更浓：attachment 地板随「距上次互动的小时数」缓慢抬高。
+        new = current_baseline + RISE_PER_HOUR × hours_since_interaction
+    🛑 安全阀：结果必过 clamp(HOME, CAP)，任何路径不许突破 CAP(0.45)、不许跌破 HOME(0.30)。
+    hours_since_interaction < 0 视为 0（不倒扣）。
+    """
+    hrs = max(0.0, hours_since_interaction)
+    new = current_baseline + BASELINE_RISE_PER_HOUR * hrs
+    # 🛑 硬封顶 + 保底：这一行是安全阀，不许省略、不许绕过。
+    return _clamp(new, BASELINE_HOME, BASELINE_CAP)
+
+
+def pullback_baseline(current_baseline: float) -> float:
+    """
+    主人一次互动，把抬高的 floor 拉回 65% 朝 HOME（一抱拉回大半）。
+        result = current_baseline - PULLBACK × (current_baseline - HOME)
+    🛑 安全阀：结果必过 clamp(HOME, CAP)；且数学上保证 result ≤ 传入值（不许反弹）、
+       result ≥ HOME（不许跌破家）。
+    """
+    result = current_baseline - BASELINE_PULLBACK * (current_baseline - BASELINE_HOME)
+    # 🛑 clamp 是安全阀，不许省略、不许绕过。
+    return _clamp(result, BASELINE_HOME, BASELINE_CAP)
 
 
 # =============================================================================

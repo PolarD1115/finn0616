@@ -432,8 +432,23 @@ async def async_free_activity():
             return []
 
     while True:
-        wake_jitter = random.randint(-900, 900)
-        await asyncio.sleep(max(300, interval + wake_jitter))
+        # v2⑤ 自主心跳：若开启（HEARTBEAT_AUTONOMY），用上一拍算出的动态间隔醒来；
+        # 否则回退到固定间隔 + 抖动。
+        sleep_secs = None
+        try:
+            import desire_bridge
+            _hb = desire_bridge.seconds_until_next_heartbeat()
+            if _hb is not None:
+                sleep_secs = _hb
+                print(f"💓 [自主心跳] 下次醒来 {sleep_secs}s 后（张力/疲劳/时段动态）")
+        except Exception as _hbe:
+            print(f"💓 [自主心跳] 读取失败，回退固定间隔：{_hbe}")
+
+        if sleep_secs is None:
+            wake_jitter = random.randint(-900, 900)
+            sleep_secs = max(300, interval + wake_jitter)
+
+        await asyncio.sleep(sleep_secs)
 
         try:
             client = _get_llm_client("main_chat")
@@ -698,6 +713,15 @@ async def async_telegram_polling():
 
         bubbles = await _send_bubbles(base_url, chat_id, reply, 15)
         _tg_log(f"回复已发送 chat={chat_label} 回复字数={len(reply)} 气泡数={len(bubbles)}")
+
+        # 欲望驱动：把「用户消息（分类）」与「AI 已回复」两个事件塞进情感引擎队列。
+        # 全部吞异常，绝不影响正常聊天。
+        try:
+            import desire_bridge
+            await desire_bridge.record_user_message(text)
+            await desire_bridge.record_assistant_message()
+        except Exception as _dee:
+            _tg_log(f"欲望驱动事件入队跳过: {_dee}")
 
         saved = await asyncio.to_thread(
             _save_memory_to_db, "🤖 互动记录",
