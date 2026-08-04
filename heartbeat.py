@@ -463,6 +463,10 @@ async def async_free_activity():
                 snap = await asyncio.to_thread(desire_bridge.tick)
                 desire_intent = snap.intent
                 desire_driven = snap.driven
+                # 观测信息：不应期哪些维度在冷却 + wildcard 是否触发
+                _cooling = "、".join(f"{k}:{v}" for k, v in (snap.refractory or {}).items()) or "无"
+                _wild = "triggered" if desire_intent.is_wildcard else "not"
+                _obs = f"[不应期: {_cooling}] [wildcard: {_wild}]"
                 if desire_driven:
                     suggested = desire_bridge.suggest_free_activity(desire_intent)
                     if suggested and suggested != avoid:
@@ -472,10 +476,11 @@ async def async_free_activity():
                             f" 若合适，优先考虑「{suggested}」。）"
                         )
                     print(f"💗 [欲望驱动·开] intent={desire_intent.want_action} "
-                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f}")
+                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} {_obs}")
                 else:
                     print(f"💗 [欲望驱动·观测] intent={desire_intent.want_action} "
-                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f}（不覆盖行为）")
+                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} "
+                          f"{_obs}（不覆盖行为）")
             except Exception as _de:
                 print(f"💗 [欲望驱动] 跳过：{_de}")
 
@@ -519,9 +524,12 @@ async def async_free_activity():
                 f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
             )
 
-            # 欲望驱动：做完活动后对相关驱动条做针对性回落（仅在拿到意图时）。
-            # 无论 gating 开关如何都回落，保持驱动条与真实行为一致；只是「是否覆盖选择」受开关控制。
-            if desire_intent is not None:
+            # 欲望驱动：做完活动后对相关驱动条做针对性回落 + 进入不应期。
+            # 规则（对齐 gating）：
+            #   - DESIRE_DRIVEN=False：只观测、不执行 satisfy（不覆盖行为也不改冷却）。
+            #   - wildcard 触发：不可归因，"说不上来就突然想"，不 satisfy。
+            #   - 其余：satisfy_action 回落对应维度并置入不应期。
+            if desire_intent is not None and desire_driven and not desire_intent.is_wildcard:
                 try:
                     import desire_bridge
                     await asyncio.to_thread(desire_bridge.satisfy_action, desire_intent.want_action)
