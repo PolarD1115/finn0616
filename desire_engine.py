@@ -21,8 +21,13 @@
 from __future__ import annotations
 
 import math
+import random as _random
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+# 鸭子类型：任何有 .random() 和 .choice(seq) 的对象（如 random.Random 实例）
+_RandomLike = Any
+
 
 
 # =============================================================================
@@ -111,6 +116,20 @@ ACTION_REL_DRIVES: Dict[str, Tuple[str, ...]] = {
 # --- fatigue 闸 ---
 FATIGUE_GATE: float = 0.72            # ≥ 此值：不硬找事，走 "rest"
 
+# --- v2② 不应期 refractory ---
+# 刚满足过的欲望，短时间内压着别立刻复燃（"刚做完别马上又馋"）。
+# 纯 tick 计数实现（不用 wall-clock，契合纯函数原则）。
+REFRACTORY_TICKS: int = 3            # satisfy 后该维度的冷却拍数
+
+# --- v2③ wildcard 心血来潮 ---
+# 不是独立 random 柱子，而是长在张力上的泄洪口：
+# 总张力高、但前几名召唤力胶着 / 最高那个卡死时，从小候选集抽一件做，事后不可归因。
+WILDCARD_TENSION_THRESHOLD: float = 0.55   # 总张力（参与排序维度的平均值）≥ 此值才有资格
+WILDCARD_TIE_MARGIN: float = 0.08          # 前两名召唤力分差 < 此值 = 胶着
+WILDCARD_STUCK_TICKS: int = 2              # 最高分 want_action 连续 ≥ 此拍数没变 = 卡死
+WILDCARD_CANDIDATES: List[str] = ["read", "wander", "social", "rest"]  # 小候选集
+WILDCARD_REASON: str = "说不上来……就突然想换个事做。"  # 第一人称、不可归因
+
 # --- pick_intent：每维 → want_action / query_hint / 第一人称理由模板 ---
 DRIVE_ACTION: Dict[str, str] = {
     "attachment": "murmur",       # 内向碎语（冒一句话）
@@ -155,6 +174,27 @@ EMOTION_MAP: Dict[str, Dict[str, float]] = {
     "libido":     {"lust": 0.6, "intimacy": 0.3, "vitality": 0.1},
     "stress":     {"anxiety": 0.4, "irritability": 0.3, "dejection": 0.2, "fear": 0.1},
 }
+
+# --- v2① 耦合网（维度间联动）---
+# 每条边：(source_key, target_key, coefficient, mode)
+#   mode="level" : 每拍按源当前值持续施压   target += source × coeff
+#   mode="delta" : 仅当源本拍有正向变化时激发 target += (source - prev_source) × coeff（仅正向）
+# ⚠️ 耦合是反馈系统，会自激/震荡。两条防失控：
+#   - 系数初值压小（|k| ≤ 0.06）；
+#   - apply_coupling 里加全局阻尼：每拍所有维度向各自 baseline 回归一小步。
+COUPLING_EDGES: List[Tuple[str, str, float, str]] = [
+    ("stress",      "attachment",  +0.05, "level"),   # 压力大→更想念
+    ("stress",      "curiosity",   -0.04, "level"),   # 压力大→好奇降
+    ("attachment",  "libido",      +0.06, "delta"),   # 想念涨→亲密欲涨
+    ("libido",      "attachment",  +0.03, "delta"),   # 亲密欲涨→想念涨
+    ("fatigue",     "curiosity",   -0.05, "level"),   # 累→不想探索
+    ("fatigue",     "social",      -0.04, "level"),   # 累→不想社交
+    ("curiosity",   "reflection",  +0.04, "delta"),   # 好奇涨→想沉淀
+    ("social",      "curiosity",   +0.03, "delta"),   # 社交涨→好奇涨
+]
+
+# 全局阻尼系数：每拍每维向 baseline 回归的比例（防自激发散）
+COUPLING_DAMPING: float = 0.02
 
 
 # =============================================================================
@@ -214,6 +254,7 @@ class Intent:
     reason: str
     score: float
     query_hint: str = ""
+    is_wildcard: bool = False        # v2③ 本拍是否走了 wildcard（心血来潮，不可归因）
 
 
 # =============================================================================
@@ -321,6 +362,101 @@ def satisfy(state: DriveState, action: str) -> DriveState:
 
 
 # =============================================================================
+# v2② 不应期 refractory（纯 tick 计数，不用 wall-clock）
+# =============================================================================
+# 约定：refractory 是一个 Dict[str, int]（key=drive_key, value=剩余冷却拍数），
+#       由调用方持久化。这里提供纯函数维护它，DriveState 保持只装 8 维数值。
+
+def tick_refractory(refractory: Optional[Dict[str, int]]) -> Dict[str, int]:
+    """
+    每拍开头调用：所有冷却计数 -1，归零则删。返回新 dict（不改入参）。
+    传 None 视为空。
+    """
+    if not refractory:
+        return {}
+    out: Dict[str, int] = {}
+    for k, v in refractory.items():
+        nv = int(v) - 1
+        if nv > 0:
+            out[k] = nv
+    return out
+
+
+def enter_refractory(refractory: Optional[Dict[str, int]],
+                     drive_key: str,
+                     ticks: int = REFRACTORY_TICKS) -> Dict[str, int]:
+    """
+    satisfy 某维度后调用：把该维度置入不应期（剩余 ticks 拍）。返回新 dict。
+    fatigue 是闸不参与排序，置它无意义但也无害。
+    """
+    out: Dict[str, int] = dict(refractory or {})
+    if ticks > 0:
+        out[drive_key] = int(ticks)
+    return out
+
+
+def satisfy_with_refractory(state: DriveState,
+                            action: str,
+                            refractory: Optional[Dict[str, int]] = None,
+                            ticks: int = REFRACTORY_TICKS,
+                            ) -> Tuple[DriveState, Dict[str, int]]:
+    """
+    satisfy 的便捷组合：既做乘性回落，又把该 action 的主驱动置入不应期。
+    返回 (新 DriveState, 新 refractory)。未知 action 时驱动条原样、refractory 不变。
+    """
+    new_state = satisfy(state, action)
+    main = ACTION_MAIN_DRIVE.get(action)
+    if main is None:
+        return new_state, dict(refractory or {})
+    return new_state, enter_refractory(refractory, main, ticks)
+
+
+# =============================================================================
+# v2① 耦合网（维度间联动）
+# =============================================================================
+
+def apply_coupling(
+    state: DriveState,
+    prev_state: DriveState,
+    edges: List[Tuple[str, str, float, str]] = COUPLING_EDGES,
+) -> DriveState:
+    """
+    让一维的涨落牵动其他维（一拍）。返回新的 DriveState。
+
+    - level 模式：直接用「当前 source 值 × coeff」施加到 target。
+    - delta 模式：算 (当前 source − 上一拍 source)，仅正向变化时施加 (delta × coeff)。
+    - 施加完对所有维度做全局阻尼：每维向各自 baseline 回归一小步
+      （target += COUPLING_DAMPING × (baseline − 当前值)），抑制自激/发散。
+    - 最后统一 clamp 到 [0, 1]。
+
+    prev_state 用于 delta 模式取「上一拍源值」。level 模式只看当前 state。
+    """
+    # 在一个可变 dict 上累加，避免边之间互相读到半更新的值
+    acc: Dict[str, float] = dict(state.as_dict())
+
+    for src, tgt, coeff, mode in edges:
+        if src not in acc or tgt not in acc:
+            continue
+        if mode == "level":
+            acc[tgt] += state.get(src) * coeff
+        elif mode == "delta":
+            rise = state.get(src) - prev_state.get(src)
+            if rise > 0:
+                acc[tgt] += rise * coeff
+        # 未知 mode 静默跳过
+
+    # 全局阻尼：每维向 baseline 回归一小步（防失控）
+    for k in DRIVE_KEYS:
+        acc[k] += COUPLING_DAMPING * (BASELINE[k] - acc[k])
+
+    # 统一 clamp
+    for k in DRIVE_KEYS:
+        acc[k] = _clamp(acc[k])
+
+    return DriveState.from_dict(acc)
+
+
+# =============================================================================
 # ③ 召唤力 + pick_intent
 # =============================================================================
 
@@ -351,16 +487,27 @@ def pick_intent(
     state: DriveState,
     thoughts: Optional[List[Thought]] = None,
     has_pending_task: bool = False,
+    refractory: Optional[Dict[str, int]] = None,
+    last_action: Optional[str] = None,
+    action_repeat: int = 0,
+    rng: Optional["_RandomLike"] = None,
 ) -> Intent:
     """
     决定「此刻最想做的事」：
     - fatigue ≥ FATIGUE_GATE → 不硬找事，返回 "rest"（歇息态自省）。
-    - 否则取召唤力最高的欲望维，映射到对应 want_action。
-    - duty 若无未完成任务则不该被选中（正常映射里 duty 已回 baseline，此处再兜底）。
+    - 处于不应期（refractory 里剩余拍数 > 0）的维度即使分最高也跳过，选次高的。
+    - duty 若无未完成任务则不该被选中。
+    - v2③ wildcard：总张力高、且（前两名胶着 或 最高动作卡死）时，
+      从 WILDCARD_CANDIDATES 里随机抽一件（排除当前最高对应动作）做，
+      返回 Intent.is_wildcard=True。调用方对 wildcard 结果**不应**调 satisfy。
 
-    thoughts / has_pending_task 为可选上下文。
+    可选上下文：
+    - refractory   : Dict[drive_key -> 剩余冷却拍数]，>0 的维度本拍跳过。
+    - last_action  : 上一拍最终采用的 want_action（判卡死用）。
+    - action_repeat: last_action 已连续保持的拍数（判卡死用）。
+    - rng          : 随机源（有 .random() / .choice()），wildcard 抽签用；None 用模块 random。
     """
-    # fatigue 闸优先
+    # fatigue 闸优先（闸态不参与 wildcard / 不应期逻辑）
     if state.fatigue >= FATIGUE_GATE:
         return Intent(
             want_action="rest",
@@ -368,6 +515,7 @@ def pick_intent(
             reason=REST_REASON,
             score=state.fatigue,
             query_hint="",
+            is_wildcard=False,
         )
 
     scores = compute_scores(state, thoughts)
@@ -376,16 +524,50 @@ def pick_intent(
     if not has_pending_task:
         scores = {k: v for k, v in scores.items() if k != "duty"}
 
-    # 取最高分维度（稳定：分数相同按 RANKED_KEYS 顺序）
-    best_key = max(scores, key=lambda k: (scores[k], -RANKED_KEYS.index(k)))
-    best_score = scores[best_key]
+    # 不应期：冷却中的维度从候选里剔除（选次高）
+    ref = refractory or {}
+    eligible = {k: v for k, v in scores.items() if ref.get(k, 0) <= 0}
+    # 若所有维度都在冷却，退回到全体（避免无可选；此时不应期整体失效一拍）
+    pool = eligible if eligible else scores
+
+    # 排序（稳定：分数相同按 RANKED_KEYS 顺序）
+    ranked = sorted(pool, key=lambda k: (pool[k], -RANKED_KEYS.index(k)), reverse=True)
+    best_key = ranked[0]
+    best_score = pool[best_key]
+    best_action = DRIVE_ACTION[best_key]
+
+    # ---- v2③ wildcard 判定 ----
+    # 总张力：参与排序的全部维度平均值（fatigue 已不在其中）
+    tension = sum(scores.values()) / len(scores) if scores else 0.0
+    tie = False
+    if len(ranked) >= 2:
+        tie = (pool[ranked[0]] - pool[ranked[1]]) < WILDCARD_TIE_MARGIN
+    stuck = (last_action is not None
+             and last_action == best_action
+             and action_repeat >= WILDCARD_STUCK_TICKS)
+
+    if tension >= WILDCARD_TENSION_THRESHOLD and (tie or stuck):
+        _r = rng if rng is not None else _random
+        # 候选集里排除「当前最高对应的动作」
+        cands = [a for a in WILDCARD_CANDIDATES if a != best_action]
+        if cands:
+            picked = _r.choice(cands)
+            return Intent(
+                want_action=picked,
+                drive_key=best_key,          # 记一下张力来源维，但动作不由它决定
+                reason=WILDCARD_REASON,
+                score=best_score,
+                query_hint="",
+                is_wildcard=True,
+            )
 
     return Intent(
-        want_action=DRIVE_ACTION[best_key],
+        want_action=best_action,
         drive_key=best_key,
         reason=DRIVE_REASON[best_key],
         score=best_score,
         query_hint=DRIVE_QUERY_HINT.get(best_key, ""),
+        is_wildcard=False,
     )
 
 

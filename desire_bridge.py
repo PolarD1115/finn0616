@@ -11,6 +11,7 @@
       → emotion_engine.tick_evolve()  拿到 16 维 display
       → desire_engine.map_from_emotions()
       → 对「本拍新到的情感冲击」做 pulse（边际递减）
+      → [DESIRE_COUPLING 开] apply_coupling（维度间联动一拍）
       → desire_engine.pick_intent()
       → 存回状态 → 返回 DesireSnapshot
 
@@ -23,6 +24,9 @@ gating（灰度原则，默认关）：
     desire_emotion_state   16 维情感引擎完整状态 JSON
     desire_drive_state     8 维驱动条快照 JSON（含上一拍值，用于算 pulse 增量）
     desire_events_queue    待情感引擎消费的事件队列 JSON
+    desire_refractory      不应期计数 Dict[str,int]（v2②）
+    desire_last_action     上一拍最终 want_action（v2③ 卡死判定）
+    desire_action_repeat   连续相同动作的拍数（v2③ 卡死判定）
 """
 
 from __future__ import annotations
@@ -44,6 +48,9 @@ import desire_engine as de
 EMOTION_STATE_KEY = "desire_emotion_state"
 DRIVE_STATE_KEY = "desire_drive_state"
 EVENTS_QUEUE_KEY = "desire_events_queue"
+REFRACTORY_KEY = "desire_refractory"          # v2② 不应期计数 Dict[str,int]
+LAST_ACTION_KEY = "desire_last_action"        # v2③ 上一拍 want_action
+ACTION_REPEAT_KEY = "desire_action_repeat"    # v2③ 连续相同动作拍数
 
 # pulse 增量：主人来的情感冲击 vs 自经历（对齐攻略：自经历更小）
 PULSE_FROM_USER = 0.18
@@ -53,6 +60,11 @@ PULSE_FROM_SELF = 0.10
 def is_desire_driven() -> bool:
     """总闸：欲望是否真覆盖行为。默认关（只读可看不动手）。"""
     return os.environ.get("DESIRE_DRIVEN", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_desire_coupling() -> bool:
+    """v2① 耦合网开关。默认关（关着时 tick 跳过 apply_coupling）。"""
+    return os.environ.get("DESIRE_COUPLING", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _tz_offset() -> float:
@@ -129,12 +141,14 @@ class DesireSnapshot:
 
     def __init__(self, driven: bool, drive: Dict[str, float],
                  scores: Dict[str, float], intent: de.Intent,
-                 display: Dict[str, float]):
+                 display: Dict[str, float],
+                 refractory: Optional[Dict[str, int]] = None):
         self.driven = driven          # DESIRE_DRIVEN 是否开
         self.drive = drive            # 8 维驱动条当前值
         self.scores = scores          # 各维召唤力（fatigue 不计）
         self.intent = intent          # pick_intent 结果
         self.display = display        # 16 维情感 display（来源）
+        self.refractory = refractory or {}   # v2② 当前冷却中的维度 -> 剩余拍数
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -147,8 +161,10 @@ class DesireSnapshot:
                 "reason": self.intent.reason,
                 "score": self.intent.score,
                 "query_hint": self.intent.query_hint,
+                "is_wildcard": self.intent.is_wildcard,
             },
             "display": self.display,
+            "refractory": self.refractory,
         }
 
 
@@ -173,6 +189,18 @@ def tick(now_ms: Optional[float] = None,
         now_ms = time.time() * 1000.0
     tz = _tz_offset()
 
+    # 0) 不应期 / 卡死跨拍状态。
+    #    consume_events=True 才真正「推进一拍」：refractory 计数 -1、写回 last_action/repeat。
+    #    只读观测（consume_events=False）用加载值算 intent，但不推进、不写回（免污染计数）。
+    refractory = _load_fact(REFRACTORY_KEY) or {}
+    if consume_events:
+        refractory = de.tick_refractory(refractory)
+    last_action = _load_fact(LAST_ACTION_KEY)  # str 或 None
+    try:
+        action_repeat = int(_load_fact(ACTION_REPEAT_KEY) or 0)
+    except Exception:
+        action_repeat = 0
+
     # 1) 加载情感状态 + 事件队列
     emo_state = _load_fact(EMOTION_STATE_KEY)
     if not emo_state:
@@ -193,7 +221,8 @@ def tick(now_ms: Optional[float] = None,
     #    上一拍驱动值从 DRIVE_STATE_KEY 读；首次则以 mapped 作基线（无 pulse）。
     prev = _load_fact(DRIVE_STATE_KEY)
     if prev and isinstance(prev.get("drive"), dict):
-        drive_state = de.DriveState.from_dict(prev["drive"])
+        prev_drive_state = de.DriveState.from_dict(prev["drive"])
+        drive_state = prev_drive_state
         # 对每一维：若映射值高于当前驱动值，视为一次外来冲击 → pulse 上去
         for k in de.RANKED_KEYS:
             gap = mapped.get(k) - drive_state.get(k)
@@ -206,17 +235,39 @@ def tick(now_ms: Optional[float] = None,
             {**drive_state.as_dict(), "fatigue": mapped.fatigue}
         )
     else:
-        # 首拍：直接以映射值为基线
+        # 首拍：直接以映射值为基线；耦合的 delta 模式无「上一拍」，以自身作 prev（delta=0）
+        prev_drive_state = mapped
         drive_state = mapped
 
-    # 5) pick_intent
-    intent = de.pick_intent(drive_state, has_pending_task=has_pending_task)
+    # 4.5) v2① 耦合网（灰度，默认关）：pulse 之后、pick_intent 之前。
+    #      delta 模式取「上一拍存储的驱动快照」prev_drive_state 作为源的前值。
+    if is_desire_coupling():
+        drive_state = de.apply_coupling(drive_state, prev_drive_state)
+
+    # 5) pick_intent（带不应期跳过 + wildcard 判定）
+    intent = de.pick_intent(
+        drive_state,
+        has_pending_task=has_pending_task,
+        refractory=refractory,
+        last_action=last_action,
+        action_repeat=action_repeat,
+    )
     scores = de.compute_scores(drive_state)
+
+    # 更新连续相同动作拍数（wildcard 卡死判定用）
+    if intent.want_action == last_action:
+        action_repeat += 1
+    else:
+        action_repeat = 1
+    last_action = intent.want_action
 
     # 6) 存回状态
     if consume_events:
         _save_fact(EMOTION_STATE_KEY, new_emo)
         _save_fact(EVENTS_QUEUE_KEY, [])  # 清空已消费队列
+        _save_fact(REFRACTORY_KEY, refractory)
+        _save_fact(LAST_ACTION_KEY, last_action)
+        _save_fact(ACTION_REPEAT_KEY, action_repeat)
     _save_fact(DRIVE_STATE_KEY, {
         "drive": drive_state.as_dict(),
         "snapshot_at": ee._ms_to_iso(now_ms),
@@ -228,23 +279,32 @@ def tick(now_ms: Optional[float] = None,
         scores=scores,
         intent=intent,
         display=display,
+        refractory=refractory,
     )
 
 
 def satisfy_action(action: str) -> None:
     """
-    做完某 want_action 后，对驱动条做针对性回落并存回。
+    做完某 want_action 后，对驱动条做针对性回落并让对应维度进入不应期。
     调用方在真正执行了 intent.want_action 对应的行为后调用。
+
+    ⚠️ wildcard（is_wildcard=True）触发的动作**不应**调用本函数
+       （"说不上来就突然想"，不可归因），由调用方判断后跳过。
     """
     prev = _load_fact(DRIVE_STATE_KEY)
     if not prev or not isinstance(prev.get("drive"), dict):
         return
     drive_state = de.DriveState.from_dict(prev["drive"])
-    drive_state = de.satisfy(drive_state, action)
+    refractory = _load_fact(REFRACTORY_KEY) or {}
+
+    # 乘性回落 + 主驱动进入不应期
+    drive_state, refractory = de.satisfy_with_refractory(drive_state, action, refractory)
+
     _save_fact(DRIVE_STATE_KEY, {
         "drive": drive_state.as_dict(),
         "snapshot_at": ee._ms_to_iso(time.time() * 1000.0),
     })
+    _save_fact(REFRACTORY_KEY, refractory)
 
 
 def read_snapshot(now_ms: Optional[float] = None,
