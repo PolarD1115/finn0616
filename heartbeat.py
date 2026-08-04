@@ -452,6 +452,33 @@ async def async_free_activity():
             options_text = "\n".join(f"- {o}" for o in options)
             avoid_hint = f"\n注意：你最近连着做了两次「{avoid}」，这次换点别的。" if avoid else ""
 
+            # ── 欲望驱动引擎（灰度）：算一拍情感→驱动→意图快照 ──
+            # DESIRE_DRIVEN 关（默认）：只算 + 只存快照观测，不覆盖行为。
+            # DESIRE_DRIVEN 开        ：把最高欲望对应的活动作为「倾向」注入 prompt。
+            desire_hint = ""
+            desire_intent = None
+            desire_driven = False
+            try:
+                import desire_bridge
+                snap = await asyncio.to_thread(desire_bridge.tick)
+                desire_intent = snap.intent
+                desire_driven = snap.driven
+                if desire_driven:
+                    suggested = desire_bridge.suggest_free_activity(desire_intent)
+                    if suggested and suggested != avoid:
+                        # 第一人称把「此刻最想做的事」告诉模型，作为倾向而非强制
+                        desire_hint = (
+                            f"\n（你此刻内心最想做的：{desire_intent.reason}"
+                            f" 若合适，优先考虑「{suggested}」。）"
+                        )
+                    print(f"💗 [欲望驱动·开] intent={desire_intent.want_action} "
+                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f}")
+                else:
+                    print(f"💗 [欲望驱动·观测] intent={desire_intent.want_action} "
+                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f}（不覆盖行为）")
+            except Exception as _de:
+                print(f"💗 [欲望驱动] 跳过：{_de}")
+
             # 🧠 注入与平时聊天相同的上下文（人设+画像+记忆+设备），
             #    让"想对方了"这类外向活动结合近况、有温度。
             system_ctx = await _build_channel_context("最近的近况、想对她说的话", channel_tag="TG_MSG")
@@ -461,7 +488,7 @@ async def async_free_activity():
             现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
 
             这是属于你自己的一段自由时间。从下面的活动里挑一件你此刻最想做的：
-            {options_text}{avoid_hint}
+            {options_text}{avoid_hint}{desire_hint}
 
             关于 log 字段怎么写，分两种情况：
             - 如果你选的是【{out_names}】这类"要发消息给对方"的活动：
@@ -491,6 +518,15 @@ async def async_free_activity():
                 _save_memory_to_db,
                 f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
             )
+
+            # 欲望驱动：做完活动后对相关驱动条做针对性回落（仅在拿到意图时）。
+            # 无论 gating 开关如何都回落，保持驱动条与真实行为一致；只是「是否覆盖选择」受开关控制。
+            if desire_intent is not None:
+                try:
+                    import desire_bridge
+                    await asyncio.to_thread(desire_bridge.satisfy_action, desire_intent.want_action)
+                except Exception as _se:
+                    print(f"💗 [欲望驱动] satisfy 跳过：{_se}")
 
             # 外向型活动（想对方了/分享发现/偷偷关心）：除了写日志，还真的把内容推送出去。
             # plain=True → 不带标题前缀，像平时聊天一样自然发出。
