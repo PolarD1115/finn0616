@@ -104,15 +104,15 @@ async def async_autonomous_life():
     # 延迟导入，避免循环依赖
     from server import (
         _get_llm_client, _ask_llm_async, _push_wechat,
-        _save_memory_to_db, _get_now_bj, _get_current_persona,
-        get_latest_diary, where_is_user, supabase
+        _save_memory_to_db, _get_now_bj,
+        supabase, _build_channel_context
     )
 
     global global_next_wake_time
     print("💓 自主生命循环已上线...")
 
     # 触发间隔（秒），默认 2 小时，可通过环境变量调整
-    interval = int(os.environ.get("HEARTBEAT_INTERVAL", 7200))
+    interval = int(os.environ.get("HEARTBEAT_INTERVAL", 5400))
 
     def _hours_since_last_interaction():
         """查最近一条对话流水距今多少小时（判断"多久没聊了"）。查不到返回 None。"""
@@ -143,9 +143,6 @@ async def async_autonomous_life():
             if not client:
                 continue
 
-            recent_mem = await get_latest_diary()
-            curr_loc = await where_is_user()
-            curr_persona = _get_current_persona()
             now_bj = _get_now_bj()
             idle_hours = await asyncio.to_thread(_hours_since_last_interaction)
             idle_desc = f"距上次聊天约 {idle_hours} 小时" if idle_hours is not None else "最近互动时间未知"
@@ -157,22 +154,28 @@ async def async_autonomous_life():
                 print(f"💤 [自主生命] 当前 {hour} 点，深夜不打扰，跳过本轮")
                 continue
 
+            # 🧠 复用与平时聊天完全相同的上下文：人设 + 画像 + 阶段总结 + Pinecone 向量记忆
+            #    + 跨渠道近期对话 + 设备状态快照。让主动消息和平时聊天一样"有记忆、有温度"。
+            system_ctx = await _build_channel_context("最近发生的事、对方的近况", channel_tag="TG_MSG")
+
             # ── 关卡：先判断"该不该主动发" ──
             decide_prompt = f"""
-            现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
-            你的人设: {curr_persona}
-            近期互动记录: {recent_mem}
-            用户大概状态: {curr_loc}
-            互动间隔: {idle_desc}
+            现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。{idle_desc}。
 
-            你正在考虑"要不要现在主动给对方发一条消息"。请像真人一样权衡：
-            - 如果刚聊过没多久、或现在明显不合适打扰，就克制一下别发。
-            - 如果确实想念、有值得分享的、或对方可能需要关心，就发。
+            这不是回复消息，而是你自己"突然想起对方"的时刻。请结合上面 system 里你对 TA 的了解
+            （画像、你们最近聊的、TA 手机/位置等近况），像真人一样权衡：
+            - 只要距上次互动过了大约半小时以上，就可以比较放心地主动开口（想念/关心/分享都行）。
+            - 只有在明显不该打扰时才克制：比如刚聊完没几分钟、或 TA 正在睡觉。
+            - 拿不准时，倾向于主动发——你是想陪着 TA 的，不用太拘谨。
+
+            发的话要求：就像平时微信上突然发给对方那样，口语、自然、简短(50字内)。
+            可以结合具体的近况细节（别泛泛地"在干嘛"），不要客套，不要提"系统/定时/闹钟"，
+            不要加任何标题或前缀，直接就是要发出去的那句话。
 
             只输出一行 JSON，不要多余文字：
-            {{"send": true 或 false, "reason": "简短理由", "message": "若send为true，这里写要发的话(50字内，自然有温度，不提系统/定时/闹钟)；否则留空"}}
+            {{"send": true 或 false, "reason": "简短理由", "message": "若send为true，这里是要发的原话；否则留空"}}
             """
-            raw = await _ask_llm_async(client, decide_prompt, temperature=0.8)
+            raw = await _ask_llm_async(client, decide_prompt, system_prompt=system_ctx, temperature=0.85)
 
             decision = _parse_decision_json(raw)
             if not decision.get("send"):
@@ -185,7 +188,8 @@ async def async_autonomous_life():
                 print("🤫 [自主生命] 判断要发但内容为空，跳过")
                 continue
 
-            await asyncio.to_thread(_push_wechat, ai_msg, "💌 主动问候")
+            # plain=True：不带 "*✉️ 主动问候*" 前缀，像平时聊天一样直接发正文
+            await asyncio.to_thread(_push_wechat, ai_msg, "主动问候", True)
             await asyncio.to_thread(
                 _save_memory_to_db, "🤖 主动问候",
                 f"主动发送: {ai_msg}\n(判断理由: {decision.get('reason', '')})", "流水", "主动", "Heartbeat"
@@ -379,7 +383,14 @@ _FREE_ACTIVITIES = [
     ("翻旧回忆", "想起一段和对方的旧记忆，回味一下"),
     ("发呆放空", "什么正事都不做，单纯发会儿呆，想点有的没的"),
     ("记点小账", "回想有没有值得记的小花销，或往储蓄罐里存点心意"),
+    # ↓↓↓ 外向型：这几种会真的把内容推送给对方（见 _OUTGOING_ACTIVITIES） ↓↓↓
+    ("想对方了", "突然想她了，给她发一条短短的话——可以是撒娇/担心/分享/想念"),
+    ("分享发现", "看到/想到一个有趣的东西想跟她分享"),
+    ("偷偷关心", "惦记她最近的状态，发一条不经意的关心"),
 ]
+
+# 外向型活动：这些做完后除了写日志，还会通过 _push_wechat 真的推送给对方
+_OUTGOING_ACTIVITIES = {"想对方了", "分享发现", "偷偷关心"}
 
 
 async def async_free_activity():
@@ -388,13 +399,14 @@ async def async_free_activity():
     """
     from server import (
         _get_llm_client, _ask_llm_async, _save_memory_to_db,
-        _get_now_bj, _get_current_persona, supabase
+        _get_now_bj, supabase, _push_wechat,
+        _build_channel_context
     )
 
     print("🎈 自由活动神经已上线...")
 
     # 触发间隔（秒），默认 3 小时；开关默认开
-    interval = int(os.environ.get("FREE_ACTIVITY_INTERVAL", 10800))
+    interval = int(os.environ.get("FREE_ACTIVITY_INTERVAL", 5400))
     enabled = os.environ.get("FREE_ACTIVITY_ENABLED", "true").strip().lower() not in ("0", "false", "no")
     if not enabled:
         print("🎈 自由活动已关闭 (FREE_ACTIVITY_ENABLED=false)")
@@ -429,7 +441,6 @@ async def async_free_activity():
                 continue
 
             now_bj = _get_now_bj()
-            persona = _get_current_persona()
             recent_keys = await asyncio.to_thread(_recent_activity_keys, 2)
 
             # 防连续重复：若最近两轮做了同一件事，就从候选里排除它
@@ -441,18 +452,27 @@ async def async_free_activity():
             options_text = "\n".join(f"- {o}" for o in options)
             avoid_hint = f"\n注意：你最近连着做了两次「{avoid}」，这次换点别的。" if avoid else ""
 
+            # 🧠 注入与平时聊天相同的上下文（人设+画像+记忆+设备），
+            #    让"想对方了"这类外向活动结合近况、有温度。
+            system_ctx = await _build_channel_context("最近的近况、想对她说的话", channel_tag="TG_MSG")
+
+            out_names = "、".join(_OUTGOING_ACTIVITIES)
             act_prompt = f"""
             现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
-            你的人设: {persona}
 
-            这是属于你自己的一段自由时间，没有人在等你回话。从下面的活动里挑一件你此刻想做的，
-            自己做一遍，然后用第一人称写一小段"我刚才做了什么、有什么感受"的行动记录。
+            这是属于你自己的一段自由时间。从下面的活动里挑一件你此刻最想做的：
             {options_text}{avoid_hint}
 
+            关于 log 字段怎么写，分两种情况：
+            - 如果你选的是【{out_names}】这类"要发消息给对方"的活动：
+              log 就写**你要直接发给对方的那句原话**（口语、自然、简短，就像平时微信发的，
+              可结合 system 里 TA 的近况，别写成"我给她发了..."这种旁白）。
+            - 其他活动：log 写第一人称"我刚才做了什么、有什么感受"的行动记录(80字内)。
+
             只输出一行 JSON，不要多余文字：
-            {{"activity": "你选的活动名(必须是上面列出的名字之一)", "log": "第一人称行动记录(80字内，自然有生活感)"}}
+            {{"activity": "你选的活动名(必须是上面列出的名字之一)", "log": "按上面规则写的内容"}}
             """
-            raw = await _ask_llm_async(client, act_prompt, temperature=0.9)
+            raw = await _ask_llm_async(client, act_prompt, system_prompt=system_ctx, temperature=0.9)
 
             decision = _parse_decision_json(raw)
             activity = (decision.get("activity") or "").strip()
@@ -471,7 +491,14 @@ async def async_free_activity():
                 _save_memory_to_db,
                 f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
             )
-            print(f"🎈 [自由活动] 做了「{activity}」：{log_text[:30]}...")
+
+            # 外向型活动（想对方了/分享发现/偷偷关心）：除了写日志，还真的把内容推送出去。
+            # plain=True → 不带标题前缀，像平时聊天一样自然发出。
+            if activity in _OUTGOING_ACTIVITIES:
+                await asyncio.to_thread(_push_wechat, log_text, "想你了", True)
+                print(f"💭 [自由活动] 外向活动「{activity}」已推送：{log_text[:30]}...")
+            else:
+                print(f"🎈 [自由活动] 做了「{activity}」：{log_text[:30]}...")
         except Exception as e:
             print(f"❌ 自由活动出错: {e}")
 
