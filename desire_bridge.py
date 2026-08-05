@@ -53,6 +53,7 @@ LAST_ACTION_KEY = "desire_last_action"        # v2③ 上一拍 want_action
 ACTION_REPEAT_KEY = "desire_action_repeat"    # v2③ 连续相同动作拍数
 NEXT_HEARTBEAT_KEY = "desire_next_heartbeat_at"  # v2⑤ 下次心跳醒来的时间戳（毫秒）
 ATTACHMENT_BASELINE_KEY = "desire_attachment_baseline"  # v2④ attachment 当前地板值（初始=HOME）
+LAST_TICK_KEY = "desire_last_tick_at"          # 上次 tick 的时间戳（毫秒），算 decay 的 dt
 
 # pulse 增量：主人来的情感冲击 vs 自经历（对齐攻略：自经历更小）
 PULSE_FROM_USER = 0.18
@@ -123,6 +124,46 @@ def _save_fact(key: str, value: Any) -> None:
         ).execute()
     except Exception as e:
         print(f"[Desire] save {key} failed: {e}")
+
+
+DESIRE_TRACE_TAG = "Desire_Trace"   # 曲线留痕专用标签；importance=1，两天后被深梦清理协程自动扫掉
+
+
+def _save_desire_trace(drive: Dict[str, float], intent: de.Intent,
+                       att_baseline: float, now_ms: float) -> None:
+    """
+    往 memories 追加一条驱动条快照留痕。
+    DRIVE_STATE_KEY 是覆盖写、历史全丢；整定系数需要曲线，这里逐拍落一条。
+    - tags=Desire_Trace，importance=1（STREAM 级）→ heartbeat._perform_deep_dreaming
+      里 importance < 4 的清理协程两天后自动扫掉，不堆积。
+    - content 存 8 维值 + intent 的 JSON，供离线取数画曲线。
+    """
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        import datetime as _dt
+        payload = {
+            "drive": drive,
+            "intent": {
+                "want_action": intent.want_action,
+                "drive_key": intent.drive_key,
+                "score": intent.score,
+                "is_wildcard": intent.is_wildcard,
+            },
+            "attachment_baseline": att_baseline,
+        }
+        sb.table("memories").insert({
+            "title": "💗 欲望驱动留痕",
+            "content": json.dumps(payload, ensure_ascii=False),
+            "category": "流水",
+            "mood": "平静",
+            "tags": DESIRE_TRACE_TAG,
+            "importance": 1,
+            "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"[Desire] save trace failed: {e}")
 
 
 # =============================================================================
@@ -421,7 +462,17 @@ def tick(now_ms: Optional[float] = None,
     prev = _load_fact(DRIVE_STATE_KEY)
     if prev and isinstance(prev.get("drive"), dict):
         prev_drive_state = de.DriveState.from_dict(prev["drive"])
-        drive_state = prev_drive_state
+
+        # 先按真实经过时间做自然衰减，再叠 pulse。
+        # 缺这一步驱动条只涨不跌，只能靠 satisfy 硬砸，曲线会变成锯齿。
+        # ⚠️ prev_drive_state 保持衰减「前」的值：耦合网 delta 模式靠它算源的前值，
+        #    用衰减后的值会把 delta 吃掉。这里另用 drive_state 承接衰减结果。
+        last_tick = _load_fact(LAST_TICK_KEY)
+        if isinstance(last_tick, (int, float)):
+            dt = max(0.0, (now_ms - float(last_tick)) / 1000.0)
+            drive_state = de.decay(prev_drive_state, dt)
+        else:
+            drive_state = prev_drive_state
         # 对每一维：若映射值高于当前驱动值，视为一次外来冲击 → pulse 上去
         for k in de.RANKED_KEYS:
             gap = mapped.get(k) - drive_state.get(k)
@@ -489,6 +540,8 @@ def tick(now_ms: Optional[float] = None,
         _save_fact(ACTION_REPEAT_KEY, action_repeat)
         _save_fact(NEXT_HEARTBEAT_KEY, next_heartbeat_at)
         _save_fact(ATTACHMENT_BASELINE_KEY, att_baseline)  # v2④ 写回当前地板
+        _save_fact(LAST_TICK_KEY, now_ms)                  # decay 的 dt 基准
+        _save_desire_trace(drive_state.as_dict(), intent, att_baseline, now_ms)  # 曲线留痕（两天后自动清）
     _save_fact(DRIVE_STATE_KEY, {
         "drive": drive_state.as_dict(),
         "snapshot_at": ee._ms_to_iso(now_ms),
@@ -523,6 +576,16 @@ def satisfy_action(action: str) -> None:
 
     # 乘性回落 + 主驱动进入不应期
     drive_state, refractory = de.satisfy_with_refractory(drive_state, action, refractory)
+
+    # 🛑 v2④ 地板兜底：satisfy 不许把 attachment 挖穿地板。
+    #    intimacy 动作的相关维度正好是 attachment（乘 SATISFY_REL_FACTOR），
+    #    没有这道兜底会从下面把想念地板踩穿——想念的地板不该被「刚做完亲密」踩下去。
+    try:
+        att_baseline = float(_load_fact(ATTACHMENT_BASELINE_KEY))
+    except (TypeError, ValueError):
+        att_baseline = de.BASELINE_HOME
+    if drive_state.attachment < att_baseline:
+        drive_state = de.replace(drive_state, attachment=att_baseline)
 
     _save_fact(DRIVE_STATE_KEY, {
         "drive": drive_state.as_dict(),

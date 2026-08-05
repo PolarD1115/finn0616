@@ -127,7 +127,7 @@ REFRACTORY_TICKS: int = 3            # satisfy 后该维度的冷却拍数
 WILDCARD_TENSION_THRESHOLD: float = 0.55   # 总张力（参与排序维度的平均值）≥ 此值才有资格
 WILDCARD_TIE_MARGIN: float = 0.08          # 前两名召唤力分差 < 此值 = 胶着
 WILDCARD_STUCK_TICKS: int = 2              # 最高分 want_action 连续 ≥ 此拍数没变 = 卡死
-WILDCARD_CANDIDATES: List[str] = ["read", "wander", "social", "rest"]  # 小候选集
+WILDCARD_CANDIDATES: List[str] = ["reflect", "explore", "socialize", "rest"]  # 小候选集
 WILDCARD_REASON: str = "说不上来……就突然想换个事做。"  # 第一人称、不可归因
 
 # --- v2⑤ 自主心跳（张力 ↔ 间隔）---

@@ -412,9 +412,21 @@ class HostFixMiddleware:
             await self._handle_models_api(scope, receive, send)
             return
 
+        # ---------- 🧠 情绪 / 欲望系统状态接口（只读） ----------
+        # 返回 user_facts 里 desire_* 的最新持久化快照，供 Mini App / 前端面板使用。
+        # 已在上方全局拦截中过 API_SECRET 鉴权。纯只读：不推进引擎、不写库。
+        if scope["path"] == "/api/desire":
+            await self._handle_desire_api(send)
+            return
+
         # ---------- 🎛️ 内置模型管理网页 ----------
         if scope["path"] == "/admin/models":
             await self._handle_admin_page(send)
+            return
+
+        # ---------- 📱 情绪 / 欲望 Mini App（静态页面） ----------
+        if scope["path"] == "/emotion" or scope["path"] == "/emotion/":
+            await self._handle_emotion_page(send)
             return
 
         # ---------- 📱 Mini App 配置面板（前端直连 Supabase） ----------
@@ -1047,6 +1059,142 @@ class HostFixMiddleware:
             status = 200
         except Exception as e:
             body = f"miniapp.html 未找到: {e}".encode("utf-8")
+            status = 500
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/html; charset=utf-8"),
+                                (b"access-control-allow-origin", b"*")]})
+        await send({"type": "http.response.body", "body": body})
+
+    # ------------------------------------------
+    # 🧠 情绪 / 欲望系统状态接口 /api/desire
+    # ------------------------------------------
+    async def _handle_desire_api(self, send):
+        """只读返回「情感 16 维 + 欲望 8 维」最新持久化快照。
+
+        数据源：user_facts 表里的 desire_* 键（desire_bridge 心跳每拍写库）。
+        纯只读：不推进引擎、不消费事件、不写库，可放心高频轮询。
+
+        返回结构：
+          {
+            "ok": true,
+            "source": "user_facts",
+            "updated_at": <drive_state.snapshot_at 或 null>,
+            "emotion": <desire_emotion_state 原样 JSON>,
+            "drive_state": <desire_drive_state 原样 JSON>,
+            "refractory": {...},
+            "last_action": str,
+            "action_repeat": int,
+            "next_heartbeat_at": float(ms) | null,
+            "attachment_baseline": float,
+            "events_queue_len": int,
+            "derived": {
+              "display": {16维 + fatigue},   // 最新 display 快照
+              "drive": {8维},                // 最新驱动条
+              "scores": {7维召唤力},          // 从 drive 现值近似（无念头加成）
+              "intent": null,                // 服务端不推进引擎，intent 由前端本地算或置空
+              "sleep": {...},                // 睡眠子状态
+              "unanswered_thread": {...} | null,
+              "last_interaction_at": str | null,
+              "active_whim": {...} | null,
+              "time_episode_applied": {...}, // 本 episode 已累积的维度
+            },
+          }
+        """
+        sb = _get_supabase()
+        if not sb:
+            await _send_json_resp(send, 200, {
+                "ok": False,
+                "error": "网关未配置 Supabase，无法读取情绪/欲望状态",
+            })
+            return
+
+        def _load(key):
+            try:
+                r = sb.table("user_facts").select("value").eq("key", key).maybe_single().execute()
+                if r.data and r.data.get("value"):
+                    return json.loads(r.data["value"])
+            except Exception as e:
+                _log(f"⚠️ /api/desire 读取 {key} 失败: {e}")
+            return None
+
+        emotion = _load("desire_emotion_state")
+        drive_state = _load("desire_drive_state")
+        refractory = _load("desire_refractory") or {}
+        last_action = _load("desire_last_action")
+        try:
+            action_repeat = int(_load("desire_action_repeat") or 0)
+        except (TypeError, ValueError):
+            action_repeat = 0
+        next_hb = _load("desire_next_heartbeat_at")
+        try:
+            att_baseline = float(_load("desire_attachment_baseline"))
+        except (TypeError, ValueError):
+            att_baseline = None
+        queue = _load("desire_events_queue") or []
+
+        # ---- 派生视图（纯本地拼装，不调引擎） ----
+        derived = {
+            "display": None,
+            "drive": None,
+            "scores": None,
+            "intent": None,
+            "sleep": None,
+            "unanswered_thread": None,
+            "last_interaction_at": None,
+            "active_whim": None,
+            "time_episode_applied": {},
+        }
+        if isinstance(emotion, dict):
+            emo = emotion
+            d = emo.get("display") or emo.get("prev_display") or {}
+            derived["display"] = d
+            derived["sleep"] = emo.get("sleep")
+            derived["unanswered_thread"] = emo.get("unanswered_thread")
+            derived["last_interaction_at"] = emo.get("last_interaction_at")
+            derived["active_whim"] = emo.get("active_whim")
+            ep = emo.get("time_episode") or {}
+            derived["time_episode_applied"] = ep.get("applied", {})
+        if isinstance(drive_state, dict) and isinstance(drive_state.get("drive"), dict):
+            drv = drive_state["drive"]
+            derived["drive"] = drv
+            # 召唤力 = 驱动条现值（念头加成服务端不存，按 0 处理）→ 7 维
+            ranked = ["attachment", "curiosity", "reflection", "duty",
+                      "social", "libido", "stress"]
+            derived["scores"] = {k: drv.get(k, 0.0) for k in ranked}
+
+        updated_at = None
+        if isinstance(drive_state, dict):
+            updated_at = drive_state.get("snapshot_at")
+
+        await _send_json_resp(send, 200, {
+            "ok": True,
+            "source": "user_facts",
+            "updated_at": updated_at,
+            "emotion": emotion,
+            "drive_state": drive_state,
+            "refractory": refractory,
+            "last_action": last_action,
+            "action_repeat": action_repeat,
+            "next_heartbeat_at": next_hb,
+            "attachment_baseline": att_baseline,
+            "events_queue_len": len(queue),
+            "derived": derived,
+        })
+
+    # ------------------------------------------
+    # 📱 情绪 / 欲望 Mini App 页面（/emotion）
+    # ------------------------------------------
+    async def _handle_emotion_page(self, send):
+        """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""
+        try:
+            import os as _os
+            _here = _os.path.dirname(_os.path.abspath(__file__))
+            with open(_os.path.join(_here, "emotion_miniapp.html"), "r", encoding="utf-8") as f:
+                html = f.read()
+            body = html.encode("utf-8")
+            status = 200
+        except Exception as e:
+            body = f"emotion_miniapp.html 未找到: {e}".encode("utf-8")
             status = 500
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"text/html; charset=utf-8"),
