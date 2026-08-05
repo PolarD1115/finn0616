@@ -54,6 +54,7 @@ ACTION_REPEAT_KEY = "desire_action_repeat"    # v2③ 连续相同动作拍数
 NEXT_HEARTBEAT_KEY = "desire_next_heartbeat_at"  # v2⑤ 下次心跳醒来的时间戳（毫秒）
 ATTACHMENT_BASELINE_KEY = "desire_attachment_baseline"  # v2④ attachment 当前地板值（初始=HOME）
 LAST_TICK_KEY = "desire_last_tick_at"          # 上次 tick 的时间戳（毫秒），算 decay 的 dt
+LAST_SLEEP_WAKE_KEY = "desire_last_sleep_wake_ms"  # v2⑥ 已处理过的设备睡眠 sleepWakeupMs（去重，防重复注入同一觉）
 
 # pulse 增量：主人来的情感冲击 vs 自经历（对齐攻略：自经历更小）
 PULSE_FROM_USER = 0.18
@@ -78,6 +79,17 @@ def is_heartbeat_autonomy() -> bool:
 def is_baseline_drift() -> bool:
     """v2④ 基线漂移开关。默认关（关着时 attachment 地板固定在 HOME，不漂移）。"""
     return os.environ.get("DESIRE_BASELINE_DRIFT", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_sleep_from_device() -> bool:
+    """
+    v2⑥ 设备睡眠同步开关。默认关。
+    开：心跳 tick 前从 device_data 最新一条读真实睡眠（sleepStartMs/sleepWakeupMs），
+        检测到「新的一觉」时向情感引擎注入 sleep_start + sleep_end 事件，
+        让疲惫值按真实睡眠时长回血 / 起床点重算。
+    关：不读设备，疲惫仍走「清醒时长 + 昼夜节律」的默认估算。
+    """
+    return os.environ.get("SLEEP_FROM_DEVICE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _tz_offset() -> float:
@@ -337,6 +349,122 @@ async def record_assistant_message(message_id: Optional[str] = None) -> None:
 
 
 # =============================================================================
+# v2⑥ 设备睡眠同步（device_data → sleep_start / sleep_end 事件）
+# =============================================================================
+# 设备端每晚给出「一觉」的汇总：sleepStartMs / sleepWakeupMs（epoch 毫秒）+ 总时长。
+# 情感引擎的 sleep_start / sleep_end 事件正好吃这个格式的时间戳。
+# 本函数把「设备记录的真实睡眠」翻成一对事件塞进队列，让疲惫按真实睡眠回血。
+#
+# 设计原则（对齐项目一贯的灰度 + 防御风格）：
+#   - 默认关（SLEEP_FROM_DEVICE）；关着时整段跳过。
+#   - 去重：记住已处理的 sleepWakeupMs，同一觉不重复注入。
+#   - 合理性校验：时长必须落在 [MIN, MAX] 小时；起 < 止；醒来不在未来。异常直接丢弃。
+#   - 事件按时间顺序 prepend 到队列头部（睡觉发生在这拍其它事件之前）。
+#   - 任何异常都吞掉、只打日志：设备读挂了绝不能影响正常心跳。
+
+SLEEP_MIN_HOURS = 1.0    # 短于此视为噪声（小憩/误报），丢弃
+SLEEP_MAX_HOURS = 16.0   # 长于此视为脏数据，丢弃
+SLEEP_FUTURE_TOLERANCE_MS = 6 * 3600_000.0  # 醒来时间最多可比 now 晚这么多（容设备/时区小偏差）
+
+
+def _health_data_of_latest_device_row() -> Optional[Dict[str, Any]]:
+    """
+    读 device_data 最新一条的 health_data（JSON 字符串 → dict）。
+    无库 / 无数据 / 解析失败 → None。
+    ⚠️ 设备数据是外部不可信来源，这里只按已知字段名取值，不执行其中任何内容。
+    """
+    sb = _get_supabase()
+    if not sb:
+        return None
+    try:
+        r = (sb.table("device_data").select("health_data")
+             .order("id", desc=True).limit(1).execute())
+        rows = r.data or []
+        if not rows:
+            return None
+        raw = rows[0].get("health_data")
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+    except Exception as e:
+        print(f"😴 [设备睡眠] 读取 device_data 失败：{e}")
+    return None
+
+
+def sync_sleep_from_device(now_ms: Optional[float] = None) -> bool:
+    """
+    从设备最新健康数据同步「一觉」到情感引擎事件队列。
+
+    返回 True 表示本次真的注入了一对睡眠事件；False 表示没有可同步的新睡眠
+    （开关关 / 无数据 / 已处理过 / 校验不过）。
+
+    注入的事件（prepend 到队列头，保证时间序在其它事件之前）：
+      sleep_start  timestamp = sleepStartMs
+      sleep_end    timestamp = sleepWakeupMs
+    情感引擎 process_event 会据此把 last_sleep_duration_hours 设为真实时长、
+    last_wake_at 设为真实醒来时刻，疲惫从真实起床点重算。
+    """
+    if not is_sleep_from_device():
+        return False
+    if now_ms is None:
+        now_ms = time.time() * 1000.0
+
+    health = _health_data_of_latest_device_row()
+    if not health:
+        return False
+
+    start_ms = health.get("sleepStartMs")
+    wake_ms = health.get("sleepWakeupMs")
+    if not isinstance(start_ms, (int, float)) or not isinstance(wake_ms, (int, float)):
+        return False
+    start_ms = float(start_ms)
+    wake_ms = float(wake_ms)
+
+    # 合理性校验：起 < 止、时长在 [MIN, MAX] 小时、醒来不在（过分的）未来
+    if wake_ms <= start_ms:
+        print(f"😴 [设备睡眠] 起止异常（wake<=start），丢弃：start={start_ms} wake={wake_ms}")
+        return False
+    dur_h = (wake_ms - start_ms) / ee.MS_PER_HOUR
+    if dur_h < SLEEP_MIN_HOURS or dur_h > SLEEP_MAX_HOURS:
+        print(f"😴 [设备睡眠] 时长 {dur_h:.1f}h 超出 [{SLEEP_MIN_HOURS},{SLEEP_MAX_HOURS}]，丢弃")
+        return False
+    if wake_ms > now_ms + SLEEP_FUTURE_TOLERANCE_MS:
+        print(f"😴 [设备睡眠] 醒来时间在未来，疑似脏数据，丢弃：wake={wake_ms} now={now_ms}")
+        return False
+
+    # 去重：同一觉（相同 sleepWakeupMs）只注入一次
+    last_wake = _load_fact(LAST_SLEEP_WAKE_KEY)
+    if isinstance(last_wake, (int, float)) and abs(float(last_wake) - wake_ms) < 1000.0:
+        return False
+
+    # 组装一对事件（sleep_start 在前、sleep_end 在后），prepend 到队列头
+    start_iso = ee._ms_to_iso(start_ms)
+    wake_iso = ee._ms_to_iso(wake_ms)
+    rid = os.urandom(3).hex()
+    sleep_events = [
+        {
+            "event_id": f"evt_sleep_start_{int(wake_ms)}_{rid}",
+            "timestamp": start_iso,
+            "type": "sleep_start",
+            "payload": {"source": "device", "duration_hours": round(dur_h, 2)},
+        },
+        {
+            "event_id": f"evt_sleep_end_{int(wake_ms)}_{rid}",
+            "timestamp": wake_iso,
+            "type": "sleep_end",
+            "payload": {"source": "device", "duration_hours": round(dur_h, 2)},
+        },
+    ]
+    q = _load_fact(EVENTS_QUEUE_KEY) or []
+    q = sleep_events + q  # prepend：睡觉发生在这拍其它事件之前
+    _save_fact(EVENTS_QUEUE_KEY, q)
+    _save_fact(LAST_SLEEP_WAKE_KEY, wake_ms)
+    print(f"😴 [设备睡眠] 已注入一觉：{start_iso} → {wake_iso}（{dur_h:.1f}h）")
+    return True
+
+
+# =============================================================================
 # 快照数据
 # =============================================================================
 
@@ -418,6 +546,15 @@ def tick(now_ms: Optional[float] = None,
     emo_state = _load_fact(EMOTION_STATE_KEY)
     if not emo_state:
         emo_state = ee.create_initial_state(now_ms, tz)
+
+    # 1.2) v2⑥ 设备睡眠同步（默认关）：在读事件队列之前注入，本拍即消费。
+    #      只在真正推进一拍时同步（consume_events=True）；只读观测不动队列。
+    #      内部含开关判断 + 去重 + 校验，任何异常吞掉不影响心跳。
+    if consume_events:
+        try:
+            sync_sleep_from_device(now_ms)
+        except Exception as _se:
+            print(f"😴 [设备睡眠] 同步跳过：{_se}")
 
     events: List[Dict[str, Any]] = []
     if consume_events:

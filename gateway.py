@@ -18,6 +18,7 @@
 """
 
 import os
+import re
 import json
 import asyncio
 import time
@@ -829,9 +830,18 @@ class HostFixMiddleware:
         # 统一写 UTC 时刻，与旧网关数据兼容
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        final_save_text = ai_msg
-        if reasoning:
-            final_save_text = f"<think>\n{reasoning}\n</think>\n\n{final_save_text}"
+        final_save_text = ai_msg or ""
+        # 🧠 默认过滤思考过程，避免 <think> 占满字数导致正文被截断。
+        #    如需保留旧行为（存 <think> 块），设置环境变量 SAVE_THINKING=true。
+        save_thinking = os.environ.get("SAVE_THINKING", "false").strip().lower() in ("1", "true", "yes")
+        if save_thinking:
+            if reasoning:
+                final_save_text = f"<think>\n{reasoning}\n</think>\n\n{final_save_text}"
+        else:
+            # 剥离正文里可能内联混入的 <think>...</think> 块（reasoning 直接丢弃不拼接）
+            final_save_text = re.sub(
+                r"<think>.*?</think>", "", final_save_text, flags=re.DOTALL | re.IGNORECASE
+            ).strip()
         if not final_save_text and tool_calls:
             tc_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls.values()]
             final_save_text = f"[系统记录：调用了工具 {', '.join(tc_names)}]"
