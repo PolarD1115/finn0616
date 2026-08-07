@@ -250,6 +250,27 @@ def _dedupe_notifs(notifs, max_n):
     return out
 
 
+def _is_profile_key(key: str) -> bool:
+    """
+    判断一个 user_facts 的 key 是否属于「用户画像」（应注入 prompt）。
+
+    desire 系列的处理：
+    - 运行时状态（desire_drive_state / desire_emotion_state / desire_last_tick_at
+      / desire_next_heartbeat_at 等）——每拍都在变，是引擎内部状态，绝不能进画像，
+      否则既是噪音、又会因为时间戳每拍变化而击穿缓存前缀 → 排除。
+    - 人写的笔记（如 desire_system_tech_debt_2026_08_05）——带日期后缀，属于真画像 → 放行。
+
+    识别方式：desire_ 开头且**结尾带 _YYYY_MM_DD 日期后缀**的视为笔记放行，
+    其余 desire_ 开头一律当运行时状态排除。非 desire_ 开头的照常放行。
+    """
+    if not key:
+        return False
+    if key.startswith("desire_"):
+        # 结尾是 _2026_08_05 这种日期后缀 → 笔记，放行
+        return bool(re.search(r"_\d{4}_\d{2}_\d{2}$", key))
+    return True
+
+
 def _fetch_device_snapshot(sb):
     """
     拉取 device_data 最新一条，渲染成可注入 prompt 的文本块。
@@ -535,12 +556,20 @@ class HostFixMiddleware:
             await _send_json_resp(send, 500, {"error": {"message": "Server 未配置模型上游（注册表为空且未设置 OPENAI_API_KEY）"}})
             return
 
-        # 构造上游 URL（兼容用户填或不填 /v1 后缀）
+        # 构造上游 URL（智能兼容各家 base_url 写法）
+        # 规则：
+        #   1) base 已带 /chat/completions → 原样用（用户填了完整端点）
+        #   2) base 以版本号段结尾（/v1 /v2 /v3 /v4 或 /paas/v4 等）→ 直接补 /chat/completions
+        #   3) 其余（裸域名/根路径）→ 按 OpenAI 习惯补 /v1/chat/completions
+        # 这样智谱 https://open.bigmodel.cn/api/paas/v4 → .../v4/chat/completions（不再错拼成 /v4/v1/...）
         base = upstream_base.rstrip("/") or "https://api.openai.com/v1"
-        if not base.endswith("/v1"):
-            upstream_url = f"{base}/v1/chat/completions"
-        else:
+        if re.search(r"/chat/completions$", base):
+            upstream_url = base
+        elif re.search(r"/v\d+[a-zA-Z]*$", base):
+            # 结尾是版本段：/v1 /v2 /v4 /v1beta 等 → 直接接 /chat/completions
             upstream_url = f"{base}/chat/completions"
+        else:
+            upstream_url = f"{base}/v1/chat/completions"
 
         # ==========================================
         # 🧠 智能体模式：注入上文/人设/记忆（仅当配了 Supabase 时启用）
@@ -714,9 +743,12 @@ class HostFixMiddleware:
         # 用户画像
         user_prof = "暂无"
         try:
-            pr = await asyncio.to_thread(lambda: sb.table("user_facts").select("key, value").neq("key", "sys_config").neq("key", "llm_settings").execute())
+            # 画像查询：排除系统配置键；desire_ 前缀在 Python 侧精细过滤（见 _is_profile_key）。
+            # 加 .order("key") 稳定排序 —— 顺序固定，注入进稳定前缀的内容才不会变，缓存前缀才能命中。
+            pr = await asyncio.to_thread(lambda: sb.table("user_facts").select("key, value").neq("key", "sys_config").neq("key", "llm_settings").neq("key", "llm_models").order("key").execute())
             if pr and pr.data:
-                user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in pr.data[:30]])
+                rows = [r for r in pr.data if _is_profile_key(r.get("key", ""))]
+                user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in rows[:60]])
         except Exception:
             pass
 
@@ -771,44 +803,62 @@ class HostFixMiddleware:
         except Exception:
             channel_display = chat_tag
 
-        status_inject = (
-            f"\n\n[系统当前状态]\n当前时间:{time_str}(北京时间),距离上次聊天:{silence_hours}h。\n"
-            f"当前聊天渠道：{channel_display}\n"
-            f"【{user_name}的核心画像】:\n{user_prof}\n\n"
-            f"--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---\n"
-            f"【深层关联记忆】:\n{pinecone_context}\n"
-            f"【近3次阶段总结】:\n{core_summaries}\n"
-            f"------------------------------------------------\n"
-        )
-
         # 🆕 设备状态快照（device_data 最新一条，含更新时间标注；可开关）
         device_snapshot = ""
         if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
             try:
                 device_snapshot = _fetch_device_snapshot(sb)
-                if device_snapshot:
-                    status_inject += f"\n{device_snapshot}\n"
             except Exception as e:
                 _log(f"⚠️ 设备快照注入失败（跳过）: {e}")
 
+        # ==========================================
+        # 📦 缓存友好的两段式拼装（修复缓存命中率≈0 & AI 漏看时间戳）
+        #   ① stable_system —— 稳定前缀（人设 + 画像 + 阶段总结），几乎不随请求变化，
+        #      放最前面当作可命中 prompt cache 的公共前缀（上游多为前缀匹配缓存，
+        #      前缀里一旦混入每请求都变的时间戳，整段缓存即失效 → 命中率归零）。
+        #   ② volatile_block —— 易变尾块（实时时间 / 沉默时长 / 渠道 / 按本轮话题检索的
+        #      深层记忆 / 设备快照），随每次请求变化，塞到「最后一条 user 之前」，
+        #      既不污染缓存前缀，又落在模型注意力最高的末尾位置。
+        #   ③ 时间戳放在 volatile_block 的最末行、紧贴用户消息，避免被 AI 漏看。
+        # ==========================================
+        stable_parts = []
         if persona:
-            status_inject = f"{persona}\n{status_inject}"
+            stable_parts.append(persona)
+        stable_parts.append(f"【{user_name}的核心画像】:\n{user_prof}")
+        stable_parts.append(f"【近3次阶段总结】:\n{core_summaries}")
+        stable_system = "\n\n".join(stable_parts)
 
-        # 注入到 messages：已有 system 就追加，没有就插入
+        volatile_block = (
+            f"--- 以下为按本轮话题检索的背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---\n"
+            f"【深层关联记忆】:\n{pinecone_context}\n"
+        )
+        if device_snapshot:
+            volatile_block += f"{device_snapshot}\n"
+        volatile_block += (
+            f"------------------------------------------------\n"
+            f"[实时状态 · 回复前请先读这里]\n"
+            f"⏰ 当前时间：{time_str}（北京时间）\n"
+            f"🔕 距离上次聊天：{silence_hours}h\n"
+            f"📡 当前聊天渠道：{channel_display}"
+        )
+
+        # ① 注入稳定前缀到 system：已有 system 就「前置」拼接（保证稳定内容仍在最前，
+        #    维持缓存前缀不被前端自带 system 内容顶开），没有就插入到最前。
         has_system = False
         for m in req_data.get("messages", []):
             if m.get("role") == "system":
-                m["content"] = str(m.get("content", "")) + status_inject
+                existing = str(m.get("content", ""))
+                m["content"] = f"{stable_system}\n\n{existing}" if existing else stable_system
                 has_system = True
                 break
         if not has_system and req_data.get("messages"):
-            req_data["messages"].insert(0, {"role": "system", "content": status_inject.strip()})
+            req_data["messages"].insert(0, {"role": "system", "content": stable_system})
 
         # 清理：去掉末尾的 assistant 尾巴（防止前端误带）
         while req_data.get("messages") and req_data["messages"][-1].get("role") == "assistant":
             req_data["messages"].pop()
 
-        # 把上文历史插到 system 之后、user 之前
+        # ② 把上文历史插到 system 之后、user 之前
         if history_msgs:
             sys_idx = 0
             for i, m in enumerate(req_data["messages"]):
@@ -818,7 +868,21 @@ class HostFixMiddleware:
             for j, hm in enumerate(history_msgs):
                 req_data["messages"].insert(sys_idx + j, hm)
 
-        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else ""))
+        # ③ 易变尾块：作为一条 system 消息塞到「最后一条 user 之前」，
+        #    确保实时时间/记忆落在缓存前缀之后 + 注意力最高的末尾。
+        msgs = req_data.get("messages", [])
+        last_user_idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                last_user_idx = i
+                break
+        volatile_msg = {"role": "system", "content": volatile_block}
+        if last_user_idx is not None:
+            msgs.insert(last_user_idx, volatile_msg)
+        else:
+            msgs.append(volatile_msg)
+
+        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
 
     async def _save_conversation(self, sb, user_msg, ai_msg, reasoning, tool_calls):
         """异步把本轮对话存到 Supabase memories 表 + Pinecone"""

@@ -567,9 +567,11 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
     tasks["persona"] = _safe(_get_current_persona)
 
     if supabase:
-        # 2. 用户画像
+        # 2. 用户画像（desire_ 前缀在 Python 侧精细过滤，见 gateway._is_profile_key；
+        #    .order("key") 稳定排序 → 注入内容顺序固定，缓存前缀才能命中）
         tasks["profile"] = _safe(lambda: supabase.table("user_facts").select("key, value")
-                                 .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona").execute())
+                                 .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona")
+                                 .neq("key", "llm_models").order("key").execute())
         # 3. 阶段总结（长期记忆 Core_Cognition）
         tasks["summaries"] = _safe(lambda: supabase.table("memories").select("content")
                                    .eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
@@ -602,7 +604,9 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
     user_prof = "暂无"
     pr = r.get("profile")
     if pr and pr.data:
-        user_prof = "\n".join([f"- {row['key']}: {str(row['value'])[:200]}" for row in pr.data[:30]])
+        import gateway as _gw
+        rows = [row for row in pr.data if _gw._is_profile_key(row.get("key", ""))]
+        user_prof = "\n".join([f"- {row['key']}: {str(row['value'])[:200]}" for row in rows[:60]])
 
     core_summaries = "无长期记忆"
     sr = r.get("summaries")
@@ -628,17 +632,28 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
 
     device_snapshot = r.get("device") or ""
 
-    parts = [
-        f"[系统当前状态] 当前时间:{time_str}(北京时间)。当前聊天渠道：{_channel_display_name(channel_tag)}。",
+    # 📦 缓存友好的两段式拼装（与网页渠道 _inject_context 对齐）：
+    #   稳定前缀（人设 + 画像 + 阶段总结）在前，作为可命中 prompt cache 的公共前缀；
+    #   易变尾块（深层记忆 / 历史回顾 / 设备快照 / 实时时间+渠道）在后，
+    #   时间戳放最末行紧贴用户消息，避免污染缓存前缀 & 避免被 AI 漏看。
+    stable_parts = [
         f"【{user_name}的核心画像】:\n{user_prof}",
-        "--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---",
-        f"【深层关联记忆】:\n{pinecone_context}",
         f"【近3次阶段总结】:\n{core_summaries}",
     ]
+    volatile_parts = [
+        "--- 以下为调取的历史背景记忆（请注意这是过去的事，不是现在正在聊的内容） ---",
+        f"【深层关联记忆】:\n{pinecone_context}",
+    ]
     if history_text:
-        parts.append(f"【近期对话回顾】:\n{history_text}")
+        volatile_parts.append(f"【近期对话回顾】:\n{history_text}")
     if device_snapshot:
-        parts.append(device_snapshot)
+        volatile_parts.append(device_snapshot)
+    volatile_parts.append(
+        f"[实时状态 · 回复前请先读这里]\n"
+        f"⏰ 当前时间：{time_str}（北京时间）\n"
+        f"📡 当前聊天渠道：{_channel_display_name(channel_tag)}"
+    )
+    parts = stable_parts + volatile_parts
 
     # Feed injection statistics into the shared gateway buffer without logging private context.
     try:

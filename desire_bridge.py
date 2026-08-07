@@ -20,7 +20,9 @@ gating（灰度原则，默认关）：
                                 但调用方**不应**用它覆盖行为。
     DESIRE_DRIVEN=true         ：调用方按 intent.want_action 覆盖「想做的事」。
 
-状态存储（user_facts key）：
+状态存储（desire_state 表，key-value 结构，与 user_facts 同构）：
+    ⚠️ 原先寄居在 user_facts，因高频读写拖累 prompt 缓存前缀、且被画像查询误当"用户画像"
+       注入上下文，v3.8 起独立到 desire_state 表。表名见本模块 STATE_TABLE 常量。
     desire_emotion_state   16 维情感引擎完整状态 JSON
     desire_drive_state     8 维驱动条快照 JSON（含上一拍值，用于算 pulse 增量）
     desire_events_queue    待情感引擎消费的事件队列 JSON
@@ -112,12 +114,17 @@ def _get_supabase():
         return None
 
 
+# 引擎状态专用表（原先寄居在 user_facts，因其高频读写拖累 prompt 缓存前缀而独立出来）。
+# 结构与 user_facts 对齐（key/value/confidence），额外多一列 updated_at 便于观测 tick 频率。
+STATE_TABLE = "desire_state"
+
+
 def _load_fact(key: str) -> Optional[Any]:
     sb = _get_supabase()
     if not sb:
         return None
     try:
-        r = sb.table("user_facts").select("value").eq("key", key).execute()
+        r = sb.table(STATE_TABLE).select("value").eq("key", key).execute()
         if r and r.data:
             return json.loads(r.data[0]["value"])
     except Exception as e:
@@ -130,12 +137,22 @@ def _save_fact(key: str, value: Any) -> None:
     if not sb:
         return
     try:
-        sb.table("user_facts").upsert(
-            {"key": key, "value": json.dumps(value, ensure_ascii=False), "confidence": 1.0},
+        sb.table(STATE_TABLE).upsert(
+            {
+                "key": key,
+                "value": json.dumps(value, ensure_ascii=False),
+                "confidence": 1.0,
+                "updated_at": _dt_now_iso(),
+            },
             on_conflict="key",
         ).execute()
     except Exception as e:
         print(f"[Desire] save {key} failed: {e}")
+
+
+def _dt_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
 DESIRE_TRACE_TAG = "Desire_Trace"   # 曲线留痕专用标签；importance=1，两天后被深梦清理协程自动扫掉
