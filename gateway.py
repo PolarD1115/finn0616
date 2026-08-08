@@ -372,6 +372,73 @@ def _fetch_device_snapshot(sb):
     return "\n".join(lines)
 
 
+# ==========================================
+# 🏷️ Claude 思考标签改写：<thinking> → <think>
+# ==========================================
+# 背景：Claude 系列常把思考过程包成 <thinking>...</thinking> 混在正文里下发，
+#      而本项目其余环节（存库剥离、前端渲染）统一按 <think> 处理。
+#      为保持一致，转发 Claude 响应时把 thinking 标签统一改写成 think。
+# 难点：流式下标签会被切碎（如 "<think" 一块、"ing>" 下一块），
+#      因此需要一个「跨 chunk 尾缓冲」状态机：末尾若可能是半个标签就暂存，
+#      等后续拼齐再替换，避免漏改。
+# 开关：默认对 model 名含 "claude" 的响应启用；可用 REWRITE_THINKING_TAG
+#      环境变量强制开启(1/true/yes)或关闭(0/false/no)。
+
+_THINKING_TAG_RE = re.compile(r"</?thinking(\s[^>]*)?>", re.IGNORECASE)
+# 尾部可能是半个 "<thinking>" / "</thinking>" 开头，需要暂存等下一块拼齐再判断。
+# 含开标签 "<thinking" 与闭标签 "</thinking" 的所有前缀（斜杠后 t 亦可缺失，如 "</"）。
+_THINKING_PARTIAL_RE = re.compile(
+    r"</?(t(h(i(n(k(i(n(g)?)?)?)?)?)?)?)?$", re.IGNORECASE
+)
+
+
+def _should_rewrite_thinking(model_name: str) -> bool:
+    """判断是否需要把 <thinking> 改写成 <think>。"""
+    ov = os.environ.get("REWRITE_THINKING_TAG", "").strip().lower()
+    if ov in ("1", "true", "yes"):
+        return True
+    if ov in ("0", "false", "no"):
+        return False
+    return "claude" in (model_name or "").lower()
+
+
+def _rewrite_thinking_tags(text: str) -> str:
+    """把一段文本里的 <thinking>/</thinking> 换成 <think>/</think>（保留斜杠）。"""
+    return _THINKING_TAG_RE.sub(
+        lambda m: "</think>" if m.group(0).lstrip("<").startswith("/") else "<think>",
+        text,
+    )
+
+
+class _ThinkingTagRewriter:
+    """流式 <thinking> → <think> 改写器，处理跨 chunk 被切碎的标签。
+
+    用法：对每段 delta.content 调用 feed()，结束时调用 flush() 取回残留缓冲。
+    """
+
+    def __init__(self):
+        self._buf = ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        data = self._buf + text
+        # 先把已完整出现的标签替换掉
+        data = _rewrite_thinking_tags(data)
+        # 检查末尾是否是「半个标签」，是则留在缓冲里等下一块
+        m = _THINKING_PARTIAL_RE.search(data)
+        if m and m.start() < len(data):
+            self._buf = data[m.start():]
+            return data[: m.start()]
+        self._buf = ""
+        return data
+
+    def flush(self) -> str:
+        out = self._buf
+        self._buf = ""
+        return out
+
+
 class HostFixMiddleware:
     """ASGI 中间件：路由分发 + OpenAI 兼容代理 + MCP 下游转发"""
 
@@ -649,6 +716,12 @@ class HostFixMiddleware:
         collected_reasoning = ""
         tool_calls_dict = {}
 
+        # 🏷️ 是否把 Claude 的 <thinking> 标签改写成 <think>（跨 chunk 状态机）
+        rewrite_thinking = _should_rewrite_thinking(req_data.get("model", ""))
+        thinking_rewriter = _ThinkingTagRewriter() if rewrite_thinking else None
+        if rewrite_thinking:
+            _log(f"🏷️ [thinking改写] 已启用 <thinking>→<think> | model={req_data.get('model')}")
+
         # 主循环：透传 + 收集
         while True:
             chunk = await asyncio.to_thread(q.get)
@@ -667,28 +740,75 @@ class HostFixMiddleware:
                 await send({"type": "http.response.body", "body": f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8"), "more_body": True})
                 continue
 
-            await send({"type": "http.response.body", "body": (chunk + "\n\n").encode("utf-8"), "more_body": True})
+            # 默认原样透传；启用 thinking 改写时对 data 行做 <thinking>→<think>
+            if not rewrite_thinking or not chunk.startswith("data: ") or chunk == "data: [DONE]":
+                await send({"type": "http.response.body", "body": (chunk + "\n\n").encode("utf-8"), "more_body": True})
+                if chunk.startswith("data: ") and chunk != "data: [DONE]":
+                    try:
+                        dj = json.loads(chunk[6:])
+                        if dj.get("choices"):
+                            delta = dj["choices"][0].get("delta", {})
+                            if delta.get("content"):
+                                collected_content += delta["content"]
+                            if delta.get("reasoning_content"):
+                                collected_reasoning += delta["reasoning_content"]
+                            if delta.get("tool_calls"):
+                                for tc in delta["tool_calls"]:
+                                    idx = tc.get("index", 0)
+                                    if idx not in tool_calls_dict:
+                                        tool_calls_dict[idx] = tc
+                                    else:
+                                        if tc.get("function", {}).get("arguments"):
+                                            tool_calls_dict[idx]["function"].setdefault("arguments", "")
+                                            tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                    except Exception:
+                        pass
+                continue
 
-            if chunk.startswith("data: ") and chunk != "data: [DONE]":
-                try:
-                    dj = json.loads(chunk[6:])
-                    if dj.get("choices"):
-                        delta = dj["choices"][0].get("delta", {})
-                        if delta.get("content"):
-                            collected_content += delta["content"]
-                        if delta.get("reasoning_content"):
-                            collected_reasoning += delta["reasoning_content"]
-                        if delta.get("tool_calls"):
-                            for tc in delta["tool_calls"]:
-                                idx = tc.get("index", 0)
-                                if idx not in tool_calls_dict:
-                                    tool_calls_dict[idx] = tc
-                                else:
-                                    if tc.get("function", {}).get("arguments"):
-                                        tool_calls_dict[idx]["function"].setdefault("arguments", "")
-                                        tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                except Exception:
-                    pass
+            # ---- 需要改写 thinking 标签的分支 ----
+            try:
+                dj = json.loads(chunk[6:])
+            except Exception:
+                # 解析失败：原样透传，不影响其他 SSE 行（如注释/心跳）
+                await send({"type": "http.response.body", "body": (chunk + "\n\n").encode("utf-8"), "more_body": True})
+                continue
+
+            rewritten = False
+            if dj.get("choices"):
+                delta = dj["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    new_content = thinking_rewriter.feed(delta["content"])
+                    delta["content"] = new_content
+                    collected_content += new_content
+                    rewritten = True
+                if delta.get("reasoning_content"):
+                    collected_reasoning += delta["reasoning_content"]
+                if delta.get("tool_calls"):
+                    for tc in delta["tool_calls"]:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = tc
+                        else:
+                            if tc.get("function", {}).get("arguments"):
+                                tool_calls_dict[idx]["function"].setdefault("arguments", "")
+                                tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+
+            out_line = f"data: {json.dumps(dj, ensure_ascii=False)}" if rewritten else chunk
+            await send({"type": "http.response.body", "body": (out_line + "\n\n").encode("utf-8"), "more_body": True})
+
+        # 🏷️ flush 改写器残留缓冲（末尾停在半个标签的情况），补一个 content chunk
+        if thinking_rewriter is not None:
+            tail = thinking_rewriter.flush()
+            if tail:
+                collected_content += tail
+                tail_chunk = {
+                    "id": "chatcmpl-tail",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req_data.get("model"),
+                    "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
+                }
+                await send({"type": "http.response.body", "body": f"data: {json.dumps(tail_chunk, ensure_ascii=False)}\n\n".encode("utf-8"), "more_body": True})
 
         # 结束响应
         await send({"type": "http.response.body", "body": b"", "more_body": False})
