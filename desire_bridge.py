@@ -64,8 +64,16 @@ PULSE_FROM_SELF = 0.10
 
 
 def is_desire_driven() -> bool:
-    """总闸：欲望是否真覆盖行为。默认关（只读可看不动手）。"""
-    return os.environ.get("DESIRE_DRIVEN", "false").strip().lower() in ("1", "true", "yes", "on")
+    """总闸：欲望是否真覆盖行为。默认关（只读可看不动手）。
+
+    数据库优先：sys_config.desire_driven 覆盖环境变量 DESIRE_DRIVEN。
+    这样控制台开关能热生效（5s TTL 缓存），不依赖重启。
+    """
+    try:
+        import gateway as _gw
+        return _gw._desire_driven_enabled()
+    except Exception:
+        return os.environ.get("DESIRE_DRIVEN", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def is_desire_coupling() -> bool:

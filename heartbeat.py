@@ -139,7 +139,7 @@ async def async_autonomous_life():
         await asyncio.sleep(interval + wake_jitter)
 
         try:
-            client = _get_llm_client("main_chat")
+            client = _get_llm_client("background")  # 主动问候属后台活动角色
             if not client:
                 continue
 
@@ -248,8 +248,8 @@ async def _perform_deep_dreaming():
         if len(context) > 80000:
             context = context[-80000:]
 
-        # 获取主对话模型客户端（用户要求：总结类一律用聊天模型，不用便宜/默认模型）
-        client = _get_llm_client("main_chat")
+        # 获取压缩角色模型客户端（日记属压缩类任务：阶段总结/历史压缩/日记压缩）
+        client = _get_llm_client("compression")
         if not client:
             print("⚠️ 未配置 CHAT_API_KEY，日记生成跳过（LLM 客户端缺失）。")
             return
@@ -451,7 +451,7 @@ async def async_free_activity():
         await asyncio.sleep(sleep_secs)
 
         try:
-            client = _get_llm_client("main_chat")
+            client = _get_llm_client("background")
             if not client:
                 continue
 
@@ -470,34 +470,41 @@ async def async_free_activity():
             # ── 欲望驱动引擎（灰度）：算一拍情感→驱动→意图快照 ──
             # DESIRE_DRIVEN 关（默认）：只算 + 只存快照观测，不覆盖行为。
             # DESIRE_DRIVEN 开        ：把最高欲望对应的活动作为「倾向」注入 prompt。
+            # 🚫 情感总开关：emotion_enabled=false 时停止 tick（停止计算/消费事件）。
             desire_hint = ""
             desire_intent = None
             desire_driven = False
             try:
-                import desire_bridge
-                snap = await asyncio.to_thread(desire_bridge.tick)
-                desire_intent = snap.intent
-                desire_driven = snap.driven
-                # 观测信息：不应期哪些维度在冷却 + wildcard 是否触发
-                _cooling = "、".join(f"{k}:{v}" for k, v in (snap.refractory or {}).items()) or "无"
-                _wild = "triggered" if desire_intent.is_wildcard else "not"
-                _obs = f"[不应期: {_cooling}] [wildcard: {_wild}]"
-                if desire_driven:
-                    suggested = desire_bridge.suggest_free_activity(desire_intent)
-                    if suggested and suggested != avoid:
-                        # 第一人称把「此刻最想做的事」告诉模型，作为倾向而非强制
-                        desire_hint = (
-                            f"\n（你此刻内心最想做的：{desire_intent.reason}"
-                            f" 若合适，优先考虑「{suggested}」。）"
-                        )
-                    print(f"💗 [欲望驱动·开] intent={desire_intent.want_action} "
-                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} {_obs}")
-                else:
-                    print(f"💗 [欲望驱动·观测] intent={desire_intent.want_action} "
-                          f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} "
-                          f"{_obs}（不覆盖行为）")
-            except Exception as _de:
-                print(f"💗 [欲望驱动] 跳过：{_de}")
+                import gateway as _gw
+                _emo_on = _gw._emotion_enabled()
+            except Exception:
+                _emo_on = True
+            if _emo_on:
+                try:
+                    import desire_bridge
+                    snap = await asyncio.to_thread(desire_bridge.tick)
+                    desire_intent = snap.intent
+                    desire_driven = snap.driven
+                    # 观测信息：不应期哪些维度在冷却 + wildcard 是否触发
+                    _cooling = "、".join(f"{k}:{v}" for k, v in (snap.refractory or {}).items()) or "无"
+                    _wild = "triggered" if desire_intent.is_wildcard else "not"
+                    _obs = f"[不应期: {_cooling}] [wildcard: {_wild}]"
+                    if desire_driven:
+                        suggested = desire_bridge.suggest_free_activity(desire_intent)
+                        if suggested and suggested != avoid:
+                            # 第一人称把「此刻最想做的事」告诉模型，作为倾向而非强制
+                            desire_hint = (
+                                f"\n（你此刻内心最想做的：{desire_intent.reason}"
+                                f" 若合适，优先考虑「{suggested}」。）"
+                            )
+                        print(f"💗 [欲望驱动·开] intent={desire_intent.want_action} "
+                              f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} {_obs}")
+                    else:
+                        print(f"💗 [欲望驱动·观测] intent={desire_intent.want_action} "
+                              f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} "
+                              f"{_obs}（不覆盖行为）")
+                except Exception as _de:
+                    print(f"💗 [欲望驱动] 跳过：{_de}")
 
             # 🧠 注入与平时聊天相同的上下文（人设+画像+记忆+设备），
             #    让"想对方了"这类外向活动结合近况、有温度。
@@ -672,7 +679,7 @@ async def async_telegram_polling():
         if len(items) > 1:
             _tg_log(f"聚合触发 chat={chat_label} 合并{len(items)}条 → 共{len(text)}字")
 
-        client = _get_llm_client("main_chat")
+        client = _get_llm_client("chat")
         if not client:
             await asyncio.to_thread(
                 _send_message, base_url, chat_id, "（AI 服务暂未配置，暂时没法回话哦）", 10
@@ -715,13 +722,33 @@ async def async_telegram_polling():
         _tg_log(f"回复已发送 chat={chat_label} 回复字数={len(reply)} 气泡数={len(bubbles)}")
 
         # 欲望驱动：把「用户消息（分类）」与「AI 已回复」两个事件塞进情感引擎队列。
+        # 🚫 情感总开关：emotion_enabled=false 时停止事件入队（停止计算/消费事件）。
         # 全部吞异常，绝不影响正常聊天。
         try:
-            import desire_bridge
-            await desire_bridge.record_user_message(text)
-            await desire_bridge.record_assistant_message()
-        except Exception as _dee:
-            _tg_log(f"欲望驱动事件入队跳过: {_dee}")
+            import gateway as _gw
+            _emo_on = _gw._emotion_enabled()
+        except Exception:
+            _emo_on = True
+        if _emo_on:
+            try:
+                import desire_bridge
+                await desire_bridge.record_user_message(text)
+                await desire_bridge.record_assistant_message()
+            except Exception as _dee:
+                _tg_log(f"欲望驱动事件入队跳过: {_dee}")
+        else:
+            _tg_log(f"情感引擎已关闭，跳过事件入队 chat={chat_label}")
+
+        # 🚫 聊天记录写入门控：chat_history_write_enabled=false 时跳过 memories 流水 + Pinecone。
+        #    不影响手动保存记忆、已有记忆读取、必要的系统状态记录。
+        try:
+            import gateway as _gw2
+            _write_on = _gw2._chat_write_enabled()
+        except Exception:
+            _write_on = True
+        if not _write_on:
+            _tg_log(f"🔇 [聊天写入已关闭] 跳过 TG_MSG 流水写入 chat={chat_label}")
+            return
 
         saved = await asyncio.to_thread(
             _save_memory_to_db, "🤖 互动记录",
@@ -759,6 +786,18 @@ async def async_telegram_polling():
             if not data.get("ok"):
                 await asyncio.sleep(5)
                 continue
+
+            # 🚫 TG 渠道门控：telegram_enabled=false 时停止处理消息（仍推进 offset 避免积压）。
+            #    不删除 TG_BOT_TOKEN、不重复启动轮询任务；再次开启后恢复处理。
+            try:
+                import gateway as _gw
+                if not _gw._tg_enabled():
+                    for _u in data.get("result", []):
+                        offset = _u["update_id"] + 1
+                    await asyncio.sleep(2)
+                    continue
+            except Exception:
+                pass
 
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
@@ -807,8 +846,8 @@ async def async_message_summarizer():
         await asyncio.sleep(interval)
         if not supabase:
             continue
-        # 消息总结也是总结类，按用户要求统一用聊天模型（main_chat）
-        client = _get_llm_client("main_chat")
+        # 消息总结属压缩类任务，统一走 compression 角色
+        client = _get_llm_client("compression")
         if not client:
             continue
         try:
@@ -885,8 +924,8 @@ async def async_reminder_worker():
                         if current_hm == t_str and last_fired != current_date:
                             final_push_text = raw_msg
 
-                            # 尝试用 LLM 生成更自然的提醒文案
-                            client = _get_llm_client("main_chat")
+                            # 尝试用 LLM 生成更自然的提醒文案（提醒属后台活动角色）
+                            client = _get_llm_client("background")
                             if client:
                                 try:
                                     curr_persona = _get_current_persona()

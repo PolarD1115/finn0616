@@ -261,6 +261,15 @@ async def _process_napcat_message(data: dict, send):
         if post_type != "message":
             return
 
+        # 🚫 QQ 渠道门控：qq_enabled=false 时不进入聊天处理（已连接状态与功能启用状态分离）
+        try:
+            import gateway as _gw
+            if not _gw._qq_enabled():
+                _naplog("🔇 [QQ] 渠道已关闭，跳过消息处理")
+                return
+        except Exception:
+            pass
+
         message_type = data.get("message_type")
         raw_message = data.get("raw_message", "")
         sender = data.get("sender", {})
@@ -323,7 +332,7 @@ def _get_qq_aggregator(send):
         if not dep:
             return
 
-        client = dep._get_llm_client("main_chat")
+        client = dep._get_llm_client("chat")  # QQ 实时回复属 chat 角色
         if not client:
             await send_qq_message(target_id, "（AI 服务暂未配置，无法回复）", is_group=is_group)
             return
@@ -356,12 +365,30 @@ def _get_qq_aggregator(send):
         await send_qq_message(target_id, reply, is_group=is_group)
 
         # 欲望驱动：用户消息（分类）+ AI 已回复 两个事件入队。全部吞异常，不影响聊天。
+        # 🚫 情感总开关：emotion_enabled=false 时停止事件入队（停止计算/消费事件）。
         try:
-            import desire_bridge
-            await desire_bridge.record_user_message(text)
-            await desire_bridge.record_assistant_message()
-        except Exception as _dee:
-            print(f"💗 [欲望驱动] QQ 事件入队跳过：{_dee}")
+            import gateway as _gw
+            _emo_on = _gw._emotion_enabled()
+        except Exception:
+            _emo_on = True
+        if _emo_on:
+            try:
+                import desire_bridge
+                await desire_bridge.record_user_message(text)
+                await desire_bridge.record_assistant_message()
+            except Exception as _dee:
+                print(f"💗 [欲望驱动] QQ 事件入队跳过：{_dee}")
+
+        # 🚫 聊天记录写入门控：chat_history_write_enabled=false 时跳过 memories 流水写入。
+        #    不影响手动保存记忆、已有记忆读取、必要的系统状态记录。
+        try:
+            import gateway as _gw2
+            _write_on = _gw2._chat_write_enabled()
+        except Exception:
+            _write_on = True
+        if not _write_on:
+            _naplog(f"🔇 [聊天写入已关闭] 跳过 QQ_MSG 流水写入 target={target_id}")
+            return
 
         # 记忆入库
         if hasattr(dep, "_save_memory_to_db"):
@@ -451,7 +478,7 @@ async def check_and_summarize_all():
                     f"（例如直接说：'{user_name}最近在忙...' 或 '我们刚才聊了...'）。"
                 )
                 # 用户要求：总结类一律用聊天模型（main_chat），不用便宜/默认模型
-                client = dep._get_llm_client("main_chat")
+                client = dep._get_llm_client("compression")  # 总结属压缩类任务
                 if client:
                     try:
                         model_name = getattr(client, 'custom_model_name', "abab6.5s-chat")

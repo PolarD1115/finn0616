@@ -80,35 +80,97 @@ def _get_supabase():
 
 _LLM_REGISTRY_KEY = "llm_models"
 
+# 三种模型身份角色（见下 _ROLES 文档与 resolve_llm_role）。
+# chat         —— 实时聊天（网页 /v1/chat/completions、TG 轮询、QQ NapCat 的即时回复）
+# compression  —— 阶段总结、历史压缩、日记压缩等压缩类任务
+# background   —— 自由活动、主动问候、后台思考等后台活动
+# 同一模型可同时承担多个角色；被禁用的模型不能被分配角色。
+_LLM_ROLES = ("chat", "compression", "background")
+
+
+def _normalize_registry(reg: dict) -> dict:
+    """把任意历史版本的注册表归一化为 v2 结构 {schema_version, models, default, roles}。
+
+    兼容：
+      - 旧版只有 {models, default}（无 roles）→ roles.chat_default=default，roles.chat=[default]
+      - v3.9 临时字段 assignments:{background: id} → 迁入 roles.background
+      - 已有 roles（v2）→ 原样保留，但补全缺失字段
+    幂等：对已是 v2 的结构再跑一次结果不变。
+    """
+    models = reg.get("models") if isinstance(reg.get("models"), list) else []
+    default = str(reg.get("default", "") or "").strip()
+    roles = reg.get("roles") if isinstance(reg.get("roles"), dict) else {}
+
+    # 旧 assignments 字段迁移到 roles（仅当 roles.background 未设置时）
+    assignments = reg.get("assignments") if isinstance(reg.get("assignments"), dict) else {}
+    for r in _LLM_ROLES:
+        if r not in roles or roles[r] in (None, "", []):
+            av = assignments.get(r)
+            if av:
+                roles[r] = av
+
+    # chat_default 缺失时回退到 default / 第一个启用模型
+    if not roles.get("chat_default"):
+        roles["chat_default"] = default
+    if not isinstance(roles.get("chat"), list):
+        # 旧版无 chat 列表：用 chat_default（若仍是有效模型）作为唯一聊天模型
+        cd = roles.get("chat_default")
+        roles["chat"] = [cd] if cd else []
+    # compression / background 是单值（可为空字符串）
+    for r in ("compression", "background"):
+        if r in roles and isinstance(roles[r], list):
+            roles[r] = roles[r][0] if roles[r] else ""
+        if r not in roles:
+            roles[r] = ""
+
+    # 补 chat_default 进 chat 列表（保证默认聊天模型在列表里）
+    cd = roles.get("chat_default")
+    if cd and cd not in roles["chat"]:
+        roles["chat"] = [cd] + [x for x in roles["chat"] if x != cd]
+
+    # default 字段始终与 chat_default 保持一致（向后兼容前端 /v1/models 与 /admin/models）
+    default = roles.get("chat_default") or default
+    return {
+        "schema_version": 2,
+        "models": models,
+        "default": default,
+        "roles": {
+            "chat": roles["chat"],
+            "chat_default": roles.get("chat_default") or default,
+            "compression": roles.get("compression") or "",
+            "background": roles.get("background") or "",
+        },
+    }
+
 
 def _load_llm_registry():
-    """从 Supabase 读取模型注册表；无表/无数据/未配库时返回空结构。"""
+    """从 Supabase 读取模型注册表（归一化为 v2 结构）。
+    无表/无数据/未配库时返回空结构。
+    """
     sb = _get_supabase()
     if not sb:
-        return {"models": [], "default": ""}
+        return _normalize_registry({"models": [], "default": ""})
     try:
         res = sb.table("user_facts").select("value").eq("key", _LLM_REGISTRY_KEY).execute()
         if res.data and res.data[0].get("value"):
             reg = json.loads(res.data[0]["value"])
             if isinstance(reg, dict) and isinstance(reg.get("models"), list):
-                return {"models": reg["models"], "default": reg.get("default", "")}
+                return _normalize_registry(reg)
     except Exception as e:
         _log(f"⚠️ 读取模型注册表失败: {e}")
-    return {"models": [], "default": ""}
+    return _normalize_registry({"models": [], "default": ""})
 
 
 def _save_llm_registry(reg: dict) -> bool:
-    """把模型注册表写回 Supabase（upsert）。"""
+    """把模型注册表写回 Supabase（upsert），持久化 v2 结构（含 roles + schema_version）。"""
     sb = _get_supabase()
     if not sb:
         return False
     try:
+        norm = _normalize_registry(reg)
         payload = {
             "key": _LLM_REGISTRY_KEY,
-            "value": json.dumps({
-                "models": reg.get("models", []),
-                "default": reg.get("default", ""),
-            }, ensure_ascii=False),
+            "value": json.dumps(norm, ensure_ascii=False),
         }
         sb.table("user_facts").upsert(payload).execute()
         return True
@@ -120,6 +182,7 @@ def _save_llm_registry(reg: dict) -> bool:
 def _resolve_model(model_id: str):
     """按前端传入的 model(id) 解析出真实上游三元组。
     返回 (base_url, api_key, real_model, matched)；matched=False 表示未命中注册表。
+    （仅用于网页 /v1/chat/completions 的请求路由，按前端指定 model id 命中）
     """
     reg = _load_llm_registry()
     models = [m for m in reg.get("models", []) if m.get("enabled", True)]
@@ -156,6 +219,237 @@ def _resolve_model(model_id: str):
     return (base_url, api_key, real_model, True)
 
 
+def _find_enabled_model(reg: dict, model_id: str):
+    """在注册表里按 id 找一个 *已启用* 的模型条目，找不到返回 None。"""
+    if not model_id:
+        return None
+    for m in reg.get("models", []):
+        if m.get("id") == model_id and m.get("enabled", True):
+            return m
+    return None
+
+
+def _has_legacy_llm_settings() -> bool:
+    """检查 user_facts 是否存在旧版 llm_settings（控制台"待迁移模型"提示用）。"""
+    sb = _get_supabase()
+    if not sb:
+        return False
+    try:
+        r = sb.table("user_facts").select("value").eq("key", "llm_settings").maybe_single().execute()
+        if r and r.data and r.data.get("value"):
+            ls = json.loads(r.data["value"])
+            return isinstance(ls, dict) and bool(ls.get("key"))
+    except Exception:
+        pass
+    return False
+
+
+def _model_role_usage(reg: dict, model_id: str) -> list:
+    """返回该 model_id 当前承担的角色列表（用于删除/禁用前的占用检查）。"""
+    roles = reg.get("roles", {})
+    used = []
+    if model_id in (roles.get("chat") or []):
+        used.append("chat")
+    if model_id == roles.get("chat_default"):
+        used.append("chat_default")
+    if model_id == roles.get("compression"):
+        used.append("compression")
+    if model_id == roles.get("background"):
+        used.append("background")
+    return used
+
+
+def _migrate_llm_settings_to_registry(reg: dict) -> tuple:
+    """把旧 llm_settings 幂等迁移为新注册表的一个模型条目。
+    返回 (new_reg, migrated:bool, reason:str)。
+    - 若 llm_settings 无效 → 原样返回 reg, False, "llm_settings 无效"
+    - 若注册表已有同 base_url+model 的条目 → 视为已迁移，原样返回
+    - 否则新增一条 id="legacy_main_chat" 的模型，并把 chat_default 指向它（仅当无 default 时）
+    """
+    sb = _get_supabase()
+    if not sb:
+        return reg, False, "无 Supabase"
+    try:
+        r = sb.table("user_facts").select("value").eq("key", "llm_settings").maybe_single().execute()
+        if not (r and r.data and r.data.get("value")):
+            return reg, False, "llm_settings 不存在"
+        ls = json.loads(r.data["value"])
+        if not (isinstance(ls, dict) and ls.get("key")):
+            return reg, False, "llm_settings 无 key 字段"
+    except Exception as e:
+        return reg, False, f"读取失败: {e}"
+
+    models = list(reg.get("models", []))
+    ls_model = str(ls.get("model", "")).strip() or "main_chat"
+    ls_base = str(ls.get("url", "")).strip()
+    ls_key = str(ls.get("key", "")).strip()
+
+    # 幂等：已有同 base_url + model 的条目则不重复生成
+    for m in models:
+        if m.get("base_url", "").strip() == ls_base and m.get("model", "").strip() == ls_model:
+            return reg, False, "已存在等价条目，跳过"
+
+    new_id = "legacy_main_chat"
+    # 避免与已有 id 冲突
+    existing_ids = {m.get("id") for m in models}
+    if new_id in existing_ids:
+        new_id = "legacy_main_chat_2"
+    entry = {
+        "id": new_id,
+        "label": f"旧主聊天模型({ls_model})",
+        "base_url": ls_base,
+        "api_key": ls_key,
+        "model": ls_model,
+        "enabled": True,
+    }
+    models.append(entry)
+    new_reg = dict(reg)
+    new_reg["models"] = models
+    roles = dict(reg.get("roles", {}))
+    if not roles.get("chat_default"):
+        roles["chat_default"] = new_id
+        roles["chat"] = [new_id] + [x for x in roles.get("chat", []) if x != new_id]
+    new_reg["roles"] = roles
+    new_reg["default"] = roles.get("chat_default") or reg.get("default", "")
+    return new_reg, True, f"已迁移为 {new_id}"
+
+
+def resolve_llm_role(role: str):
+    """统一的角色解析函数 —— 所有聊天/压缩/后台活动调用点都走这里，不要在各文件重复解析 JSON。
+
+    role ∈ {"chat","compression","background"}
+    返回 dict：
+      {
+        "api_key": str, "base_url": str, "model": str,
+        "registry_id": str | "",   # 命中的注册表模型 id（空=非注册表来源）
+        "source": str,             # "registry" / "llm_settings" / "env" / "default"
+        "fallback": bool,          # True=未命中理想来源，走了回退
+        "enabled": bool,           # 该角色当前是否可用（有可用 key+model）
+      }
+
+    回退顺序（逐级尝试，记入 source/fallback）：
+      1. llm_models.roles[role] 命中已启用注册表模型          → source="registry"
+      2. 默认聊天模型 / 兼容映射（chat_default）              → source="registry", fallback=True
+      3. 旧 user_facts.llm_settings（key/url/model）          → source="llm_settings"
+      4. 对应环境变量（CHAT_* / COMPRESS_* / BACKGROUND_*；OPENAI_* 兼容）→ source="env"
+      5. 原有默认值                                          → source="default"
+    """
+    role = (role or "chat").strip()
+    if role not in _LLM_ROLES:
+        role = "chat"
+
+    reg = _load_llm_registry()
+    roles = reg.get("roles", {})
+
+    # 1) 注册表角色命中
+    if role == "chat":
+        cand_ids = [rid for rid in roles.get("chat", []) if rid]
+        cd = roles.get("chat_default")
+        if cd and cd not in cand_ids:
+            cand_ids = [cd] + cand_ids
+    else:
+        cand_ids = [roles.get(role, "")] if roles.get(role, "") else []
+
+    for rid in cand_ids:
+        m = _find_enabled_model(reg, rid)
+        if m:
+            return {
+                "api_key": str(m.get("api_key", "")).strip(),
+                "base_url": str(m.get("base_url", "")).strip(),
+                "model": str(m.get("model", "")).strip() or m.get("id", ""),
+                "registry_id": m.get("id", ""),
+                "source": "registry",
+                "fallback": False,
+                "enabled": True,
+            }
+
+    # 2) 注册表默认聊天模型回退
+    cd = roles.get("chat_default") or reg.get("default")
+    m = _find_enabled_model(reg, cd) if cd else None
+    if m:
+        return {
+            "api_key": str(m.get("api_key", "")).strip(),
+            "base_url": str(m.get("base_url", "")).strip(),
+            "model": str(m.get("model", "")).strip() or m.get("id", ""),
+            "registry_id": m.get("id", ""),
+            "source": "registry",
+            "fallback": True,
+            "enabled": True,
+        }
+
+    # 3) 旧 llm_settings（db）
+    sb = _get_supabase()
+    if sb:
+        try:
+            r = sb.table("user_facts").select("value").eq("key", "llm_settings").maybe_single().execute()
+            if r and r.data and r.data.get("value"):
+                ls = json.loads(r.data["value"])
+                if isinstance(ls, dict) and ls.get("key"):
+                    return {
+                        "api_key": str(ls.get("key", "")).strip(),
+                        "base_url": str(ls.get("url", "")).strip(),
+                        "model": str(ls.get("model", "")).strip(),
+                        "registry_id": "",
+                        "source": "llm_settings",
+                        "fallback": True,
+                        "enabled": True,
+                    }
+        except Exception as e:
+            _log(f"⚠️ resolve_llm_role 读取 llm_settings 失败: {e}")
+
+    # 4) 环境变量（按角色拆分，向后兼容 OPENAI_* / CHAT_*）
+    if role == "compression":
+        env_prefix = "COMPRESS"
+        fb_prefix = "CHAT"
+    elif role == "background":
+        env_prefix = "BACKGROUND"
+        fb_prefix = "CHAT"
+    else:
+        env_prefix = "CHAT"
+        fb_prefix = "OPENAI"
+
+    def _env(*names):
+        for n in names:
+            v = os.environ.get(n, "").strip()
+            if v:
+                return v
+        return ""
+
+    api_key = _env(f"{env_prefix}_API_KEY", f"{fb_prefix}_API_KEY", "OPENAI_API_KEY", "DEFAULT_API_KEY")
+    base_url = _env(f"{env_prefix}_BASE_URL", f"{fb_prefix}_BASE_URL", "OPENAI_BASE_URL", "DEFAULT_BASE_URL")
+    model = _env(f"{env_prefix}_MODEL_NAME", f"{fb_prefix}_MODEL_NAME", "OPENAI_MODEL_NAME", "DEFAULT_MODEL_NAME") or "gpt-3.5-turbo"
+
+    src = "env" if api_key else "default"
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+        "registry_id": "",
+        "source": src,
+        "fallback": True,
+        "enabled": bool(api_key),
+    }
+
+
+def _role_client(role: str):
+    """构造一个 OpenAI 客户端用于给定角色（供 server._get_llm_client 复用）。
+    返回 (client, model_name)；client 可能为 None（角色未配置）。
+    """
+    r = resolve_llm_role(role)
+    if not r["enabled"] or not r["api_key"]:
+        return (None, r["model"])
+    try:
+        from openai import OpenAI
+        base_url = r["base_url"] or None
+        client = OpenAI(api_key=r["api_key"], base_url=base_url, timeout=60.0)
+        client.custom_model_name = r["model"]
+        client.role_source = r["source"]   # 便于日志/调试
+        return (client, r["model"])
+    except Exception as e:
+        _log(f"⚠️ _role_client({role}) 构造失败: {e}")
+        return (None, r["model"])
+
+
 def _mask_key(k: str) -> str:
     """屏蔽 api_key，仅保留前缀用于识别。"""
     k = str(k or "")
@@ -171,6 +465,177 @@ def _get_pinecone_memory():
         return server.pinecone_memory
     except Exception:
         return None
+
+
+# ==========================================
+# 🎛️ 运行时配置系统（sys_config）+ 全渠道门控开关
+# ==========================================
+# 设计：
+#   - 所有可热生效的开关持久化在 user_facts.sys_config（一个 JSON 字符串）。
+#   - 各进程（A 消息进程 / B 后台进程 / WS 处理器 / 网关请求线程）通过
+#     _get_runtime_config() 读取，带 5 秒 TTL 内存缓存 —— 既避免每条消息都打 DB，
+#     又能在数秒内把控制台修改热同步到所有进程（与 heartbeat.async_env_sync 10s 对齐）。
+#   - 数据库优先于环境变量：sys_config 里有就用它，没有回退环境变量默认值。
+#   - 修复 v3.8 遗留：情感/欲望状态已迁到 desire_state 表，/api/desire 必须从该表读。
+#
+# 开关作用范围（全部跨 Web/TG/QQ 三渠道一致）：
+#   telegram_enabled              TG 轮询门控（进程 A）
+#   qq_enabled                    QQ NapCat 消息处理门控（WS 处理器）
+#   emotion_enabled               情感/欲望引擎总开关（心跳 tick + 事件入队）
+#   desire_driven                 DESIRE_DRIVEN 是否覆盖行为（DB 覆盖同名环境变量）
+#   chat_history_write_enabled    聊天记录写入门控（memories 流水 + Pinecone）
+#   vector_memory_injection_enabled 向量记忆检索注入门控（_inject_context / _build_channel_context）
+
+_SYS_CONFIG_KEY = "sys_config"
+_runtime_config_cache = {"data": None, "ts": 0.0}
+_RUNTIME_CONFIG_TTL = 5.0  # 秒
+
+
+def _default_runtime_config() -> dict:
+    """默认值：未配置 sys_config 或某键缺失时的回退（与现有行为一致）。"""
+    return {
+        "telegram_enabled": True,
+        "qq_enabled": True,
+        "emotion_enabled": True,
+        "desire_driven": os.environ.get("DESIRE_DRIVEN", "false").strip().lower() in ("1", "true", "yes", "on"),
+        "chat_history_write_enabled": True,
+        "vector_memory_injection_enabled": True,
+    }
+
+
+def _load_sys_config_raw() -> dict:
+    """直接读 sys_config JSON（无缓存），失败返回空 dict。"""
+    sb = _get_supabase()
+    if not sb:
+        return {}
+    try:
+        r = sb.table("user_facts").select("value").eq("key", _SYS_CONFIG_KEY).maybe_single().execute()
+        if r and r.data and r.data.get("value"):
+            conf = json.loads(r.data["value"])
+            if isinstance(conf, dict):
+                return conf
+    except Exception as e:
+        _log(f"⚠️ 读取 sys_config 失败: {e}")
+    return {}
+
+
+def _get_runtime_config() -> dict:
+    """读取运行时配置（带 TTL 缓存）。返回合并了默认值的完整 dict。"""
+    now = time.time()
+    if _runtime_config_cache["data"] is not None and (now - _runtime_config_cache["ts"]) < _RUNTIME_CONFIG_TTL:
+        return _runtime_config_cache["data"]
+    raw = _load_sys_config_raw()
+    merged = _default_runtime_config()
+    # 数据库覆盖默认值（仅当显式存在且是合法 bool 值时）
+    for k in list(merged.keys()):
+        if k in raw and raw[k] is not None:
+            v = raw[k]
+            if isinstance(v, bool):
+                merged[k] = v
+            elif isinstance(v, str):
+                merged[k] = v.strip().lower() in ("1", "true", "yes", "on")
+    _runtime_config_cache["data"] = merged
+    _runtime_config_cache["ts"] = now
+    return merged
+
+
+def _invalidate_runtime_config():
+    """强制刷新缓存（PATCH 配置后调用，保证下次读取拿到新值）。"""
+    _runtime_config_cache["data"] = None
+    _runtime_config_cache["ts"] = 0.0
+
+
+def _tg_enabled() -> bool:
+    """Telegram 渠道是否启用（轮询门控）。"""
+    return _get_runtime_config().get("telegram_enabled", True)
+
+
+def _qq_enabled() -> bool:
+    """QQ 渠道是否启用（消息处理门控）。"""
+    return _get_runtime_config().get("qq_enabled", True)
+
+
+def _emotion_enabled() -> bool:
+    """情感/欲望引擎总开关（关闭后停止 tick + 停止事件入队）。"""
+    return _get_runtime_config().get("emotion_enabled", True)
+
+
+def _desire_driven_enabled() -> bool:
+    """DESIRE_DRIVEN 是否覆盖行为（数据库 sys_config 优先于环境变量）。"""
+    return _get_runtime_config().get("desire_driven", False)
+
+
+def _chat_write_enabled() -> bool:
+    """聊天记录写入门控（memories 流水 + Pinecone 写入）。"""
+    return _get_runtime_config().get("chat_history_write_enabled", True)
+
+
+def _vector_injection_enabled() -> bool:
+    """向量记忆检索注入门控（构建 prompt 时跳过 Pinecone 检索）。"""
+    return _get_runtime_config().get("vector_memory_injection_enabled", True)
+
+
+def _config_source_of(key: str) -> str:
+    """判断某个开关当前生效来源：'database' / 'env' / 'default'。"""
+    raw = _load_sys_config_raw()
+    if key in raw and raw[key] is not None:
+        return "database"
+    if key == "desire_driven" and os.environ.get("DESIRE_DRIVEN", "").strip():
+        return "env"
+    return "default"
+
+
+# ==========================================
+# 🗂️ 记忆分类映射（记忆库页 6 个页签的服务端权威实现）
+# ==========================================
+_CORE_TAGS = {"Core_Cognition", "Core_Cognition_Weekly", "Core_Cognition_Monthly", "Core_Cognition_Yearly"}
+_QQ_TAGS = {"QQ_MSG", "QQ_Chat", "QQ_Group"}
+_TG_TAGS = {"TG_MSG"}
+
+# 渠道页签 → 用于 memories.in_("tags", [...]) 的 SQL 过滤
+MEM_CATEGORY_TAGS = {
+    "core": ["Core_Cognition", "Core_Cognition_Weekly", "Core_Cognition_Monthly", "Core_Cognition_Yearly"],
+    "web": ["Web_Chat"],
+    "qq": ["QQ_MSG", "QQ_Chat", "QQ_Group"],
+    "tg": ["TG_MSG"],
+    "free": ["Free_Activity"],
+}
+
+
+def _memory_category(tags: str, content: str = "") -> str:
+    """把一条 memory 的 tags 映射到 6 个页签之一：core/web/qq/tg/free/other。
+
+    规则（与控制台前端、记忆库页完全一致，单一真相源）：
+      - 核心认知：tags ∈ Core_Cognition 系列
+      - 网页对话：tags == Web_Chat
+      - QQ 对话：tags ∈ QQ_MSG/QQ_Chat/QQ_Group
+      - TG 对话：tags == TG_MSG
+      - 自由活动：tags == Free_Activity
+      - 其他/历史：Archived_Chat、Desire_Trace、Heartbeat、逗号分隔的旧多词标签、
+                   空标签、created_at 为空的历史数据 —— 统一归入 other
+    """
+    t = str(tags or "").strip()
+    if t in _CORE_TAGS:
+        return "core"
+    if t == "Web_Chat":
+        return "web"
+    if t in _QQ_TAGS:
+        return "qq"
+    if t in _TG_TAGS:
+        return "tg"
+    if t == "Free_Activity":
+        return "free"
+    return "other"
+
+
+def _category_tag_filter(category: str):
+    """返回该页签对应的 tags 白名单（用于服务端精确分页查询）。
+    other 页签无法用单次 in_ 查询表达（它是"不在以上分类"的补集），
+    返回 None 表示调用方需用 Python 侧过滤或反向查询。
+    """
+    if category in MEM_CATEGORY_TAGS:
+        return MEM_CATEGORY_TAGS[category]
+    return None  # other
 
 
 # ==========================================
@@ -252,23 +717,32 @@ def _dedupe_notifs(notifs, max_n):
 
 def _is_profile_key(key: str) -> bool:
     """
-    判断一个 user_facts 的 key 是否属于「用户画像」（应注入 prompt）。
+    判断一个 user_facts 的 key 是否属于「用户画像」（应注入 prompt / 应在画像页展示）。
+    这是画像过滤的单一真相源：控制台画像页、_inject_context、_build_channel_context 都复用它。
 
+    系统配置键（必须隐藏）：
+      sys_config / llm_settings / llm_models / sys_ai_persona —— 结构化系统配置，非画像。
     desire 系列的处理：
     - 运行时状态（desire_drive_state / desire_emotion_state / desire_last_tick_at
       / desire_next_heartbeat_at 等）——每拍都在变，是引擎内部状态，绝不能进画像，
       否则既是噪音、又会因为时间戳每拍变化而击穿缓存前缀 → 排除。
     - 人写的笔记（如 desire_system_tech_debt_2026_08_05）——带日期后缀，属于真画像 → 放行。
 
-    识别方式：desire_ 开头且**结尾带 _YYYY_MM_DD 日期后缀**的视为笔记放行，
-    其余 desire_ 开头一律当运行时状态排除。非 desire_ 开头的照常放行。
+    识别方式：系统配置键直接排除；desire_ 开头且**结尾带 _YYYY_MM_DD 日期后缀**的视为笔记放行，
+    其余 desire_ 开头一律当运行时状态排除。非系统键且非 desire_ 开头的照常放行。
     """
     if not key:
+        return False
+    if key in _SYSTEM_PROFILE_KEYS:
         return False
     if key.startswith("desire_"):
         # 结尾是 _2026_08_05 这种日期后缀 → 笔记，放行
         return bool(re.search(r"_\d{4}_\d{2}_\d{2}$", key))
     return True
+
+
+# 系统配置键白名单：绝不作为用户画像展示/注入（单一真相源，与 _inject_context 的 neq 对齐）
+_SYSTEM_PROFILE_KEYS = {"sys_config", "llm_settings", "llm_models", "sys_ai_persona"}
 
 
 def _fetch_device_snapshot(sb):
@@ -502,10 +976,48 @@ class HostFixMiddleware:
             return
 
         # ---------- 🧠 情绪 / 欲望系统状态接口（只读） ----------
-        # 返回 user_facts 里 desire_* 的最新持久化快照，供 Mini App / 前端面板使用。
+        # 返回 desire_state 表里 desire_* 的最新持久化快照，供 Mini App / 前端面板使用。
         # 已在上方全局拦截中过 API_SECRET 鉴权。纯只读：不推进引擎、不写库。
         if scope["path"] == "/api/desire":
             await self._handle_desire_api(send)
+            return
+
+        # ---------- 🖥️ 桌面控制台（电脑端网关管理控制台 HTML） ----------
+        if scope["path"] == "/console" or scope["path"] == "/console/":
+            await self._handle_console_page(send)
+            return
+
+        # ---------- ⚙️ 管理配置（运行时开关） ----------
+        if scope["path"] == "/api/admin/config":
+            await self._handle_admin_config(scope, receive, send)
+            return
+
+        # ---------- 📊 系统状态（TG/QQ 连接、进程、最近错误） ----------
+        if scope["path"] == "/api/admin/status":
+            await self._handle_admin_status(send)
+            return
+
+        # ---------- 🧪 模型连接测试 ----------
+        if scope["path"] == "/api/models/test":
+            await self._handle_models_test(scope, receive, send)
+            return
+
+        # ---------- 📚 记忆库 CRUD（服务端分页 + 分类查询） ----------
+        if scope["path"] == "/api/memories":
+            await self._handle_memories_api(scope, receive, send, mem_id=None)
+            return
+        if scope["path"].startswith("/api/memories/"):
+            mid = scope["path"][len("/api/memories/"):]
+            await self._handle_memories_api(scope, receive, send, mem_id=mid)
+            return
+
+        # ---------- 👤 用户画像 CRUD（user_facts，系统键过滤） ----------
+        if scope["path"] == "/api/profile":
+            await self._handle_profile_api(scope, receive, send, key=None)
+            return
+        if scope["path"].startswith("/api/profile/"):
+            pkey = scope["path"][len("/api/profile/"):]
+            await self._handle_profile_api(scope, receive, send, key=pkey)
             return
 
         # ---------- 🎛️ 内置模型管理网页 ----------
@@ -873,9 +1385,11 @@ class HostFixMiddleware:
             pass
 
         # Pinecone 向量记忆（可选）
+        # 🚫 向量记忆注入门控：vector_memory_injection_enabled=false 时跳过 Pinecone 检索
+        #    （不影响普通画像注入、Core_Cognition 注入、Pinecone 数据本身）。
         pinecone_context = "无相关深层记忆"
         mc = _get_pinecone_memory()
-        if mc and current_query.strip():
+        if mc and current_query.strip() and _vector_injection_enabled():
             try:
                 def _s():
                     return mc.search(query=str(current_query), user_id=user_id, filters={"user_id": user_id}, limit=5)
@@ -1031,45 +1545,50 @@ class HostFixMiddleware:
             final_save_text = f"[系统记录：调用了工具 {', '.join(tc_names)}]"
 
         # 1. 存到 memories 表（user + assistant 两条）
-        try:
-            def _save_user():
-                sb.table("memories").insert({
-                    "title": f"💬 {user_name}说",
-                    "content": f"{user_name}：{user_msg[:2000]}",
-                    "category": "流水",
-                    "mood": "平静",
-                    "tags": chat_tag,
-                    "created_at": now_str,
-                }).execute()
-            await asyncio.to_thread(_save_user)
-
-            def _save_ai():
-                sb.table("memories").insert({
-                    "title": f"🤖 {ai_name}回复",
-                    "content": f"我({ai_name})：{final_save_text[:2000]}",
-                    "category": "流水",
-                    "mood": "温和",
-                    "tags": chat_tag,
-                    "created_at": now_str,
-                }).execute()
-            await asyncio.to_thread(_save_ai)
-            _log(f"💾 已存库：{user_name}问({len(user_msg)}字) + {ai_name}答({len(final_save_text)}字)")
-        except Exception as e:
-            _log(f"❌ 存库失败: {e}")
-
-        # 2. 写入 Pinecone（可选）
-        mc = _get_pinecone_memory()
-        if mc and user_msg:
+        # 🚫 聊天记录写入门控：chat_history_write_enabled=false 时跳过对话流水写入
+        #    （不影响手动保存记忆、已有记忆读取、必要的系统状态记录）。
+        if not _chat_write_enabled():
+            _log(f"🔇 [聊天写入已关闭] 跳过本轮 memories 流水写入（{chat_tag}）")
+        else:
             try:
-                def _add_m():
-                    mc.add([
-                        {"role": "user", "content": user_msg},
-                        {"role": "assistant", "content": final_save_text},
-                    ], user_id=user_id)
-                await asyncio.to_thread(_add_m)
-                _log("🧠 Pinecone 已写入")
+                def _save_user():
+                    sb.table("memories").insert({
+                        "title": f"💬 {user_name}说",
+                        "content": f"{user_name}：{user_msg[:2000]}",
+                        "category": "流水",
+                        "mood": "平静",
+                        "tags": chat_tag,
+                        "created_at": now_str,
+                    }).execute()
+                await asyncio.to_thread(_save_user)
+
+                def _save_ai():
+                    sb.table("memories").insert({
+                        "title": f"🤖 {ai_name}回复",
+                        "content": f"我({ai_name})：{final_save_text[:2000]}",
+                        "category": "流水",
+                        "mood": "温和",
+                        "tags": chat_tag,
+                        "created_at": now_str,
+                    }).execute()
+                await asyncio.to_thread(_save_ai)
+                _log(f"💾 已存库：{user_name}问({len(user_msg)}字) + {ai_name}答({len(final_save_text)}字)")
             except Exception as e:
-                _log(f"Pinecone 写入失败: {e}")
+                _log(f"❌ 存库失败: {e}")
+
+            # 2. 写入 Pinecone（可选）—— 同属"聊天记录写入"，受同一开关控制
+            mc = _get_pinecone_memory()
+            if mc and user_msg:
+                try:
+                    def _add_m():
+                        mc.add([
+                            {"role": "user", "content": user_msg},
+                            {"role": "assistant", "content": final_save_text},
+                        ], user_id=user_id)
+                    await asyncio.to_thread(_add_m)
+                    _log("🧠 Pinecone 已写入")
+                except Exception as e:
+                    _log(f"Pinecone 写入失败: {e}")
 
         # 3. 🧠 异步触发全渠道统一对话总结（不阻塞响应）
         #    监控网页/QQ/TG/邮件等所有渠道的对话流水，
@@ -1108,18 +1627,34 @@ class HostFixMiddleware:
         # ---- GET：列出 ----
         if method == "GET":
             reg = _load_llm_registry()
+            roles = reg.get("roles", {})
             safe = []
             for m in reg.get("models", []):
+                mid = m.get("id", "")
                 safe.append({
-                    "id": m.get("id", ""),
+                    "id": mid,
                     "label": m.get("label", m.get("id", "")),
                     "base_url": m.get("base_url", ""),
                     "api_key_masked": _mask_key(m.get("api_key", "")),
                     "has_key": bool(str(m.get("api_key", "")).strip()),
                     "model": m.get("model", ""),
                     "enabled": m.get("enabled", True),
+                    # 当前承担的身份（便于前端展示"当前身份"列）
+                    "roles": [r for r, v in {
+                        "chat": mid in (roles.get("chat") or []),
+                        "chat_default": mid == roles.get("chat_default"),
+                        "compression": mid == roles.get("compression"),
+                        "background": mid == roles.get("background"),
+                    }.items() if v],
                 })
-            await _send_json_resp(send, 200, {"models": safe, "default": reg.get("default", "")})
+            await _send_json_resp(send, 200, {
+                "models": safe,
+                "default": reg.get("default", ""),
+                "roles": roles,
+                "schema_version": reg.get("schema_version", 1),
+                # 旧配置来源提示（控制台"待迁移模型"展示）
+                "legacy_llm_settings": _has_legacy_llm_settings(),
+            })
             return
 
         # ---- 读 body（POST/DELETE 可能带）----
@@ -1152,10 +1687,27 @@ class HostFixMiddleware:
                 await _send_json_resp(send, 400, {"error": "缺少 id"})
                 return
             reg = _load_llm_registry()
+            # 角色占用检查：禁止删除仍被角色使用的模型，要求用户先重新分配角色
+            used = _model_role_usage(reg, del_id)
+            if used:
+                await _send_json_resp(send, 409, {
+                    "error": f"模型 {del_id} 仍被角色 {', '.join(used)} 使用，请先重新分配角色再删除",
+                    "used_by": used,
+                })
+                return
             before = len(reg.get("models", []))
             reg["models"] = [m for m in reg.get("models", []) if m.get("id") != del_id]
-            if reg.get("default") == del_id:
-                reg["default"] = reg["models"][0]["id"] if reg["models"] else ""
+            # 清理 roles 里对该 id 的引用
+            roles = reg.get("roles", {})
+            roles["chat"] = [x for x in (roles.get("chat") or []) if x != del_id]
+            if roles.get("chat_default") == del_id:
+                roles["chat_default"] = roles["chat"][0] if roles["chat"] else ""
+            if roles.get("compression") == del_id:
+                roles["compression"] = ""
+            if roles.get("background") == del_id:
+                roles["background"] = ""
+            reg["roles"] = roles
+            reg["default"] = roles.get("chat_default") or ""
             if len(reg["models"]) == before:
                 await _send_json_resp(send, 404, {"error": f"未找到模型 id={del_id}"})
                 return
@@ -1168,16 +1720,71 @@ class HostFixMiddleware:
         if method == "POST":
             action = str(payload.get("action", "")).strip()
 
-            # 设默认
+            # 设默认聊天模型（同时更新 roles.chat_default）
             if action == "set_default":
                 did = str(payload.get("id", "")).strip()
                 reg = _load_llm_registry()
-                if not any(m.get("id") == did for m in reg.get("models", [])):
-                    await _send_json_resp(send, 404, {"error": f"未找到模型 id={did}"})
+                if not any(m.get("id") == did and m.get("enabled", True) for m in reg.get("models", [])):
+                    await _send_json_resp(send, 404, {"error": f"未找到已启用的模型 id={did}"})
                     return
                 reg["default"] = did
+                roles = reg.get("roles", {})
+                roles["chat_default"] = did
+                if did not in (roles.get("chat") or []):
+                    roles["chat"] = [did] + [x for x in (roles.get("chat") or []) if x != did]
+                reg["roles"] = roles
                 ok = _save_llm_registry(reg)
                 await _send_json_resp(send, 200 if ok else 500, {"ok": ok, "default": did})
+                return
+
+            # 设置模型身份（chat 多选 / compression 单选 / background 单选）
+            if action == "set_role":
+                role = str(payload.get("role", "")).strip()
+                if role not in _LLM_ROLES:
+                    await _send_json_resp(send, 400, {"error": f"role 必须是 {','.join(_LLM_ROLES)}"})
+                    return
+                reg = _load_llm_registry()
+                roles = dict(reg.get("roles", {}))
+                enabled_ids = {m.get("id") for m in reg.get("models", []) if m.get("enabled", True)}
+                if role == "chat":
+                    ids = payload.get("ids", [])
+                    if not isinstance(ids, list):
+                        await _send_json_resp(send, 400, {"error": "ids 必须是数组"})
+                        return
+                    ids = [str(x).strip() for x in ids if str(x).strip()]
+                    # 校验引用的模型 ID 是否真实存在且已启用
+                    bad = [i for i in ids if i not in enabled_ids]
+                    if bad:
+                        await _send_json_resp(send, 400, {"error": f"以下模型不存在或未启用: {', '.join(bad)}"})
+                        return
+                    if not ids:
+                        await _send_json_resp(send, 400, {"error": "至少需要一个可用的聊天模型"})
+                        return
+                    roles["chat"] = ids
+                    if roles.get("chat_default") not in ids:
+                        roles["chat_default"] = ids[0]
+                else:
+                    # compression / background：单选
+                    mid = str(payload.get("id", "")).strip()
+                    if mid and mid not in enabled_ids:
+                        await _send_json_resp(send, 400, {"error": f"模型 {mid} 不存在或未启用"})
+                        return
+                    roles[role] = mid
+                reg["roles"] = roles
+                reg["default"] = roles.get("chat_default") or reg.get("default", "")
+                ok = _save_llm_registry(reg)
+                await _send_json_resp(send, 200 if ok else 500, {"ok": ok, "roles": roles})
+                return
+
+            # 旧 llm_settings → 新注册表幂等迁移
+            if action == "migrate_llm_settings":
+                reg = _load_llm_registry()
+                new_reg, migrated, reason = _migrate_llm_settings_to_registry(reg)
+                if migrated:
+                    ok = _save_llm_registry(new_reg)
+                    await _send_json_resp(send, 200 if ok else 500, {"ok": ok, "migrated": True, "reason": reason})
+                else:
+                    await _send_json_resp(send, 200, {"ok": True, "migrated": False, "reason": reason})
                 return
 
             # 新增 / 更新（按 id upsert）
@@ -1198,6 +1805,15 @@ class HostFixMiddleware:
                 "model": real_model,
                 "enabled": bool(payload.get("enabled", existing.get("enabled", True) if existing else True)),
             }
+            # 禁用模型时检查角色占用：禁止禁用仍被角色使用的模型
+            if existing and existing.get("enabled", True) and not entry["enabled"]:
+                used = _model_role_usage(reg, mid)
+                if used:
+                    await _send_json_resp(send, 409, {
+                        "error": f"模型 {mid} 仍被角色 {', '.join(used)} 使用，请先重新分配角色再禁用",
+                        "used_by": used,
+                    })
+                    return
             # api_key：留空表示"沿用旧值"（避免脱敏回传时误清空）
             if new_key:
                 entry["api_key"] = new_key
@@ -1265,13 +1881,15 @@ class HostFixMiddleware:
     async def _handle_desire_api(self, send):
         """只读返回「情感 16 维 + 欲望 8 维」最新持久化快照。
 
-        数据源：user_facts 表里的 desire_* 键（desire_bridge 心跳每拍写库）。
+        数据源：desire_state 表里的 desire_* 键（desire_bridge 心跳每拍写库）。
+        ⚠️ v3.8 起情感/欲望运行态已从 user_facts 迁出到独立的 desire_state 表
+        （kv 结构 + updated_at），此处必须从 desire_state 读，否则全部返回 null。
         纯只读：不推进引擎、不消费事件、不写库，可放心高频轮询。
 
         返回结构：
           {
             "ok": true,
-            "source": "user_facts",
+            "source": "desire_state",
             "updated_at": <drive_state.snapshot_at 或 null>,
             "emotion": <desire_emotion_state 原样 JSON>,
             "drive_state": <desire_drive_state 原样 JSON>,
@@ -1281,17 +1899,9 @@ class HostFixMiddleware:
             "next_heartbeat_at": float(ms) | null,
             "attachment_baseline": float,
             "events_queue_len": int,
-            "derived": {
-              "display": {16维 + fatigue},   // 最新 display 快照
-              "drive": {8维},                // 最新驱动条
-              "scores": {7维召唤力},          // 从 drive 现值近似（无念头加成）
-              "intent": null,                // 服务端不推进引擎，intent 由前端本地算或置空
-              "sleep": {...},                // 睡眠子状态
-              "unanswered_thread": {...} | null,
-              "last_interaction_at": str | null,
-              "active_whim": {...} | null,
-              "time_episode_applied": {...}, // 本 episode 已累积的维度
-            },
+            "config": {emotion_enabled, desire_driven, sources},  // 控制台开关状态
+            "last_updated": str | null,  // desire_state.updated_at 最大值
+            "derived": { ... },
           }
         """
         sb = _get_supabase()
@@ -1304,8 +1914,8 @@ class HostFixMiddleware:
 
         def _load(key):
             try:
-                r = sb.table("user_facts").select("value").eq("key", key).maybe_single().execute()
-                if r.data and r.data.get("value"):
+                r = sb.table("desire_state").select("value, updated_at").eq("key", key).maybe_single().execute()
+                if r and r.data and r.data.get("value"):
                     return json.loads(r.data["value"])
             except Exception as e:
                 _log(f"⚠️ /api/desire 读取 {key} 失败: {e}")
@@ -1325,6 +1935,15 @@ class HostFixMiddleware:
         except (TypeError, ValueError):
             att_baseline = None
         queue = _load("desire_events_queue") or []
+
+        # 取 desire_state.updated_at 的最大值作为"最后更新时间"（判断数据是否陈旧）
+        last_updated = None
+        try:
+            lu = sb.table("desire_state").select("updated_at").order("updated_at", desc=True).limit(1).execute()
+            if lu and lu.data:
+                last_updated = lu.data[0].get("updated_at")
+        except Exception:
+            pass
 
         # ---- 派生视图（纯本地拼装，不调引擎） ----
         derived = {
@@ -1362,7 +1981,7 @@ class HostFixMiddleware:
 
         await _send_json_resp(send, 200, {
             "ok": True,
-            "source": "user_facts",
+            "source": "desire_state",
             "updated_at": updated_at,
             "emotion": emotion,
             "drive_state": drive_state,
@@ -1372,12 +1991,500 @@ class HostFixMiddleware:
             "next_heartbeat_at": next_hb,
             "attachment_baseline": att_baseline,
             "events_queue_len": len(queue),
+            "last_updated": last_updated,
+            "config": {
+                "emotion_enabled": _emotion_enabled(),
+                "desire_driven": _desire_driven_enabled(),
+                "emotion_source": _config_source_of("emotion_enabled"),
+                "desire_driven_source": _config_source_of("desire_driven"),
+            },
             "derived": derived,
         })
 
     # ------------------------------------------
     # 📱 情绪 / 欲望 Mini App 页面（/emotion）
     # ------------------------------------------
+
+    # ------------------------------------------
+    # 🖥️ 桌面控制台页面 /console
+    # ------------------------------------------
+    async def _handle_console_page(self, send):
+        """返回电脑端网关管理控制台（同目录 console.html）。
+        浏览器 → gateway 管理 API → Supabase；API_SECRET 存浏览器 localStorage。
+        """
+        try:
+            import os as _os
+            _here = _os.path.dirname(_os.path.abspath(__file__))
+            with open(_os.path.join(_here, "console.html"), "r", encoding="utf-8") as f:
+                html = f.read()
+            body = html.encode("utf-8")
+            status = 200
+        except Exception as e:
+            body = f"console.html 未找到: {e}".encode("utf-8")
+            status = 500
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/html; charset=utf-8"),
+                                (b"access-control-allow-origin", b"*")]})
+        await send({"type": "http.response.body", "body": body})
+
+    # ------------------------------------------
+    # ⚙️ 管理配置 /api/admin/config  (GET / PATCH)
+    # ------------------------------------------
+    async def _handle_admin_config(self, scope, receive, send):
+        """读取/更新运行时开关（telegram_enabled / qq_enabled / emotion_enabled /
+        desire_driven / chat_history_write_enabled / vector_memory_injection_enabled）。
+
+        GET  → 返回所有开关当前生效值 + 来源（database/env/default）+ 是否热生效
+        PATCH → 仅接受白名单字段，写回 user_facts.sys_config，刷新缓存
+        """
+        method = scope["method"]
+        if method == "GET":
+            cfg = _get_runtime_config()
+            out = {}
+            for k in cfg:
+                out[k] = {
+                    "value": cfg[k],
+                    "source": _config_source_of(k),
+                    "hot_effective": True,  # 所有开关均为运行时读取，5s 内热生效
+                    "needs_restart": False,
+                }
+            out["_raw"] = _load_sys_config_raw()
+            out["_schema_version"] = 1
+            await _send_json_resp(send, 200, {"ok": True, "config": out})
+            return
+
+        if method == "PATCH":
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+            try:
+                patch = json.loads(body.decode("utf-8"))
+            except Exception:
+                await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+                return
+            if not isinstance(patch, dict):
+                await _send_json_resp(send, 400, {"error": "body 必须是 JSON 对象"})
+                return
+
+            allowed = {"telegram_enabled", "qq_enabled", "emotion_enabled",
+                       "desire_driven", "chat_history_write_enabled",
+                       "vector_memory_injection_enabled"}
+            bad = [k for k in patch if k not in allowed]
+            if bad:
+                await _send_json_resp(send, 400, {"error": f"不允许的字段: {', '.join(bad)}", "allowed": sorted(allowed)})
+                return
+
+            normalized = {}
+            for k, v in patch.items():
+                if isinstance(v, bool):
+                    normalized[k] = v
+                elif isinstance(v, str):
+                    normalized[k] = v.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    await _send_json_resp(send, 400, {"error": f"{k} 必须是布尔值"})
+                    return
+
+            sb = _get_supabase()
+            if not sb:
+                await _send_json_resp(send, 500, {"error": "网关未配置 Supabase，无法持久化配置"})
+                return
+            cur = _load_sys_config_raw()
+            cur.update(normalized)
+            try:
+                sb.table("user_facts").upsert({
+                    "key": _SYS_CONFIG_KEY,
+                    "value": json.dumps(cur, ensure_ascii=False),
+                }).execute()
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"写入 sys_config 失败: {e}"})
+                return
+            _invalidate_runtime_config()
+            cfg = _get_runtime_config()
+            await _send_json_resp(send, 200, {"ok": True, "updated": normalized, "config": cfg})
+            return
+
+        await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+
+    # ------------------------------------------
+    # 📊 系统状态 /api/admin/status (GET)
+    # ------------------------------------------
+    async def _handle_admin_status(self, send):
+        """返回系统运行状态：TG/QQ 配置 + 启用 + 连接状态、Supabase、模型角色、最近日志。"""
+        cfg = _get_runtime_config()
+        tg = {
+            "enabled": cfg.get("telegram_enabled", True),
+            "enabled_source": _config_source_of("telegram_enabled"),
+            "token_configured": bool(os.environ.get("TG_BOT_TOKEN", "").strip()),
+            "chat_id_configured": bool(os.environ.get("TG_CHAT_ID", "").strip()),
+        }
+        qq = {"enabled": cfg.get("qq_enabled", True), "enabled_source": _config_source_of("qq_enabled")}
+        try:
+            import napcat as _nc
+            qq["connected"] = bool(getattr(_nc, "_napcat_connected", False))
+            qq["status_message"] = getattr(_nc, "_napcat_status_message", "未知")
+            qq["last_connected_at"] = getattr(_nc, "_napcat_last_connected_at", None)
+            qq["ws_url_configured"] = bool(os.environ.get("NAPCAT_WS_URL", "").strip())
+            qq["bot_qq_configured"] = bool(os.environ.get("NAPCAT_BOT_QQ", "").strip())
+            try:
+                qq["napcat_status"] = _nc.get_napcat_status()
+            except Exception:
+                pass
+        except Exception as e:
+            qq["error"] = str(e)
+
+        roles_status = {}
+        try:
+            for role in _LLM_ROLES:
+                r = resolve_llm_role(role)
+                roles_status[role] = {
+                    "model": r["model"],
+                    "base_url": r["base_url"][:40] + "…" if len(r["base_url"]) > 40 else r["base_url"],
+                    "registry_id": r["registry_id"],
+                    "source": r["source"],
+                    "fallback": r["fallback"],
+                    "enabled": r["enabled"],
+                    "has_key": bool(r["api_key"]),
+                }
+        except Exception as e:
+            roles_status["error"] = str(e)
+
+        sb_status = {
+            "configured": bool(os.environ.get("SUPABASE_URL", "").strip() and os.environ.get("SUPABASE_KEY", "").strip()),
+            "url": os.environ.get("SUPABASE_URL", "")[:40] + "…" if len(os.environ.get("SUPABASE_URL", "")) > 40 else os.environ.get("SUPABASE_URL", ""),
+        }
+
+        import os as _os
+        process = {
+            "role": _os.environ.get("GATEWAY_ROLE", "single"),
+            "chat_write_enabled": cfg.get("chat_history_write_enabled", True),
+            "vector_injection_enabled": cfg.get("vector_memory_injection_enabled", True),
+            "emotion_enabled": cfg.get("emotion_enabled", True),
+            "desire_driven": cfg.get("desire_driven", False),
+        }
+        recent_logs = _system_logs_buffer[-30:]
+
+        await _send_json_resp(send, 200, {
+            "ok": True,
+            "telegram": tg,
+            "qq": qq,
+            "supabase": sb_status,
+            "model_roles": roles_status,
+            "process": process,
+            "config_sources": {k: _config_source_of(k) for k in (
+                "telegram_enabled", "qq_enabled", "emotion_enabled", "desire_driven",
+                "chat_history_write_enabled", "vector_memory_injection_enabled")},
+            "recent_logs": recent_logs,
+        })
+
+    # ------------------------------------------
+    # 🧪 模型连接测试 /api/models/test (POST)
+    # ------------------------------------------
+    async def _handle_models_test(self, scope, receive, send):
+        """测试一个模型的连通性。body: {id?, base_url, api_key, model}
+        若传 id 则用注册表里已存的配置（api_key 留空=沿用旧值）；否则用传入的临时配置。
+        返回 {ok, http_status, latency_ms, model, error?}。
+        🛡 SSRF 防护：经 _ssrf_safe_post 校验目标主机并禁止重定向。
+        """
+        body = b""
+        while True:
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body", False):
+                break
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+            return
+
+        mid = str(payload.get("id", "")).strip()
+        base_url = str(payload.get("base_url", "")).strip()
+        api_key = str(payload.get("api_key", "")).strip()
+        model = str(payload.get("model", "")).strip()
+
+        if mid:
+            reg = _load_llm_registry()
+            entry = next((m for m in reg.get("models", []) if m.get("id") == mid), None)
+            if entry:
+                base_url = base_url or str(entry.get("base_url", "")).strip()
+                api_key = api_key or str(entry.get("api_key", "")).strip()
+                model = model or str(entry.get("model", "")).strip() or mid
+            else:
+                await _send_json_resp(send, 404, {"error": f"未找到模型 id={mid}"})
+                return
+        if not api_key or not base_url or not model:
+            await _send_json_resp(send, 400, {"error": "缺少 base_url / api_key / model"})
+            return
+
+        base = base_url.rstrip("/")
+        if re.search(r"/chat/completions$", base):
+            url = base
+        elif re.search(r"/v\d+[a-zA-Z]*$", base):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+
+        test_prompt = [{"role": "user", "content": "ping，请回复 pong"}]
+        t0 = time.time()
+        http_status = 0
+        err = ""
+        resp_body = ""
+        try:
+            def _do():
+                r = _ssrf_safe_post(url, {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }, {"model": model, "messages": test_prompt, "max_tokens": 20, "stream": False}, 30)
+                return r.status_code, r.text[:300]
+            http_status, resp_body = await asyncio.to_thread(_do)
+        except ValueError as e:
+            err = str(e)[:300]   # SSRF 拦截
+        except requests.exceptions.Timeout:
+            err = "请求超时（30s）"
+        except Exception as e:
+            err = str(e)[:300]
+        latency_ms = int((time.time() - t0) * 1000)
+
+        await _send_json_resp(send, 200, {
+            "ok": http_status == 200,
+            "http_status": http_status,
+            "latency_ms": latency_ms,
+            "model": model,
+            "url": url,
+            "error": err or (resp_body if http_status != 200 else ""),
+            "response_preview": (resp_body[:200] if http_status == 200 else ""),
+        })
+
+    # ------------------------------------------
+    # 📚 记忆库 CRUD /api/memories
+    # ------------------------------------------
+    async def _handle_memories_api(self, scope, receive, send, mem_id=None):
+        """服务端分页 + 分类查询 + 编辑 + 删除。
+        GET /api/memories?category=core&page=1&size=20&q=关键词
+        PATCH /api/memories/:id  {title,content,category,mood,tags,importance}
+        DELETE /api/memories/:id
+        """
+        method = scope["method"]
+        sb = _get_supabase()
+        if not sb:
+            await _send_json_resp(send, 200, {"ok": False, "error": "未配置 Supabase"})
+            return
+
+        if method == "GET" and not mem_id:
+            qs = scope.get("query_string", b"").decode("utf-8")
+            params = {}
+            for part in qs.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    from urllib.parse import unquote
+                    params[k] = unquote(v)
+            category = params.get("category", "core").strip() or "core"
+            page = max(1, int(params.get("page", "1") or "1"))
+            size = min(100, max(1, int(params.get("size", "20") or "20")))
+            q = params.get("q", "").strip()
+            tag_filter = _category_tag_filter(category)
+
+            def _query():
+                tbl = sb.table("memories").select("id,title,content,category,mood,tags,importance,created_at")
+                if tag_filter:
+                    tbl = tbl.in_("tags", tag_filter)
+                if q:
+                    tbl = tbl.or_(f"title.ilike.%{q}%,content.ilike.%{q}%")
+                tbl = tbl.order("created_at", desc=True).limit(size).offset((page - 1) * size)
+                return tbl.execute()
+
+            def _count():
+                tbl = sb.table("memories", count="exact").select("id")
+                if tag_filter:
+                    tbl = tbl.in_("tags", tag_filter)
+                if q:
+                    tbl = tbl.or_(f"title.ilike.%{q}%,content.ilike.%{q}%")
+                return tbl.execute()
+
+            try:
+                res = await asyncio.to_thread(_query)
+                cnt = await asyncio.to_thread(_count)
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"查询失败: {e}"})
+                return
+            rows = res.data or []
+            if tag_filter is None:
+                rows = [r for r in rows if _memory_category(r.get("tags", ""), r.get("content", "")) == category]
+            total = getattr(cnt, "count", len(rows)) if cnt else len(rows)
+            await _send_json_resp(send, 200, {
+                "ok": True, "items": rows, "total": total,
+                "page": page, "size": size, "category": category,
+                "has_more": (page * size) < total,
+            })
+            return
+
+        if method == "PATCH" and mem_id:
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+                return
+            allowed = {"title", "content", "category", "mood", "tags", "importance"}
+            patch = {}
+            for k in allowed:
+                if k in payload:
+                    if k == "importance":
+                        try:
+                            iv = int(payload[k])
+                        except (TypeError, ValueError):
+                            await _send_json_resp(send, 400, {"error": "importance 必须是整数"})
+                            return
+                        if iv < 0 or iv > 10:
+                            await _send_json_resp(send, 400, {"error": "importance 范围 0-10"})
+                            return
+                        patch[k] = iv
+                    else:
+                        patch[k] = str(payload[k])[:5000]
+            if not patch:
+                await _send_json_resp(send, 400, {"error": "无有效更新字段"})
+                return
+            try:
+                res = await asyncio.to_thread(lambda: sb.table("memories").update(patch).eq("id", int(mem_id)).execute())
+                if res and res.data:
+                    await _send_json_resp(send, 200, {"ok": True, "updated": res.data[0]})
+                else:
+                    await _send_json_resp(send, 404, {"error": f"未找到 id={mem_id}"})
+            except (TypeError, ValueError):
+                await _send_json_resp(send, 400, {"error": "id 必须是整数"})
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"更新失败: {e}"})
+            return
+
+        if method == "DELETE" and mem_id:
+            try:
+                chk = await asyncio.to_thread(lambda: sb.table("memories").select("id,title,tags,created_at").eq("id", int(mem_id)).maybe_single().execute())
+                if not (chk and chk.data):
+                    await _send_json_resp(send, 404, {"error": f"未找到 id={mem_id}"})
+                    return
+                summary = chk.data
+                await asyncio.to_thread(lambda: sb.table("memories").delete().eq("id", int(mem_id)).execute())
+                await _send_json_resp(send, 200, {"ok": True, "deleted": int(mem_id), "summary": summary})
+            except (TypeError, ValueError):
+                await _send_json_resp(send, 400, {"error": "id 必须是整数"})
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"删除失败: {e}"})
+            return
+
+        await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+
+    # ------------------------------------------
+    # 👤 用户画像 CRUD /api/profile
+    # ------------------------------------------
+    async def _handle_profile_api(self, scope, receive, send, key=None):
+        """用户画像 user_facts 表的 CRUD。系统键过滤复用后端 _is_profile_key。
+
+        GET /api/profile?q=关键词  → 列出画像（已过滤系统键），支持搜索
+        POST /api/profile {key,value,confidence}  → 新增/覆盖（重复键明确提示覆盖）
+        DELETE /api/profile/:key  → 按主键精确删除
+        """
+        method = scope["method"]
+        sb = _get_supabase()
+        if not sb:
+            await _send_json_resp(send, 200, {"ok": False, "error": "未配置 Supabase"})
+            return
+
+        if method == "GET":
+            qs = scope.get("query_string", b"").decode("utf-8")
+            q = ""
+            for part in qs.split("&"):
+                if part.startswith("q="):
+                    from urllib.parse import unquote
+                    q = unquote(part[2:]).strip()
+            try:
+                res = await asyncio.to_thread(lambda: sb.table("user_facts").select("key,value,confidence").order("key").execute())
+                rows = res.data or []
+                items = [r for r in rows if _is_profile_key(r.get("key", ""))]
+                if q:
+                    ql = q.lower()
+                    items = [r for r in items if ql in str(r.get("key", "")).lower() or ql in str(r.get("value", "")).lower()]
+                await _send_json_resp(send, 200, {"ok": True, "items": items, "total": len(items)})
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"查询失败: {e}"})
+            return
+
+        if method == "POST":
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body", False):
+                    break
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+                return
+            pkey = str(payload.get("key", "")).strip()
+            pval = str(payload.get("value", "")).strip()
+            if not pkey:
+                await _send_json_resp(send, 400, {"error": "缺少 key"})
+                return
+            if not _is_profile_key(pkey):
+                await _send_json_resp(send, 400, {"error": f"'{pkey}' 是系统配置键，不能作为用户画像"})
+                return
+            conf = payload.get("confidence", 1.0)
+            try:
+                conf = float(conf)
+            except (TypeError, ValueError):
+                await _send_json_resp(send, 400, {"error": "confidence 必须是数字"})
+                return
+            if conf < 0 or conf > 1:
+                await _send_json_resp(send, 400, {"error": "confidence 范围 0-1"})
+                return
+            existed = False
+            try:
+                chk = await asyncio.to_thread(lambda: sb.table("user_facts").select("key").eq("key", pkey).maybe_single().execute())
+                existed = bool(chk and chk.data)
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(lambda: sb.table("user_facts").upsert({
+                    "key": pkey, "value": pval[:10000], "confidence": conf,
+                }).execute())
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"写入失败: {e}"})
+                return
+            await _send_json_resp(send, 200, {
+                "ok": True, "key": pkey, "overwritten": existed,
+                "message": ("已覆盖已有键" if existed else "新增成功"),
+            })
+            return
+
+        if method == "DELETE" and key:
+            try:
+                from urllib.parse import unquote
+                dkey = unquote(key)
+                chk = await asyncio.to_thread(lambda: sb.table("user_facts").select("key,value").eq("key", dkey).maybe_single().execute())
+                if not (chk and chk.data):
+                    await _send_json_resp(send, 404, {"error": f"未找到 key={dkey}"})
+                    return
+                if not _is_profile_key(dkey):
+                    await _send_json_resp(send, 400, {"error": f"'{dkey}' 是系统配置键，不允许删除"})
+                    return
+                summary = {"key": dkey, "value_preview": str(chk.data.get("value", ""))[:120]}
+                await asyncio.to_thread(lambda: sb.table("user_facts").delete().eq("key", dkey).execute())
+                await _send_json_resp(send, 200, {"ok": True, "deleted": dkey, "summary": summary})
+            except Exception as e:
+                await _send_json_resp(send, 500, {"error": f"删除失败: {e}"})
+            return
+
+        await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+
+
     async def _handle_emotion_page(self, send):
         """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""
         try:
@@ -1443,6 +2550,72 @@ async def _send_cors_preflight(send):
         ]
     })
     await send({"type": "http.response.body", "body": b""})
+
+
+def _check_ssrf(url: str) -> str:
+    """SSRF 防护：校验一个即将被服务端请求的 URL 是否安全。
+    返回错误字符串（不安全）或空字符串（通过）。
+
+    规则：
+      - 仅允许 http/https 协议
+      - 解析主机名 → IP，阻断私网/环回/链路本地/保留地址
+      - 阻断已知云元数据端点（AWS/GCP/阿里云 ECS）
+    用于 /api/models/test 测试模型连接前的目标校验。
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except Exception:
+        return "URL 解析失败"
+    if p.scheme not in ("http", "https"):
+        return f"不允许的协议: {p.scheme}"
+    host = (p.hostname or "").lower()
+    if not host:
+        return "缺少主机名"
+    # 已知云元数据端点
+    meta_hosts = {"metadata", "metadata.google.internal", "metadata.aws.internal",
+                  "169.254.169.254", "169.254.170.2", "100.100.100.200"}
+    if host in meta_hosts:
+        return "云元数据端点禁止访问"
+    # 如果 host 本身就是 IP 字面量，直接校验
+    try:
+        ipo = ipaddress.ip_address(host)
+        if ipo.is_private or ipo.is_loopback or ipo.is_link_local or ipo.is_reserved:
+            return f"目标 IP {host} 属于内网/环回/链路本地，禁止访问"
+    except ValueError:
+        pass
+    # 解析主机名到 IP，逐个阻断内网地址
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return "主机名解析失败"
+    ips = set()
+    for info in infos:
+        try:
+            ips.add(info[4][0])
+        except Exception:
+            continue
+    for ip in ips:
+        try:
+            ipo = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if ipo.is_private or ipo.is_loopback or ipo.is_link_local or ipo.is_reserved:
+            return f"目标主机 {host} 解析到内网地址 {ip}，禁止访问"
+    return ""
+
+
+def _ssrf_safe_post(url: str, headers: dict, json_body: dict, timeout: float = 30.0):
+    """SSRF 安全的 POST：先 _check_ssrf 校验，通过后发起请求并禁止重定向。
+    抛出 ValueError 表示被 SSRF 防护拦截；其余异常由调用方处理。
+    """
+    err = _check_ssrf(url)
+    if err:
+        raise ValueError(err)
+    # allow_redirects=False：防止通过 3xx 重定向绕过 SSRF 防护访问内网
+    return requests.post(url, headers=headers, json=json_body, timeout=timeout, allow_redirects=False)
 
 # ==========================================
 # 🎛️ 内置模型管理网页（/admin/models）

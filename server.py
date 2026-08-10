@@ -214,11 +214,18 @@ def _get_llm_client(provider: str = "openai"):
     """
     多模型客户端工厂：按角色返回对应的 LLM 客户端。
     完整还原原版 5 种 provider，所有密钥/地址/模型名均从环境变量读取。
-    - openai    : 通用默认模型 (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_NAME)
-    - main_chat : 主对话模型，可从数据库 llm_settings 动态覆盖 (CHAT_API_KEY / CHAT_BASE_URL / CHAT_MODEL_NAME)
-    - silicon1  : 硅基流动便宜模型 (SILICON1_API_KEY / SILICON1_BASE_URL / SILICON1_MODEL_NAME)
-    - vision    : 视觉/OCR 模型 (VISION_API_KEY / VISION_BASE_URL / VISION_MODEL_NAME)
-    - voice     : 语音/STT 模型，回退到 OPENAI (VOICE_API_KEY / VOICE_BASE_URL)
+    - openai       : 通用默认模型 (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_NAME)
+    - main_chat    : 主对话模型（兼容别名，等价于 chat）
+    - chat         : 实时聊天角色（多模型 + chat_default），走 gateway.resolve_llm_role
+    - compression  : 压缩/总结/日记角色，走 gateway.resolve_llm_role
+    - background   : 自由活动/主动问候/后台活动角色，走 gateway.resolve_llm_role
+    - silicon1     : 硅基流动便宜模型 (SILICON1_API_KEY / SILICON1_BASE_URL / SILICON1_MODEL_NAME)
+    - vision       : 视觉/OCR 模型 (VISION_API_KEY / VISION_BASE_URL / VISION_MODEL_NAME)
+    - voice        : 语音/STT 模型，回退到 OPENAI (VOICE_API_KEY / VOICE_BASE_URL)
+
+    ⚙️ 角色解析统一收口在 gateway.resolve_llm_role，回退顺序：
+       注册表 roles → 默认聊天模型 → 旧 llm_settings → 环境变量 → 默认值。
+       压缩与后台活动不再无条件共用 CHAT_* 环境变量（见 VARIABLES.md 新增 COMPRESS_* / BACKGROUND_*）。
     """
     from openai import OpenAI
     client = None
@@ -229,19 +236,30 @@ def _get_llm_client(provider: str = "openai"):
         base_url = os.environ.get("SILICON1_BASE_URL", "https://api.siliconflow.cn/v1")
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
         model_name = os.environ.get("SILICON1_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
-    elif provider == "main_chat":
-        # 优先从数据库读取动态配置，回退到环境变量
-        db_conf = {}
-        if supabase:
-            try:
-                res = supabase.table("user_facts").select("value").eq("key", "llm_settings").execute()
-                db_conf = json.loads(res.data[0]['value']) if res.data else {}
-            except Exception:
-                db_conf = {}
-        api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
-        base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
-        model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
+    elif provider in ("main_chat", "chat", "compression", "background"):
+        # 统一走 gateway.resolve_llm_role（注册表 roles → llm_settings → 环境变量 → 默认值）。
+        # main_chat 是 chat 的兼容别名，保证旧调用点 _get_llm_client("main_chat") 无需改动即生效。
+        role = "chat" if provider == "main_chat" else provider
+        try:
+            import gateway as _gw
+            client, model_name = _gw._role_client(role)
+        except Exception:
+            client = None
+            model_name = os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+        # 兜底：resolve_llm_role 已覆盖 llm_settings + CHAT_*；此处仅在 gateway 不可用时
+        # 用旧内联读 llm_settings + CHAT_* 保证旧部署不崩。
+        if client is None:
+            db_conf = {}
+            if supabase:
+                try:
+                    res = supabase.table("user_facts").select("value").eq("key", "llm_settings").execute()
+                    db_conf = json.loads(res.data[0]['value']) if res.data else {}
+                except Exception:
+                    db_conf = {}
+            api_key = db_conf.get("key") or os.environ.get("CHAT_API_KEY", "").strip()
+            base_url = db_conf.get("url") or os.environ.get("CHAT_BASE_URL", "https://api.minimaxi.com/v1")
+            model_name = db_conf.get("model") or os.environ.get("CHAT_MODEL_NAME", "abab6.5s-chat")
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0) if api_key else None
     elif provider == "deepseek":
         # DeepSeek V4 Flash：专用于消息情感分类（便宜、快）。
         # 注意：V4 默认开启 thinking，关闭方式是调用 create 时传
@@ -582,9 +600,18 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
                                  .in_("tags", _TAGS).order("created_at", desc=True).limit(8).execute())
 
     # 4. Pinecone 向量记忆（可选）
+    # 🚫 向量记忆注入门控：vector_memory_injection_enabled=false 时跳过 Pinecone 检索
+    #    （不影响普通画像注入、Core_Cognition 注入、Pinecone 数据本身）。
+    #    与网页渠道 gateway._inject_context 的门控对齐，全渠道（Web/TG/QQ）一致。
     if query and pinecone_memory:
-        tasks["pinecone"] = _safe(lambda: pinecone_memory.search(query=str(query), user_id=user_id,
-                                 filters={"user_id": user_id}, limit=5))
+        try:
+            import gateway as _gw
+            vec_enabled = _gw._vector_injection_enabled()
+        except Exception:
+            vec_enabled = True
+        if vec_enabled:
+            tasks["pinecone"] = _safe(lambda: pinecone_memory.search(query=str(query), user_id=user_id,
+                                     filters={"user_id": user_id}, limit=5))
 
     # 6. 设备状态快照（复用 gateway 渲染，可开关）
     if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
@@ -1373,7 +1400,7 @@ async def tarot_reading(question: str):
         "XVIII. 月亮 (The Moon)", "XIX. 太阳 (The Sun)", "XX. 审判 (Judgement)", "XXI. 世界 (The World)"
     ]
     draw = random.sample(deck, 3)
-    client = _get_llm_client("main_chat")
+    client = _get_llm_client("chat")  # 塔罗解读属实时聊天角色
     if not client:
         return f"🔮 抽牌结果：{', '.join(draw)}。\n(⚠️ LLM 未配置，无法解读)"
     persona = await asyncio.to_thread(_get_current_persona)

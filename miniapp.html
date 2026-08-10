@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<title>网关配置面板</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet"/>
+<style>
+  :root{
+    /* 米色底 + 奶油纸面 */
+    --bg:#f3ebdd; --paper:#fbf6ec; --paper2:#f6efe1;
+    --line:#e3d7c2; --line-soft:#ece3d2;
+    --txt:#3b3227; --sub:#8a7c66; --faint:#b3a488;
+    /* 橙蓝点缀 */
+    --orange:#d98324; --orange-soft:#f4e6d0; --orange-deep:#b5641a;
+    --blue:#3a6ea5; --blue-soft:#dde8f2; --blue-deep:#2b537d;
+    --teal:#4c8a86; --coral:#cf6a4c;
+    --danger:#c0492f; --ok:#4c8a5a;
+    --brand:var(--orange);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  body{margin:0;
+    font-family:"Noto Serif SC",Georgia,"Times New Roman","Songti SC",serif;
+    background:var(--bg);
+    background-image:radial-gradient(circle at 15% 0%,#f7f0e2 0%,transparent 45%),
+      radial-gradient(circle at 90% 10%,#f0e6d2 0%,transparent 40%);
+    color:var(--txt);font-size:15px;line-height:1.6;padding-bottom:44px;
+    -webkit-font-smoothing:antialiased;}
+  header{position:sticky;top:0;z-index:10;
+    background:linear-gradient(180deg,#fbf6ec 0%,#f7f0e2 100%);
+    border-bottom:1px solid var(--line);
+    padding:16px 18px;display:flex;align-items:center;gap:10px;}
+  header .logo{font-family:"Playfair Display",Georgia,serif;font-size:20px;font-weight:700;
+    letter-spacing:.3px;color:var(--txt);display:flex;align-items:center;gap:9px;}
+  header .logo .mark{font-size:19px;color:var(--orange);}
+  header .sp{flex:1;}
+  .badge{font-size:12px;padding:3px 12px;border-radius:999px;font-weight:600;
+    border:1px solid transparent;letter-spacing:.3px;}
+  .badge.ok{background:rgba(76,138,90,.14);color:var(--ok);border-color:rgba(76,138,90,.3);}
+  .badge.no{background:rgba(192,73,47,.12);color:var(--danger);border-color:rgba(192,73,47,.28);}
+
+  .tabs{display:flex;background:var(--paper);border-bottom:1px solid var(--line);
+    position:sticky;top:57px;z-index:9;padding:0 6px;}
+  .tab{flex:1;text-align:center;padding:13px 0;color:var(--sub);font-size:14px;font-weight:500;
+    border-bottom:2px solid transparent;cursor:pointer;transition:.18s;letter-spacing:.5px;}
+  .tab:hover{color:var(--txt);}
+  .tab.active{color:var(--orange-deep);border-bottom-color:var(--orange);font-weight:700;}
+
+  .page{display:none;padding:18px 16px;max-width:720px;margin:0 auto;}
+  .page.active{display:block;}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:14px;
+    padding:18px;margin-bottom:16px;box-shadow:0 2px 10px rgba(120,95,55,.06);}
+  .card h3{margin:0 0 14px;font-size:16px;font-weight:700;color:var(--txt);
+    display:flex;align-items:center;gap:8px;letter-spacing:.4px;}
+  .card h3::before{content:"";width:4px;height:15px;border-radius:2px;
+    background:linear-gradient(180deg,var(--orange),var(--coral));display:inline-block;}
+  label{display:block;font-size:13px;color:var(--sub);margin:12px 0 5px;font-weight:500;letter-spacing:.3px;}
+  input,textarea,select{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:9px;
+    font-size:14px;background:var(--paper2);color:var(--txt);font-family:inherit;transition:.15s;}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--orange);
+    background:#fffdf8;box-shadow:0 0 0 3px rgba(217,131,36,.12);}
+  textarea{min-height:74px;resize:vertical;line-height:1.6;}
+  button{border:none;border-radius:9px;padding:11px 18px;font-size:14px;font-weight:600;color:#fff;
+    background:linear-gradient(135deg,var(--orange),var(--orange-deep));margin-top:14px;cursor:pointer;
+    font-family:inherit;letter-spacing:.5px;transition:.15s;box-shadow:0 2px 6px rgba(181,100,26,.22);}
+  button:hover{filter:brightness(1.04);}
+  button:active{transform:translateY(1px);}
+  button.ghost{background:var(--paper2);color:var(--txt);border:1px solid var(--line);box-shadow:none;}
+  button.blue{background:linear-gradient(135deg,var(--blue),var(--blue-deep));box-shadow:0 2px 6px rgba(43,83,125,.22);}
+  button.danger{background:linear-gradient(135deg,var(--coral),var(--danger));box-shadow:0 2px 6px rgba(192,73,47,.2);}
+  button:disabled{opacity:.5;cursor:not-allowed;}
+  .row{display:flex;gap:10px;align-items:center;}
+  .row button{margin-top:0;}
+  .hint{font-size:12.5px;color:var(--sub);margin-top:9px;line-height:1.65;
+    padding:9px 12px;background:var(--paper2);border-left:3px solid var(--line-soft);border-radius:0 8px 8px 0;}
+  .toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%) translateY(10px);
+    background:var(--txt);color:var(--paper);padding:11px 22px;border-radius:999px;font-size:13.5px;
+    opacity:0;transition:.3s;z-index:100;pointer-events:none;box-shadow:0 6px 20px rgba(59,50,39,.3);font-weight:500;}
+  .toast.show{opacity:.97;transform:translateX(-50%) translateY(0);}
+  .item{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:11px;background:var(--paper);}
+  .item .meta{font-size:12.5px;color:var(--sub);margin-bottom:6px;display:flex;justify-content:space-between;}
+  .item .body{font-size:14px;white-space:pre-wrap;word-break:break-word;line-height:1.65;}
+  .item .acts{margin-top:10px;display:flex;gap:8px;}
+  .item .acts button{margin-top:0;padding:7px 14px;font-size:13px;}
+  .tag{display:inline-block;background:var(--blue-soft);color:var(--blue-deep);border-radius:999px;
+    padding:2px 9px;font-size:11px;font-weight:600;}
+  .empty{text-align:center;color:var(--faint);padding:34px 0;font-size:14px;font-style:italic;}
+
+  /* ===== 记忆页：渠道 + 卡片折叠 UI ===== */
+  .mem-toolbar{display:flex;flex-direction:column;gap:13px;}
+  .mem-search{position:relative;}
+  .mem-search input{padding-left:36px;}
+  .mem-search .ico{position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:15px;color:var(--faint);pointer-events:none;}
+  .chan-scroll{display:flex;gap:8px;overflow-x:auto;padding-bottom:3px;-webkit-overflow-scrolling:touch;scrollbar-width:none;}
+  .chan-scroll::-webkit-scrollbar{display:none;}
+  .chan{flex:0 0 auto;padding:7px 15px;border-radius:999px;border:1px solid var(--line);background:var(--paper2);
+    color:var(--sub);font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;transition:.15s;margin:0;
+    font-family:inherit;box-shadow:none;letter-spacing:.3px;}
+  .chan:hover{border-color:var(--orange);color:var(--orange-deep);}
+  .chan.active{background:linear-gradient(135deg,var(--orange),var(--orange-deep));color:#fff;border-color:var(--orange-deep);}
+  .chan .cnt{opacity:.8;font-size:11px;margin-left:5px;}
+  .mem-stats{display:flex;gap:12px;margin:16px 0;}
+  .mem-stat{flex:1;background:var(--paper);border:1px solid var(--line);border-radius:13px;padding:14px 16px;
+    box-shadow:0 2px 8px rgba(120,95,55,.05);}
+  .mem-stat .lbl{font-size:11px;color:var(--sub);text-transform:uppercase;font-weight:600;margin-bottom:5px;letter-spacing:.6px;}
+  .mem-stat .val{font-family:"Playfair Display",Georgia,serif;font-size:26px;font-weight:700;line-height:1.1;color:var(--orange-deep);}
+  .mcard{background:var(--paper);border:1px solid var(--line);border-radius:13px;margin-bottom:11px;overflow:hidden;
+    box-shadow:0 2px 8px rgba(120,95,55,.05);transition:box-shadow .2s,border-color .2s;}
+  .mcard.active{box-shadow:0 8px 22px rgba(120,95,55,.14);border-color:var(--orange);}
+  .mcard-head{padding:14px 16px;cursor:pointer;user-select:none;}
+  .mcard-top{display:flex;align-items:flex-start;gap:9px;}
+  .mcard-id{font:600 10px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--blue-deep);background:var(--blue-soft);
+    padding:3px 8px;border-radius:6px;flex-shrink:0;margin-top:2px;}
+  .mcard-title{flex:1;min-width:0;font-size:15px;font-weight:600;line-height:1.35;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;color:var(--txt);}
+  .mcard-chev{color:var(--faint);font-size:11px;transition:transform .25s;margin-top:4px;}
+  .mcard.active .mcard-chev{transform:rotate(180deg);color:var(--orange);}
+  .mcard-tags{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:9px;}
+  .mtag{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10.5px;font-weight:600;
+    padding:2px 9px;border-radius:999px;background:var(--orange-soft);color:var(--orange-deep);}
+  .mtag.sec{background:var(--blue-soft);color:var(--blue-deep);}
+  .mtag.imp{background:rgba(207,106,76,.16);color:var(--coral);}
+  .mcard-time{margin-left:auto;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--faint);}
+  .mcard-body{max-height:0;overflow:hidden;transition:max-height .35s ease;}
+  .mcard.active .mcard-body{max-height:3000px;padding:2px 16px 16px;}
+  .mcard-sec{margin-top:13px;}
+  .mcard-sec .st{padding-bottom:6px;border-bottom:1px solid var(--line-soft);margin-bottom:9px;font-size:11px;
+    font-weight:700;color:var(--sub);text-transform:uppercase;letter-spacing:.6px;}
+  .mcard-content{background:var(--paper2);border:1px solid var(--line-soft);border-radius:9px;padding:12px 14px;font-size:13.5px;
+    line-height:1.7;white-space:pre-wrap;word-break:break-word;max-height:360px;overflow-y:auto;}
+  .mkv{display:grid;grid-template-columns:1fr 1fr;gap:9px 14px;}
+  .mkv .lbl{font-size:10.5px;font-weight:600;color:var(--sub);margin-bottom:3px;letter-spacing:.4px;}
+  .mkv .v{font-size:12.5px;word-break:break-word;}
+  .mcard-acts{margin-top:14px;padding-top:14px;border-top:1px solid var(--line-soft);display:flex;gap:9px;}
+  .mcard-acts button{margin-top:0;padding:8px 15px;font-size:13px;}
+
+  /* ===== 编辑表单（记忆 / 画像共用） ===== */
+  .edit-form label{margin:9px 0 4px;}
+  .edit-form input,.edit-form textarea,.edit-form select{font-size:13px;padding:9px 11px;}
+  .edit-form textarea{min-height:120px;}
+  .edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px 14px;}
+  .edit-acts{margin-top:13px;display:flex;gap:9px;}
+  .edit-acts button{margin-top:0;padding:8px 15px;font-size:13px;}
+  .pf-card{background:var(--paper);border:1px solid var(--line);border-radius:13px;margin-bottom:11px;overflow:hidden;
+    box-shadow:0 2px 8px rgba(120,95,55,.05);transition:box-shadow .2s,border-color .2s;}
+  .pf-card.active{box-shadow:0 8px 22px rgba(120,95,55,.14);border-color:var(--blue);}
+  .pf-head{padding:14px 16px;cursor:pointer;user-select:none;}
+  .pf-head .pf-key{font-size:14.5px;font-weight:600;word-break:break-word;color:var(--txt);}
+  .pf-head .pf-conf{float:right;font:11px ui-monospace,monospace;color:var(--blue-deep);
+    background:var(--blue-soft);padding:2px 8px;border-radius:6px;}
+  .pf-head .pf-preview{font-size:12.5px;color:var(--sub);margin-top:6px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;font-style:italic;}
+  .pf-body{max-height:0;overflow:hidden;transition:max-height .35s ease;}
+  .pf-card.active .pf-body{max-height:3000px;padding:2px 16px 16px;}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo"><span class="mark">✒</span>网关配置面板</span>
+  <span class="sp"></span>
+  <span id="connBadge" class="badge no">未连接</span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-p="conn">连接</div>
+  <div class="tab" data-p="llm">模型</div>
+  <div class="tab" data-p="mem">记忆</div>
+  <div class="tab" data-p="profile">画像</div>
+  <div class="tab" data-p="rem">提醒</div>
+</div>
+
+<!-- 连接 -->
+<div class="page active" id="p-conn">
+  <div class="card">
+    <h3>Supabase 连接</h3>
+    <label>Supabase URL</label>
+    <input id="sbUrl" placeholder="https://xxxx.supabase.co" autocomplete="off"/>
+    <label>Supabase Key（anon 或 service_role）</label>
+    <input id="sbKey" placeholder="eyJ..." autocomplete="off"/>
+    <div class="row">
+      <button onclick="saveConn()">保存并连接</button>
+      <button class="ghost" onclick="clearConn()">清除</button>
+    </div>
+    <div class="hint">配置只保存在本设备浏览器（localStorage），不会上传。前端直连 Supabase。</div>
+  </div>
+</div>
+
+<!-- 模型 -->
+<div class="page" id="p-llm">
+  <div class="card">
+    <h3>主对话模型（llm_settings）</h3>
+    <label>API Key</label>
+    <input id="llmKey" placeholder="上游模型的 API Key"/>
+    <label>Base URL</label>
+    <input id="llmUrl" placeholder="如 https://api.minimaxi.com/v1"/>
+    <label>模型名</label>
+    <input id="llmModel" placeholder="如 abab6.5s-chat"/>
+    <button onclick="saveLlm()">保存模型配置</button>
+    <div class="hint">对应数据库 user_facts.llm_settings，网关主对话(main_chat)会优先读它。</div>
+  </div>
+</div>
+
+<!-- 记忆 -->
+<div class="page" id="p-mem">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <h3 style="margin:0;">记忆浏览</h3>
+      <button class="ghost" onclick="loadMem()" style="margin-top:0;padding:7px 14px;">刷新</button>
+    </div>
+    <div class="mem-toolbar" style="margin-top:14px;">
+      <div class="mem-search">
+        <span class="ico">⌕</span>
+        <input id="memSearch" placeholder="搜索标题或内容..." autocomplete="off" oninput="renderMem()"/>
+      </div>
+      <div class="chan-scroll" id="memChannels"></div>
+    </div>
+    <div class="hint" style="margin-top:10px;">按渠道（tags）筛选，每渠道取最新 100 条，无时间戳的旧记忆排在最后。</div>
+  </div>
+  <div class="mem-stats">
+    <div class="mem-stat"><div class="lbl">当前结果</div><div class="val" id="memStatTotal">--</div></div>
+    <div class="mem-stat"><div class="lbl">今日</div><div class="val" id="memStatToday">--</div></div>
+  </div>
+  <div id="memList"></div>
+</div>
+
+<!-- 画像 -->
+<div class="page" id="p-profile">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <h3 style="margin:0;">用户画像（user_facts）</h3>
+      <button class="ghost" onclick="loadProfile()" style="margin-top:0;padding:7px 14px;">刷新</button>
+    </div>
+    <div class="mem-search" style="margin-top:14px;">
+      <span class="ico">⌕</span>
+      <input id="pfSearch" placeholder="搜索键名或内容..." autocomplete="off" oninput="renderProfile()"/>
+    </div>
+    <div class="hint" style="margin-top:10px;">
+      这里管理注入给 AI 的长期画像事实。已自动隐藏系统配置键（sys_config / llm_settings / llm_models / sys_ai_persona）
+      与 desire_ 运行时状态（仅保留带日期后缀的人写笔记）。
+    </div>
+  </div>
+  <div class="mem-stats">
+    <div class="mem-stat"><div class="lbl">画像条数</div><div class="val" id="pfStatTotal">--</div></div>
+    <div class="mem-stat"><div class="lbl">当前结果</div><div class="val" id="pfStatShown">--</div></div>
+  </div>
+  <div class="card">
+    <h3>新增 / 覆盖画像</h3>
+    <label>键名 key（唯一，已存在则覆盖）</label>
+    <input id="pfNewKey" placeholder="如 昕的作息偏好"/>
+    <label>内容 value</label>
+    <textarea id="pfNewVal" placeholder="事实内容..."></textarea>
+    <label>置信度 confidence（0~1，默认 1）</label>
+    <input id="pfNewConf" placeholder="1.0" inputmode="decimal"/>
+    <button onclick="addProfile()">保存画像</button>
+  </div>
+  <div id="pfList"></div>
+</div>
+
+<!-- 提醒 -->
+<div class="page" id="p-rem">
+  <div class="card">
+    <h3>新建提醒</h3>
+    <label>时间 HH:MM</label>
+    <input id="remTime" placeholder="08:30"/>
+    <label>内容</label>
+    <input id="remContent" placeholder="提醒事项"/>
+    <label class="row" style="margin-top:12px;"><input type="checkbox" id="remRepeat" style="width:auto;margin-right:8px;"/>每天重复</label>
+    <button onclick="addRem()">添加提醒</button>
+  </div>
+  <div id="remList"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+let sb=null;
+const LS={url:"mp_sb_url",key:"mp_sb_key"};
+
+function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"),1800);}
+
+function setConn(ok){const b=$("connBadge");
+  b.textContent=ok?"已连接":"未连接";b.className="badge "+(ok?"ok":"no");}
+
+// ---- Tabs ----
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  document.querySelectorAll(".page").forEach(x=>x.classList.remove("active"));
+  t.classList.add("active");$("p-"+t.dataset.p).classList.add("active");
+  if(t.dataset.p==="llm")loadLlm();
+  if(t.dataset.p==="mem"){renderChannels();loadMemCounts();loadMem();}
+  if(t.dataset.p==="profile")loadProfile();
+  if(t.dataset.p==="rem")loadRem();
+});
+
+// ---- 连接 ----
+function initClient(){
+  const url=localStorage.getItem(LS.url), key=localStorage.getItem(LS.key);
+  if(url&&key){
+    try{sb=supabase.createClient(url,key);setConn(true);return true;}
+    catch(e){setConn(false);return false;}
+  }
+  setConn(false);return false;
+}
+function saveConn(){
+  const url=$("sbUrl").value.trim(), key=$("sbKey").value.trim();
+  if(!url||!key){toast("URL 和 Key 都要填");return;}
+  localStorage.setItem(LS.url,url);localStorage.setItem(LS.key,key);
+  if(initClient())toast("已连接 ✅");else toast("连接失败，检查填写");
+}
+function clearConn(){
+  localStorage.removeItem(LS.url);localStorage.removeItem(LS.key);
+  sb=null;$("sbUrl").value="";$("sbKey").value="";setConn(false);toast("已清除");
+}
+function needSb(){if(!sb){toast("请先在「连接」页配置 Supabase");return false;}return true;}
+
+// ---- 模型 ----
+async function loadLlm(){
+  if(!needSb())return;
+  const {data,error}=await sb.from("user_facts").select("value").eq("key","llm_settings").maybeSingle();
+  if(error){toast("读取失败: "+error.message);return;}
+  if(data&&data.value){try{const c=JSON.parse(data.value);
+    $("llmKey").value=c.key||"";$("llmUrl").value=c.url||"";$("llmModel").value=c.model||"";}catch(e){}}
+}
+async function saveLlm(){
+  if(!needSb())return;
+  const val=JSON.stringify({key:$("llmKey").value.trim(),url:$("llmUrl").value.trim(),model:$("llmModel").value.trim()});
+  const {error}=await sb.from("user_facts").upsert({key:"llm_settings",value:val});
+  toast(error?("保存失败: "+error.message):"已保存 ✅");
+}
+
+// ---- 记忆 ----
+// 预设渠道（tags）。"全部"聚合，"其他"= 早期无时间戳/长标签历史记忆
+const MEM_CHANNELS=[
+  {key:"__all__",label:"全部"},
+  {key:"Core_Cognition",label:"核心认知"},
+  {key:"Archived_Chat",label:"归档对话"},
+  {key:"Web_Chat",label:"网页对话"},
+  {key:"Heartbeat",label:"心跳"},
+  {key:"__other__",label:"其他/历史"},
+];
+const KNOWN_TAGS=["Core_Cognition","Archived_Chat","Web_Chat","Heartbeat"];
+let memRecords=[], memChannel="__all__", memExpanded=null, memCounts={}, memEditing=null;
+
+function renderChannels(){
+  const box=$("memChannels");
+  box.innerHTML=MEM_CHANNELS.map(c=>{
+    const cnt=memCounts[c.key];
+    const cntHtml=(cnt!=null)?`<span class="cnt">${cnt}</span>`:"";
+    return `<button class="chan ${c.key===memChannel?"active":""}" data-ch="${esc(c.key)}">${esc(c.label)}${cntHtml}</button>`;
+  }).join("");
+  box.querySelectorAll(".chan").forEach(b=>b.onclick=()=>{
+    memChannel=b.dataset.ch; memExpanded=null; renderChannels(); loadMem();
+  });
+}
+
+// 各渠道计数（一次性）
+async function loadMemCounts(){
+  if(!sb)return;
+  try{
+    memCounts["__all__"]=await memCount(null,null);
+    for(const t of KNOWN_TAGS) memCounts[t]=await memCount("eq",t);
+    memCounts["__other__"]=await memCount("other",null);
+  }catch(e){}
+  renderChannels();
+}
+async function memCount(mode,tag){
+  let q=sb.from("memories").select("id",{count:"exact",head:true});
+  if(mode==="eq")q=q.eq("tags",tag);
+  else if(mode==="other")q=q.not("tags","in",`(${KNOWN_TAGS.map(t=>`"${t}"`).join(",")})`);
+  const {count}=await q;
+  return count||0;
+}
+
+async function loadMem(){
+  if(!needSb())return;
+  let q=sb.from("memories")
+    .select("id,title,content,category,mood,tags,importance,created_at")
+    // 关键修复：null 排最后，最新的排最前
+    .order("created_at",{ascending:false,nullsFirst:false})
+    .order("id",{ascending:false})
+    .limit(100);
+  if(memChannel!=="__all__"){
+    if(memChannel==="__other__")
+      q=q.not("tags","in",`(${KNOWN_TAGS.map(t=>`"${t}"`).join(",")})`);
+    else q=q.eq("tags",memChannel);
+  }
+  const {data,error}=await q;
+  if(error){$("memList").innerHTML='<div class="empty">读取失败: '+esc(error.message)+'</div>';return;}
+  memRecords=data||[];
+  renderMem();
+}
+
+function memFiltered(){
+  const kw=$("memSearch").value.trim().toLowerCase();
+  if(!kw)return memRecords;
+  return memRecords.filter(r=>
+    [r.title,r.content,r.tags,r.category,r.mood].some(v=>String(v||"").toLowerCase().includes(kw)));
+}
+
+function renderMem(){
+  const rows=memFiltered(), box=$("memList");
+  $("memStatTotal").textContent=rows.length;
+  const today=new Date().toISOString().slice(0,10);
+  $("memStatToday").textContent=memRecords.filter(r=>String(r.created_at||"").startsWith(today)).length;
+  if(!rows.length){box.innerHTML='<div class="empty">暂无记忆</div>';return;}
+  box.innerHTML=rows.map(memCard).join("");
+  box.querySelectorAll("[data-mem-toggle]").forEach(el=>el.onclick=()=>{
+    const id=el.dataset.memToggle;
+    memExpanded=(String(memExpanded)===id)?null:id; memEditing=null; renderMem();
+  });
+  box.querySelectorAll("[data-mem-del]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); delMem(el.dataset.memDel);
+  });
+  box.querySelectorAll("[data-mem-edit]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); memEditing=el.dataset.memEdit; renderMem();
+  });
+  box.querySelectorAll("[data-mem-cancel]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); memEditing=null; renderMem();
+  });
+  box.querySelectorAll("[data-mem-save]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); saveMem(el.dataset.memSave);
+  });
+}
+
+function memTags(r){
+  const out=[];
+  if(r.category)out.push(["",r.category]);
+  if(r.mood)out.push(["sec",r.mood]);
+  if(r.tags&&!KNOWN_TAGS.includes(r.tags)){
+    const t=String(r.tags).split(",")[0];
+    if(t&&t!=="System"&&t!=="[]")out.push(["sec",t]);
+  }
+  const imp=Number(r.importance);
+  if(imp>1)out.push(["imp","★".repeat(Math.min(imp,5))]);
+  return out;
+}
+
+function memCard(r){
+  const active=String(memExpanded)===String(r.id);
+  const editing=active&&String(memEditing)===String(r.id);
+  const tags=memTags(r).map(([k,t])=>`<span class="mtag ${k}">${esc(t)}</span>`).join("");
+  const time=r.created_at?fmt(r.created_at):'<span style="color:var(--danger);">无时间</span>';
+  let body;
+  if(!active){
+    body='<div class="mcard-body"></div>';
+  }else if(editing){
+    body=`
+    <div class="mcard-body">
+      <div class="edit-form" onclick="event.stopPropagation()">
+        <label>标题</label>
+        <input id="me_title_${r.id}" value="${esc(r.title||"")}"/>
+        <label>内容</label>
+        <textarea id="me_content_${r.id}">${esc(r.content||"")}</textarea>
+        <div class="edit-grid">
+          <div><label>分类 category</label><input id="me_category_${r.id}" value="${esc(r.category||"")}"/></div>
+          <div><label>情绪 mood</label><input id="me_mood_${r.id}" value="${esc(r.mood||"")}"/></div>
+          <div><label>渠道 tags</label><input id="me_tags_${r.id}" value="${esc(r.tags||"")}"/></div>
+          <div><label>重要度 importance</label><input id="me_importance_${r.id}" inputmode="numeric" value="${esc(r.importance??"")}"/></div>
+        </div>
+        <div class="edit-acts">
+          <button data-mem-save="${r.id}">保存</button>
+          <button class="ghost" data-mem-cancel="${r.id}">取消</button>
+        </div>
+      </div>
+    </div>`;
+  }else{
+    body=`
+    <div class="mcard-body">
+      <div class="mcard-sec"><div class="st">内容</div>
+        <div class="mcard-content">${esc(r.content||"（空）")}</div></div>
+      <div class="mcard-sec"><div class="st">属性</div>
+        <div class="mkv">
+          <div><div class="lbl">分类</div><div class="v">${esc(r.category||"—")}</div></div>
+          <div><div class="lbl">情绪</div><div class="v">${esc(r.mood||"—")}</div></div>
+          <div><div class="lbl">渠道(tags)</div><div class="v">${esc(r.tags||"—")}</div></div>
+          <div><div class="lbl">重要度</div><div class="v">${esc(r.importance??"—")}</div></div>
+          <div><div class="lbl">创建时间</div><div class="v">${esc(r.created_at||"无")}</div></div>
+        </div></div>
+      <div class="mcard-acts">
+        <button data-mem-edit="${r.id}">编辑</button>
+        <button class="danger" data-mem-del="${r.id}">删除</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="mcard ${active?"active":""}">
+    <div class="mcard-head" data-mem-toggle="${r.id}">
+      <div class="mcard-top">
+        <span class="mcard-id">#${r.id}</span>
+        <span class="mcard-title">${esc(r.title||r.content||"无标题记忆")}</span>
+        <span class="mcard-chev">▼</span>
+      </div>
+      <div class="mcard-tags">${tags}<span class="mcard-time">${time}</span></div>
+    </div>${body}</div>`;
+}
+
+async function saveMem(id){
+  if(!needSb())return;
+  const g=k=>{const el=$("me_"+k+"_"+id);return el?el.value:undefined;};
+  const impRaw=(g("importance")||"").trim();
+  const patch={
+    title:(g("title")||"").trim(),
+    content:g("content")||"",
+    category:(g("category")||"").trim(),
+    mood:(g("mood")||"").trim(),
+    tags:(g("tags")||"").trim(),
+  };
+  if(impRaw!==""){
+    const n=parseInt(impRaw,10);
+    if(Number.isNaN(n)){toast("重要度需为整数");return;}
+    patch.importance=n;
+  }
+  const {error}=await sb.from("memories").update(patch).eq("id",id);
+  if(error){toast("保存失败: "+error.message);return;}
+  const rec=memRecords.find(r=>String(r.id)===String(id));
+  if(rec)Object.assign(rec,patch);
+  memEditing=null;
+  toast("已保存 ✅");renderMem();
+}
+
+async function delMem(id){
+  if(!needSb())return;
+  if(!confirm("确定删除记忆 #"+id+" ？删除后无法恢复。"))return;
+  const {error}=await sb.from("memories").delete().eq("id",id);
+  if(error){toast("删除失败: "+error.message);return;}
+  toast("已删除");memExpanded=null;loadMemCounts();loadMem();
+}
+
+// ---- 画像 (user_facts) ----
+// 系统配置键：直接隐藏（对应后端 gateway.py 查询里 .neq 掉的那几个）
+const PROFILE_HIDE_KEYS=["sys_config","llm_settings","llm_models","sys_ai_persona"];
+// 复刻后端 _is_profile_key：desire_ 开头且结尾带 _YYYY_MM_DD 的是人写笔记→保留，
+// 其余 desire_ 开头是运行时状态→隐藏；非 desire_ 一律保留。
+function isProfileKey(key){
+  if(!key)return false;
+  if(PROFILE_HIDE_KEYS.includes(key))return false;
+  if(key.startsWith("desire_"))return /_\d{4}_\d{2}_\d{2}$/.test(key);
+  return true;
+}
+let profileRecords=[], pfExpanded=null, pfEditing=null;
+
+async function loadProfile(){
+  if(!needSb())return;
+  const {data,error}=await sb.from("user_facts").select("key,value,confidence").order("key");
+  if(error){$("pfList").innerHTML='<div class="empty">读取失败: '+esc(error.message)+'</div>';return;}
+  profileRecords=(data||[]).filter(r=>isProfileKey(r.key));
+  $("pfStatTotal").textContent=profileRecords.length;
+  renderProfile();
+}
+
+function pfFiltered(){
+  const kw=$("pfSearch").value.trim().toLowerCase();
+  if(!kw)return profileRecords;
+  return profileRecords.filter(r=>
+    [r.key,r.value].some(v=>String(v||"").toLowerCase().includes(kw)));
+}
+
+function renderProfile(){
+  const rows=pfFiltered(), box=$("pfList");
+  $("pfStatShown").textContent=rows.length;
+  if(!rows.length){box.innerHTML='<div class="empty">暂无画像</div>';return;}
+  box.innerHTML=rows.map(pfCard).join("");
+  box.querySelectorAll("[data-pf-toggle]").forEach(el=>el.onclick=()=>{
+    const k=el.dataset.pfToggle;
+    pfExpanded=(pfExpanded===k)?null:k; pfEditing=null; renderProfile();
+  });
+  box.querySelectorAll("[data-pf-edit]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); pfEditing=el.dataset.pfEdit; renderProfile();
+  });
+  box.querySelectorAll("[data-pf-cancel]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); pfEditing=null; renderProfile();
+  });
+  box.querySelectorAll("[data-pf-save]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); saveProfile(el.dataset.pfSave);
+  });
+  box.querySelectorAll("[data-pf-del]").forEach(el=>el.onclick=e=>{
+    e.stopPropagation(); delProfile(el.dataset.pfDel);
+  });
+}
+
+function pfCard(r){
+  const active=(pfExpanded===r.key);
+  const editing=active&&(pfEditing===r.key);
+  const conf=(r.confidence==null)?"—":r.confidence;
+  let body;
+  if(!active){
+    body='<div class="pf-body"></div>';
+  }else if(editing){
+    const kid=encodeURIComponent(r.key);
+    body=`
+    <div class="pf-body">
+      <div class="edit-form" onclick="event.stopPropagation()">
+        <label>内容 value</label>
+        <textarea id="pe_val_${kid}">${esc(r.value||"")}</textarea>
+        <label>置信度 confidence（0~1）</label>
+        <input id="pe_conf_${kid}" inputmode="decimal" value="${esc(r.confidence??"")}"/>
+        <div class="edit-acts">
+          <button data-pf-save="${esc(r.key)}">保存</button>
+          <button class="ghost" data-pf-cancel="${esc(r.key)}">取消</button>
+        </div>
+      </div>
+    </div>`;
+  }else{
+    body=`
+    <div class="pf-body">
+      <div class="mcard-sec"><div class="st">内容</div>
+        <div class="mcard-content">${esc(r.value||"（空）")}</div></div>
+      <div class="mcard-acts">
+        <button data-pf-edit="${esc(r.key)}">编辑</button>
+        <button class="danger" data-pf-del="${esc(r.key)}">删除</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="pf-card ${active?"active":""}">
+    <div class="pf-head" data-pf-toggle="${esc(r.key)}">
+      <span class="pf-conf">c=${esc(conf)}</span>
+      <div class="pf-key">${esc(r.key)}</div>
+      <div class="pf-preview">${esc(String(r.value||"").replace(/\s+/g," ").slice(0,80))}</div>
+    </div>${body}</div>`;
+}
+
+async function addProfile(){
+  if(!needSb())return;
+  const key=$("pfNewKey").value.trim();
+  const value=$("pfNewVal").value;
+  const confRaw=$("pfNewConf").value.trim();
+  if(!key){toast("请填键名 key");return;}
+  const row={key,value};
+  if(confRaw!==""){const n=parseFloat(confRaw);if(Number.isNaN(n)){toast("置信度需为数字");return;}row.confidence=n;}
+  const {error}=await sb.from("user_facts").upsert(row);
+  if(error){toast("保存失败: "+error.message);return;}
+  $("pfNewKey").value="";$("pfNewVal").value="";$("pfNewConf").value="";
+  toast("已保存 ✅");loadProfile();
+}
+
+async function saveProfile(key){
+  if(!needSb())return;
+  const kid=encodeURIComponent(key);
+  const valEl=$("pe_val_"+kid), confEl=$("pe_conf_"+kid);
+  const patch={value:valEl?valEl.value:""};
+  const confRaw=(confEl?confEl.value:"").trim();
+  if(confRaw!==""){const n=parseFloat(confRaw);if(Number.isNaN(n)){toast("置信度需为数字");return;}patch.confidence=n;}
+  const {error}=await sb.from("user_facts").update(patch).eq("key",key);
+  if(error){toast("保存失败: "+error.message);return;}
+  const rec=profileRecords.find(r=>r.key===key);
+  if(rec)Object.assign(rec,patch);
+  pfEditing=null;
+  toast("已保存 ✅");renderProfile();
+}
+
+async function delProfile(key){
+  if(!needSb())return;
+  if(!confirm("确定删除画像「"+key+"」？删除后无法恢复。"))return;
+  const {error}=await sb.from("user_facts").delete().eq("key",key);
+  if(error){toast("删除失败: "+error.message);return;}
+  toast("已删除");pfExpanded=null;pfEditing=null;loadProfile();
+}
+
+// ---- 提醒 ----
+async function loadRem(){
+  if(!needSb())return;
+  const {data,error}=await sb.from("reminders").select("*").order("time_str");
+  const box=$("remList");
+  if(error){box.innerHTML='<div class="empty">读取失败: '+error.message+'</div>';return;}
+  if(!data||!data.length){box.innerHTML='<div class="empty">暂无提醒</div>';return;}
+  box.innerHTML=data.map(r=>`
+    <div class="item">
+      <div class="meta"><span>⏰ ${esc(r.time_str||"")} ${r.is_repeat?'<span class="tag">每天</span>':''}</span>
+        <span>${r.is_paused?'<span class="tag">已暂停</span>':''}</span></div>
+      <div class="body">${esc(r.content||"")}</div>
+      <div class="acts">
+        <button class="ghost" onclick="toggleRem('${esc(r.id)}',${!r.is_paused})">${r.is_paused?"恢复":"暂停"}</button>
+        <button class="danger" onclick="delRem('${esc(r.id)}')">删除</button>
+      </div>
+    </div>`).join("");
+}
+async function addRem(){
+  if(!needSb())return;
+  const time=$("remTime").value.trim(), content=$("remContent").value.trim();
+  if(!/^\d{1,2}:\d{2}$/.test(time)){toast("时间格式应为 HH:MM");return;}
+  if(!content){toast("请填内容");return;}
+  const id="rem_"+Date.now();
+  const {error}=await sb.from("reminders").insert({id,time_str:time,content,is_repeat:$("remRepeat").checked,is_paused:false,last_fired:""});
+  if(error){toast("添加失败: "+error.message);return;}
+  $("remTime").value="";$("remContent").value="";$("remRepeat").checked=false;
+  toast("已添加");loadRem();
+}
+async function toggleRem(id,pause){
+  if(!needSb())return;
+  const {error}=await sb.from("reminders").update({is_paused:pause}).eq("id",id);
+  if(error){toast("操作失败: "+error.message);return;}
+  loadRem();
+}
+async function delRem(id){
+  if(!needSb())return;
+  if(!confirm("确定删除这条提醒？"))return;
+  const {error}=await sb.from("reminders").delete().eq("id",id);
+  if(error){toast("删除失败: "+error.message);return;}
+  toast("已删除");loadRem();
+}
+
+// ---- utils ----
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function fmt(iso){if(!iso)return"";try{const d=new Date(iso);return d.toLocaleString("zh-CN",{hour12:false});}catch(e){return iso;}}
+
+// 启动：回填已保存的连接
+(function(){
+  const url=localStorage.getItem(LS.url), key=localStorage.getItem(LS.key);
+  if(url)$("sbUrl").value=url;
+  if(key)$("sbKey").value=key;
+  initClient();
+})();
+</script>
+</body>
+</html>
