@@ -397,6 +397,21 @@ let _pollers = {};
 
 /* ---- 工具 ---- */
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+function fmtCN8(iso){
+  if(!iso) return "—";
+  try{
+    const d=new Date(iso);
+    const t=d.getTime()+(8*60*60*1000);
+    const d8=new Date(t);
+    const y=d8.getUTCFullYear();
+    const M=String(d8.getUTCMonth()+1).padStart(2,"0");
+    const D=String(d8.getUTCDate()).padStart(2,"0");
+    const h=String(d8.getUTCHours()).padStart(2,"0");
+    const m=String(d8.getUTCMinutes()).padStart(2,"0");
+    const s=String(d8.getUTCSeconds()).padStart(2,"0");
+    return `${y}-${M}-${D} ${h}:${m}:${s}`;
+  }catch(e){ return String(iso).slice(0,16).replace("T"," "); }
+}
 function getSecret(){return localStorage.getItem("gw_secret")||"";}
 function saveSecret(){localStorage.setItem("gw_secret",document.getElementById("secretInput").value);toast("密钥已保存","ok");}
 function authHeaders(json){
@@ -733,7 +748,7 @@ async function loadMemories(force){
     const list=d.items||[];
     if(!list.length){document.getElementById("memList").innerHTML='<div class="empty"><i data-lucide="inbox"></i><br>暂无记忆</div>';document.getElementById("memPager").innerHTML="";refreshIcons();return;}
     document.getElementById("memList").innerHTML=list.map(m=>{
-      const t=m.created_at?String(m.created_at).slice(5,16).replace("T"," "):"—";
+      const t=fmtCN8(m.created_at);
       return `<div class="item"><div class="meta"><span>${esc(m.tags||"—")} · ${esc(m.category||"")} · 重要度 ${esc(m.importance==null?"—":m.importance)}</span><span>${esc(t)}</span></div>
         <div class="body"><b>${esc(m.title||"")}</b></div>
         <div class="body" style="margin-top:4px">${esc((m.content||"").slice(0,400))}${(m.content||"").length>400?"…":""}</div>
