@@ -2297,7 +2297,7 @@ class HostFixMiddleware:
                 return tbl.execute()
 
             def _count():
-                tbl = sb.table("memories", count="exact").select("id")
+                tbl = sb.table("memories").select("id", count="exact")
                 if tag_filter:
                     tbl = tbl.in_("tags", tag_filter)
                 if q:
