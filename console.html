@@ -390,14 +390,15 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
  * 网关控制台 —— 浏览器 → gateway 管理 API → Supabase
  * API_SECRET 存 localStorage，所有 GET 不返回密钥明文。
  * ============================================================ */
-const ORIGIN = location.origin;
+const IS_FILE_PROTOCOL = location.protocol === "file:";
+const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
 const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",profile:"用户画像",storage:"上下文与存储"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
 function getSecret(){return localStorage.getItem("gw_secret")||"";}
-function saveSecret(){localStorage.setItem("gw_secret",document.getElementById("secretInput").value);toast("密钥已保存","ok");loadCurrent();}
+function saveSecret(){localStorage.setItem("gw_secret",document.getElementById("secretInput").value);toast("密钥已保存","ok");}
 function authHeaders(json){
   const h={"X-Api-Key":getSecret()};
   if(json) h["Content-Type"]="application/json";
@@ -448,6 +449,11 @@ window.addEventListener("DOMContentLoaded",()=>{
   document.querySelectorAll(".nav a").forEach(a=>a.addEventListener("click",()=>showPage(a.dataset.p)));
   refreshIcons();
   setNet("mute","就绪");
+  if(IS_FILE_PROTOCOL){
+    toast("⚠️ 检测到本地文件打开。请通过网关访问：http://localhost:10000/console","err");
+    setNet("no","file:// 模式");
+    return;
+  }
   if(!getSecret()){toast("请先填写 API_SECRET","err");}
   showPage("overview");
 });
