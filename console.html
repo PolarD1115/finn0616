@@ -687,6 +687,9 @@ async function loadEmotion(force){
     document.getElementById("emoToggles").innerHTML=
       toggleRow("emotion_enabled","情感/欲望引擎总开关",cfg.emotion_enabled,"关闭后停止 tick 计算 + 停止事件入队（停止消费事件）。引擎冻结，再次开启后恢复。",cfg.emotion_enabled,cfg.emotion_source)
       +toggleRow("desire_driven","DESIRE_DRIVEN 行为覆盖",cfg.desire_driven,"开：把「此刻最想做的事」注入自由活动 prompt 覆盖行为；关（默认）：只算只存快照供观测。",cfg.desire_driven,cfg.desire_driven_source);
+    // 维度中文映射
+    const _E={joy:"喜悦",calm:"平静",anxiety:"焦虑",sadness:"悲伤",anger:"愤怒",tenderness:"温柔",excitement:"兴奋",longing:"想念",guilt:"愧疚",pride:"骄傲",shame:"羞耻",envy:"嫉妒",hope:"希望",fear:"恐惧",disgust:"厌恶",surprise:"惊讶",fatigue:"疲惫"};
+    const _D={attachment:"依恋",curiosity:"好奇",reflection:"反思",duty:"责任",social:"社交",libido:"欲望",stress:"压力",fatigue:"疲惫"};
     // 情绪维度
     const drv=d.derived||{};
     const disp=drv.display||{};
@@ -694,10 +697,10 @@ async function loadEmotion(force){
     let eh="";
     emoKeys.forEach(k=>{
       let v=disp[k];if(v==null&&k==="fatigue")v=disp["fatigue"];
-      if(v==null||isNaN(v)){eh+=dimRow(k,"—",0,"gray");return;}
+      if(v==null||isNaN(v)){eh+=dimRow(_E[k]||k,"—",0,"gray");return;}
       const pct=Math.max(0,Math.min(100,Math.round(v*100)));
       const cls=v>0.6?"":v>0.3?"blue":"gray";
-      eh+=dimRow(k,(+v).toFixed(2),pct,cls);
+      eh+=dimRow(_E[k]||k,(+v).toFixed(2),pct,cls);
     });
     document.getElementById("emoDims").innerHTML=eh;
     // 驱动
@@ -705,15 +708,15 @@ async function loadEmotion(force){
     const dKeys=["attachment","curiosity","reflection","duty","social","libido","stress","fatigue"];
     let dh="";
     dKeys.forEach(k=>{
-      const v=drive[k];if(v==null||isNaN(v)){dh+=dimRow(k,"—",0,"gray");return;}
+      const v=drive[k];if(v==null||isNaN(v)){dh+=dimRow(_D[k]||k,"—",0,"gray");return;}
       const pct=Math.max(0,Math.min(100,Math.round(v*100)));
-      dh+=dimRow(k,(+v).toFixed(2),pct,k==="stress"?"teal":"blue");
+      dh+=dimRow(_D[k]||k,(+v).toFixed(2),pct,k==="stress"?"teal":"blue");
     });
     document.getElementById("emoDrive").innerHTML=dh;
     // meta
     const nextHb=d.next_heartbeat_at?new Date(d.next_heartbeat_at).toLocaleString("zh-CN"):"—";
     document.getElementById("emoMeta").innerHTML=[
-      statCard("最高驱动",drv.scores?Object.entries(drv.scores).sort((a,b)=>b[1]-a[1])[0][0]:"—","mute",""),
+      statCard("最高驱动",drv.scores?(_D[Object.entries(drv.scores).sort((a,b)=>b[1]-a[1])[0][0]]||"—"):"—","mute",""),
       statCard("当前意图","—","mute","服务端不推进引擎"),
       statCard("下次心跳",nextHb.slice(5,16),"mute",""),
       statCard("事件队列",d.events_queue_len+" 条","mute",""),
