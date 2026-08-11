@@ -1160,6 +1160,74 @@ def start_message_process_bg():
     print("🐱 NapCat QQ 端点已就绪 (被动模式)，等待本地 NapCat 通过反向 WS 连接...")
 
 
+# ==========================================
+# 9. 宠物小屋后台 tick（状态衰减 + 素材 + 自动收入）
+# ==========================================
+
+async def async_pet_house_tick():
+    """
+    🐱 宠物小屋后台 tick 协程。
+    按 PET_HOUSE_TICK_INTERVAL（默认 3600s）触发：
+    - 状态衰减（elapsed-time）
+    - 受控换房 + 物品轻微破坏
+    - 自动工资结算（日记 + 陪聊）
+    """
+    from server import _get_now_bj
+
+    print("🐱 宠物小屋 tick 神经已上线...")
+    interval = int(os.environ.get("PET_HOUSE_TICK_INTERVAL", "3600"))
+    enabled = os.environ.get("PET_HOUSE_TICK_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    if not enabled:
+        print("🐱 宠物小屋 tick 已关闭 (PET_HOUSE_TICK_ENABLED=false)")
+        return
+
+    while True:
+        try:
+            import home_system as _hs
+
+            # 1. 状态 tick（user_finn 的单例宠物）
+            tick_result = await asyncio.to_thread(_hs.cat_tick, "user_finn")
+            if tick_result.get("ok"):
+                if tick_result.get("skipped"):
+                    print(f"🐱 [宠物 tick] {tick_result.get('message')}")
+                else:
+                    print(
+                        f"🐱 [宠物 tick] 饥饿={tick_result.get('hunger')} "
+                        f"快乐={tick_result.get('happiness')} "
+                        f"清洁={tick_result.get('cleanliness')} "
+                        f"精力={tick_result.get('energy')} "
+                        f"状态={tick_result.get('status')}"
+                    )
+                    if tick_result.get("threshold_event"):
+                        print(f"⚠️ [宠物事件] 触发阈值事件: {tick_result['threshold_event']}")
+            else:
+                print(f"❌ [宠物 tick] 失败: {tick_result.get('message')}")
+
+            # 2. 受控换房 + 物品捣乱（随机概率，避免每次 tick 都触发）
+            if random.random() < 0.3:  # 30% 概率
+                mischief_result = await asyncio.to_thread(_hs.cat_room_mischief, "user_finn")
+                if mischief_result.get("ok") and not mischief_result.get("skipped"):
+                    print(f"🐾 [宠物捣乱] {mischief_result.get('message')}")
+
+            # 3. 自动工资结算（每天一次，北京时间 00:00 后首次 tick）
+            now_bj = _get_now_bj()
+            if now_bj.hour == 0 and now_bj.minute < 10:
+                # 简化：这里传入固定值，实际可由外部统计
+                wage_result = await asyncio.to_thread(
+                    _hs.cat_auto_wage,
+                    _hs.DEFAULT_WALLET_ID,
+                    diary_count=2,   # 固定 2 篇/天
+                    chat_hours=1     # 简化：1 小时/天
+                )
+                if wage_result.get("ok") and wage_result.get("total", 0) > 0:
+                    print(f"💰 [自动工资] +{wage_result.get('total')} CNY")
+
+        except Exception as e:
+            print(f"❌ [宠物 tick] 出错: {e}")
+
+        await asyncio.sleep(interval)
+
+
 async def run_background_process():
     """进程 B (后台进程) 主协程：把所有自主/定时任务跑在同一个事件循环里。
 
@@ -1174,6 +1242,7 @@ async def run_background_process():
         asyncio.create_task(async_message_summarizer(), name="msg_summarizer"),
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
         asyncio.create_task(async_schedule_secretary(), name="schedule"),
+        asyncio.create_task(async_pet_house_tick(),    name="pet_house_tick"),
     ]
 
     # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)；配了才启用

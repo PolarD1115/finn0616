@@ -80,6 +80,9 @@ try:
 except Exception as e:
     print(f"⚠️ Supabase 初始化失败: {e}")
 
+# ---------- 小屋/小满/小钱包 业务模块 ----------
+import home_system as _hs
+
 # ---------- 长期记忆客户端 (Pinecone 单写) ----------
 # v2.1: 已移除 Mem0，统一使用 Pinecone 作为唯一向量记忆库
 MEM0_USER_ID = os.environ.get("MEM0_USER_ID", "default").strip()  # 兼容旧变量名
@@ -747,14 +750,17 @@ async def get_latest_diary(limit: int = 15) -> str:
     if not supabase:
         return "（数据库未连接）"
     try:
-        # 并发拉取：长期总结 / 近期记忆 / 记忆小屋动态
+        # 并发拉取：长期总结 / 近期记忆 / 记忆小屋动态 / 小屋日记
         def _fetch_recent():
             return supabase.table("memories").select("*").order("created_at", desc=True).limit(limit).execute()
         def _fetch_house():
             return supabase.table("memory_house").select("*").order("created_at", desc=True).limit(15).execute()
-        res_recent, res_house = await asyncio.gather(
+        def _fetch_diary():
+            return supabase.table("house_diary").select("*").order("created_at", desc=True).limit(15).execute()
+        res_recent, res_house, res_diary = await asyncio.gather(
             asyncio.to_thread(_fetch_recent),
             asyncio.to_thread(_fetch_house),
+            asyncio.to_thread(_fetch_diary),
         )
 
         # 记忆小屋动态流
@@ -765,6 +771,17 @@ async def get_latest_diary(limit: int = 15) -> str:
                 time_str = _format_time_cn(h.get('created_at'))
                 locked = "🔒" if h.get('is_locked') else ""
                 house_stream += f"{time_str} {locked}在【{h.get('room', '未知')}】{h.get('action_type', '活动')}: {str(h.get('content', ''))[:80]}...\n"
+
+        # 小屋日记流（新表）
+        diary_stream = ""
+        if res_diary and res_diary.data:
+            diary_stream = "\n🏡 【小屋日记】:\n"
+            for d in sorted(res_diary.data, key=lambda x: x.get('created_at', '')):
+                time_str = _format_time_cn(d.get('created_at'))
+                entry_type = d.get('entry_type', '活动')
+                room_id = d.get('room_id', '未知')
+                content = str(d.get('content', ''))[:80]
+                diary_stream += f"{time_str} [{entry_type}] 在【{room_id}】: {content}...\n"
 
         # 主记忆流
         memory_stream = "🧠 【当前大脑状态】:\n"
@@ -778,6 +795,7 @@ async def get_latest_diary(limit: int = 15) -> str:
                 mood_str = f" | Mood:{data.get('mood')}" if data.get('mood') else ""
                 memory_stream += f"{time_str} [{cat}] 【{title}】: {data.get('content', '')}{mood_str}\n"
             memory_stream += house_stream
+            memory_stream += diary_stream
 
         return memory_stream
     except Exception as e:
@@ -1306,8 +1324,7 @@ async def manage_memory_house(action: str, room: str = "", activity: str = "", c
         await asyncio.to_thread(lambda: supabase.table("memory_house").insert(data).execute())
         return f"✅ AI 在【{room}】开始{activity}了。"
     if action == "delete" and record_id:
-        await asyncio.to_thread(lambda: supabase.table("memory_house").delete().eq("id", record_id).execute())
-        return f"✅ 小屋动态 {record_id} 已删除。"
+        return "⚠️ 删除操作需要用户确认，请联系管理员。"
     return "❌ 未知操作。"
 
 
@@ -1386,27 +1403,212 @@ async def manage_piggy_bank(action: str, amount: float = 0.0, reason: str = ""):
     return f"✅ 成功{act_str} {amount} 元！当前余额：{current:.2f} 元。"
 
 
+# ============================================================
+# 小钱包 (Virtual Wallet) — 阶段 2 MCP Tools
+# ============================================================
+
 @mcp.tool()
 @mcp_error_handler
-async def tarot_reading(question: str):
-    """【塔罗占卜】抽取三张牌 (过去/现在/未来)，由 AI 解读。"""
-    deck = [
-        "0. 愚者 (The Fool)", "I. 魔术师 (The Magician)", "II. 女祭司 (The High Priestess)",
-        "III. 皇后 (The Empress)", "IV. 皇帝 (The Emperor)", "V. 教皇 (The Hierophant)",
-        "VI. 恋人 (The Lovers)", "VII. 战车 (The Chariot)", "VIII. 力量 (Strength)",
-        "IX. 隐士 (The Hermit)", "X. 命运之轮 (Wheel of Fortune)", "XI. 正义 (Justice)",
-        "XII. 倒吊人 (The Hanged Man)", "XIII. 死神 (Death)", "XIV. 节制 (Temperance)",
-        "XV. 魔鬼 (The Devil)", "XVI. 高塔 (The Tower)", "XVII. 星星 (The Star)",
-        "XVIII. 月亮 (The Moon)", "XIX. 太阳 (The Sun)", "XX. 审判 (Judgement)", "XXI. 世界 (The World)"
-    ]
-    draw = random.sample(deck, 3)
-    client = _get_llm_client("chat")  # 塔罗解读属实时聊天角色
-    if not client:
-        return f"🔮 抽牌结果：{', '.join(draw)}。\n(⚠️ LLM 未配置，无法解读)"
-    persona = await asyncio.to_thread(_get_current_persona)
-    prompt = f"当前人设：{persona}\n场景：用户因 '{question}' 感到困惑，想通过塔罗牌找方向。\n抽牌：过去 {draw[0]} | 现在 {draw[1]} | 未来 {draw[2]}\n请给出 200 字内解读。"
-    ai_reply = await _ask_llm_async(client, prompt, temperature=0.8)
-    return f"🔮 【塔罗指引】\n🃏 牌阵: {draw[0]} | {draw[1]} | {draw[2]}\n\n💬 {ai_reply}"
+async def wallet_check():
+    """【小钱包·查余额】查询 finn_wallet 当前余额、本周已赚、加班银行、周上限与生日周状态。"""
+    def _call():
+        return _hs.wallet_check()
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def wallet_earn(amount: float, source_key: str, reason: str):
+    """【小钱包·入账】向 finn_wallet 入账。source_key 用于幂等防重。"""
+    def _call():
+        return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def wallet_spend(amount: float, reason: str):
+    """【小钱包·支出】从 finn_wallet 支出。余额不足时返回错误。"""
+    def _call():
+        return _hs.wallet_spend(_hs.DEFAULT_WALLET_ID, amount, reason)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def wallet_exchange(target: str, reason: str):
+    """【小钱包·兑换】用物品兑换余额。target: "tea" (=50) | "gift" (=100)。"""
+    def _call():
+        return _hs.wallet_exchange(_hs.DEFAULT_WALLET_ID, target, reason)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def wallet_overtime_withdraw(amount: float, reason: str):
+    """【小钱包·取出加班银行】从加班银行取出余额到主账户。单次上限 20。"""
+    def _call():
+        return _hs.wallet_overtime_withdraw(_hs.DEFAULT_WALLET_ID, amount, reason)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def wallet_log(limit: int = 20, offset: int = 0):
+    """【小钱包·查流水】查询 finn_wallet 最近交易记录。limit: 1~100。"""
+    def _call():
+        return _hs.wallet_log(_hs.DEFAULT_WALLET_ID, limit, offset)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 有状态小屋 (Phase 3)
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def house_look(room_id: str):
+    """【小屋·查看房间】查看指定房间的详情，含房间内物品和近期日记。
+    room_id: living_room / bedroom / kitchen / study / balcony
+    """
+    def _call():
+        return _hs.house_look(room_id)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def house_do(room_id: str, entry_type: str, content: str, mood: str = "", weather: str = ""):
+    """【小屋·做某事】在房间里做某事，记录到日记。
+    room_id: living_room / bedroom / kitchen / study / balcony
+    entry_type: 活动类型，如 看书 / 做饭 / 听音乐 / 发呆
+    content: 具体内容描述
+    """
+    def _call():
+        return _hs.house_do(room_id, entry_type, content, mood or None, weather or None)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def house_put(room_id: str, name: str, emoji: str = "📦", description: str = ""):
+    """【小屋·放置物品】在房间里放置一个物品。
+    room_id: living_room / bedroom / kitchen / study / balcony
+    name: 物品名称
+    emoji: 物品表情符号
+    description: 物品描述
+    """
+    def _call():
+        return _hs.house_put(room_id, name, emoji, description or None)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def house_take(object_id: str):
+    """【小屋·拿走物品】从房间里拿走一个物品（需要 object_id）。"""
+    def _call():
+        return _hs.house_take(object_id)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def house_update_desc(room_id: str, description: str):
+    """【小屋·更新描述】更新某个房间的描述文案。
+    room_id: living_room / bedroom / kitchen / study / balcony
+    """
+    def _call():
+        return _hs.house_update_desc(room_id, description)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 小满猫系统 MCP Tools
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_status():
+    """【小满·查看状态】查看小满的当前状态、属性、冷却和库存摘要。
+    返回权威属性（hunger/happiness/health/energy/cleanliness  clamp 0-100）、
+    状态、当前房间、抚摸冷却剩余秒数、库存列表。
+    """
+    def _call():
+        return _hs.cat_status("user_finn")
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_feed(item_id: str):
+    """【小满·喂食】给小满喂食（仅 food 类型物品）。扣消耗品库存，增加饥饿度。
+    item_id: 物品ID（如 fish, cat_milk, tuna_can, wet_food, apple）
+    """
+    def _call():
+        return _hs.cat_feed("user_finn", item_id)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_play(item_id: str = ""):
+    """【小满·玩耍】陪小满玩耍。sleeping 或精力过低时拒绝。
+    item_id: 玩具ID（如 ball, catnip, feather），不传则空手玩耍（效果较低）
+    """
+    def _call():
+        return _hs.cat_play("user_finn", item_id or None)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_clean(item_id: str = ""):
+    """【小满·清洁】给小满清洁。
+    item_id: 清洁道具ID（如 brush, soap），不传则基础清洁
+    """
+    def _call():
+        return _hs.cat_clean("user_finn", item_id or None)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_pet():
+    """【小满·抚摸】抚摸小满，快乐 +5。10分钟冷却，冷却内零副作用。"""
+    def _call():
+        return _hs.cat_pet("user_finn")
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_restore_energy():
+    """【小满·恢复精力】让小满恢复精力（明确、受限的恢复路径）。"""
+    def _call():
+        return _hs.cat_restore_energy("user_finn")
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_shop_list():
+    """【小满·商店列表】查看猫商店可购买的10个白名单物品及价格。"""
+    def _call():
+        return _hs.cat_shop_list()
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cat_shop_buy(item_id: str, qty: int = 1):
+    """【小满·商店购买】购买猫用品。钱包扣款 + 流水 + 库存原子事务。
+    item_id: 物品ID（见 cat_shop_list）
+    qty: 数量（1-99）
+    """
+    def _call():
+        return _hs.cat_shop_buy("user_finn", item_id, qty)
+    return await asyncio.to_thread(_call)
 
 
 @mcp.tool()

@@ -329,6 +329,13 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `DIARY_TIME` | ❌ | `03:00` | 🆕 每日日记生成时间（24小时制）。到点自动拉取昨日全部对话流水，调用聊天模型（`main_chat`）生成第一人称"昨日回溯"日记，存入 Core_Cognition。启动时若发现昨日日记缺失会自动补写。依赖 CHAT_API_KEY。 |
 | `SYNC_KEYS` | ❌ | 空 | 额外热同步的环境变量键，逗号分隔 |
 
+### 12.1 宠物小屋 tick（Phase 5）
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `PET_HOUSE_TICK_INTERVAL` | ❌ | `3600` | 宠物小屋 tick 间隔（秒）。默认 1 小时触发一次状态衰减。 |
+| `PET_HOUSE_TICK_ENABLED` | ❌ | `true` | 是否启用宠物小屋 tick。`false` 时关闭状态衰减、换房捣乱和自动工资结算。 |
+
 ---
 
 ## 13. 其他可选
@@ -366,6 +373,24 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 
 > 💡 开启顺序建议：先只开 `DESIRE_DRIVEN` 观察一段时间的意图日志（`💗 [欲望驱动]` / `💓 [自主心跳]` / `😴 [设备睡眠]`），确认行为合理后再逐个打开 `DESIRE_COUPLING` / `HEARTBEAT_AUTONOMY` / `DESIRE_BASELINE_DRIFT` / `SLEEP_FROM_DEVICE`。
 > 状态全部持久化在 Supabase `user_facts` 表（`desire_*` 系列 key），重启不丢。
+
+---
+
+## 15. 小钱包 (Virtual Wallet) 🆕
+
+> 🆕 Phase 2 新增。所有写操作通过 PostgreSQL RPC 原子完成，Python 层只做参数校验和调用封装。
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `WALLET_WEEK_CAP` | ❌ | `80` | 每周入账上限（北京时间周一 00:00 重置） |
+| `WALLET_OVERTIME_RATE` | ❌ | `0.5` | 超出周上限部分折算到加班银行的比率（0.5 = 超出 100 只存 50） |
+| `WALLET_BIRTHDAY_WEEK` | ❌ | `true` | 生日周（4月5日 / 11月15日所在周）是否取消上限 |
+| `WALLET_OVERTIME_WITHDRAW_MAX` | ❌ | `20` | 单次从加班银行取出的上限 |
+
+**说明**：
+- `wallet_check` / `wallet_earn` / `wallet_spend` / `wallet_exchange` / `wallet_overtime_withdraw` / `wallet_log` 六个 MCP 工具在 `server.py` 注册，调用 `home_system.py` 中对应的 DB IO 函数。
+- `wallet_exchange` 硬编码兑换率：`tea=50` / `gift=100`（单位与 `currency` 一致，默认 CNY）。
+- `source_key` 幂等：重复提交相同 `source_key` 时，`rpc_wallet_earn` 会返回 `DUPLICATE_SOURCE` 错误，防止重复入账。
 
 ---
 

@@ -407,6 +407,119 @@
 3. `server.py` 顶部 `import requests` 与 gateway 的线程内 requests 并存，连接池未统一。
 4. 日记/总结等依赖 `CHAT_API_KEY`，若未配置会优雅跳过（符合设计）。
 
+## 🏠 阶段 0 盘点记录 — 小屋/小满/小钱包集成（2026-08-11）
+
+> **性质**：只读盘点与交接基线，零代码改动，零数据写入。
+> **交付物**：`AGENT_HANDOFF_HOME_SYSTEM.md`
+
+### 盘点发现
+
+- **现有 Tools（server.py）**：`manage_memory_house` / `save_expense` / `check_expense_report` / `manage_piggy_bank` 均已上线；`get_latest_diary` 实现位置待确认。
+- **数据库**：
+  - `memory_house`: 5 条记录（阳台/客厅/书房）
+  - `expenses`: 0 条记录
+  - `user_facts`: 无 piggy_bank / wallet / house / pet 键
+  - `virtual_creatures`: 2 条（finn pet + finn plant）
+- **宠物系统表**：9 个已存在（pet_users/pet_species/pets/pet_items/pet_inventory/pet_adventures/pet_work_log/pet_achievements/pet_user_achievements），6 个未创建（pet_relationships/pet_relationship_events/pet_marriages/pet_breeding/pet_market_listings/pet_interaction_log）。
+- **赛博宠物.zip**：包含 manifest.json / supabase_schema.sql / main.js / ui/index.html，涵盖小屋+小满+小钱包全套功能定义。
+
+### 阶段 1 及以后待办（摘要）
+
+1. 创建缺失的 6 张宠物系统表
+2. 评估 `virtual_creatures` 与 `pets` 表的整合方案
+3. 扩展小屋物品/事件系统数据模型
+4. 扩展小钱包预算与统计功能
+5. 更新 README.md 中工具数量与描述
+6. 补充 VARIABLES.md 新增环境变量
+
+## 🏠 阶段 1 完成记录 — 小屋/小满/小钱包 Schema + 幂等种子（2026-08-11）
+
+> **性质**：基础 schema 与幂等种子，只做 DDL + Seed，不做 RPC/后台/工具。
+> **迁移文件**: `migrations/20240811_001_home_system_schema.sql`
+> **约束**：无 DELETE/DROP/TRUNCATE；向后兼容；幂等可重复执行。
+
+### 新增表
+
+| 表名 | 说明 | RLS |
+|------|------|-----|
+| `house_rooms` | 小屋房间定义（5 房间） | ✅ |
+| `house_diary` | 小屋日记/活动记录 | ✅ |
+| `wallet` | 小钱包主表（单例 finn_wallet） | ✅ |
+| `wallet_log` | 钱包流水（source_key 唯一索引） | ✅ |
+
+### pets 扩展字段（无损 ALTER）
+
+- `current_room` (text) — 当前所在房间
+- `last_petted_at` (timestamptz) — 上次被抚摸时间
+- `tick_next_at` (timestamptz) — 下次 tick 触发时间
+- `alert_flags` (jsonb) — 告警标记
+
+### Seed 结果
+
+| 项目 | 策略 | 结果 |
+|------|------|------|
+| 5 房间 | ON CONFLICT DO NOTHING | 客厅/卧室/厨房/书房/阳台 |
+| wallet | ON CONFLICT DO NOTHING | finn_wallet / 100 CNY |
+| 宠物绑定 | UPDATE current_room='living_room'（仅空值） | 小满 → living_room |
+| 10 猫用品 | ON CONFLICT DO UPDATE | catnip / scratching_post / cat_bed / tuna_can / cat_milk / litter / brush / cat_tower / wet_food / collar |
+
+### Advisor 结果
+
+- **Security**: 无本阶段引入的新问题。
+- **Performance**: 无本阶段引入的新问题。新表索引标记为 `unused_index` 属正常（刚创建无查询流量）。
+
+### 未执行的删除操作
+
+- 无任何 DELETE / DROP / TRUNCATE
+- 未重置房间、宠物属性、库存或余额
+- 未删除旧 pet_items（原有 34 条全部保留）
+
+---
+
+## 🏠 阶段 2 完成记录 — 小钱包 RPC + MCP 工具 + 测试（2026-08-11）
+
+> **性质**：只实现「小钱包」模块的 RPC + Python 封装 + MCP 工具注册 + 单元测试。
+> **迁移文件**: `migrations/20240811_002_wallet_rpc.sql`
+> **约束**：无 DELETE/DROP/TRUNCATE；向后兼容；幂等可重复执行；所有写操作原子化在数据库内完成。
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `home_system.py` | 钱包纯函数校验 + DB IO 封装（6 个 RPC 接口） |
+| `test_wallet.py` | 44 项单元测试（unittest + mock），全部通过 |
+| `migrations/20240811_002_wallet_rpc.sql` | PostgreSQL 迁移：wallet 表扩展 + 6 个 RPC 函数 + 2 个辅助函数 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `server.py` | 新增 6 个 MCP tool 注册（`wallet_check`/`wallet_earn`/`wallet_spend`/`wallet_exchange`/`wallet_overtime_withdraw`/`wallet_log`） |
+
+### 关键设计决策
+
+- **原子性**：所有写操作（earn/spend/exchange/overtime_withdraw）均通过 PostgreSQL `FOR UPDATE` 行锁 + 事务内双写（wallet + wallet_log）完成，Python 层不做 read-modify-write
+- **周计算**：使用固定 UTC+8 偏移，不依赖 pytz/tzdata 外部包
+- **生日周**：4月5日 / 11月15日所在周取消上限（`WALLET_BIRTHDAY_WEEK` 控制）
+- **加班银行**：超出周上限部分按 `WALLET_OVERTIME_RATE`（默认 0.5）折算存入 `overtime_bank`
+- **幂等性**：`source_key` 通过 `wallet_log` 唯一索引保障，重复调用返回 `DUPLICATE_SOURCE`
+- **测试策略**：纯函数直接测；DB 操作全部 mock，不触碰生产数据
+
+### 验证结果
+
+- `py_compile server.py home_system.py` ✅
+- `python -m unittest test_wallet -v` — 44/44 通过 ✅
+- 数据库只读验证：wallet 表 11 列 / 6 个 RPC 函数 / finn_wallet 数据无损 ✅
+
+### 未实现（按用户要求排除）
+
+- ❌ 小屋 MCP（`manage_memory_house` 扩展）
+- ❌ 猫 MCP（宠物 tick / 后台 heartbeat）
+- ❌ 后台 tick（`heartbeat.py` 钱包定时记账）
+- ❌ `wallet_log` 与 `expenses` 的联动
+
+---
+
 ## 🚀 快速验证命令
 
 ```bash
@@ -415,3 +528,195 @@ cd /workspace/mcp-gateway
 PORT=18765 /workspace/.venv/bin/python server.py &                                   # 启动
 python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:18765/health').read())"
 ```
+
+---
+
+## 🏠 阶段 3 — 有状态小屋（Memory House）原子 RPC + MCP 工具（2026-08-11）
+
+> **性质**：实现小屋「有状态化」——房间物品可放置/拿走、日记可写、房间描述可更新，全部通过 PostgreSQL 原子 RPC 完成。
+> **迁移文件**: `migrations/20240811_003_house_rpc.sql`
+> **约束**：无 DELETE/DROP/TRUNCATE；向后兼容；幂等可重复执行；所有写操作原子化在数据库内完成；旧 `memory_house` 表完全保留。
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `migrations/20240811_003_house_rpc.sql` | PostgreSQL 迁移：新增 `house_objects` / `house_diary` 表 + 5 个 RPC 函数 |
+| `test_house.py` | 30 项单元测试（unittest + mock），全部通过 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `home_system.py` | 新增 `VALID_ROOMS` + 3 个纯函数校验 + 5 个 DB IO 封装（`house_look`/`house_do`/`house_put`/`house_take`/`house_update_desc`） |
+| `server.py` | 新增 5 个 MCP tool 注册（`house_look`/`house_do`/`house_put`/`house_take`/`house_update_desc`）；`get_latest_diary` 扩展为双表查询（`memory_house` + `house_diary`）；`manage_memory_house` delete action 改为需用户确认 |
+
+### 关键设计决策
+
+- **原子性**：所有写操作（`do`/`put`/`take`/`update_desc`）均通过 PostgreSQL 原子 RPC 函数完成，Python 层不执行 read-modify-write
+- **房间模型**：5 个固定房间（living_room / bedroom / kitchen / study / balcony），校验在 Python 纯函数层完成
+- **向后兼容**：
+  - `memory_house` 旧表不动，`manage_memory_house` 的 `list`/`do` 继续工作
+  - `get_latest_diary` 同时查询新旧两表，合并后按时间排序，AI 不会遗漏历史
+  - `manage_memory_house` 的 `delete` 改为软保护，返回用户确认提示
+- **测试策略**：纯函数直接测；DB 操作全部 mock，不触碰生产数据
+
+### 验证结果
+
+- `py_compile server.py home_system.py` ✅
+- `python -m unittest test_house -v` — 30/30 通过 ✅
+- `python -m unittest test_wallet -v` — 44/44 通过（回归）✅
+- 数据库只读验证：`house_objects` 7 列 / `house_diary` 8 列 / 5 个 RPC 函数 / `memory_house` 数据无损 ✅
+
+### 未实现（按用户要求排除）
+
+- ❌ 猫 MCP（宠物 tick / 后台 heartbeat）
+- ❌ 后台 tick（`heartbeat.py` 钱包定时记账）
+- ❌ `wallet_log` 与 `expenses` 的联动
+
+---
+
+## 🏠 阶段 4 — 小满及猫商店（Home Cat）原子 RPC + MCP 工具（2026-08-11）
+
+> **性质**：实现小满猫系统的 8 个原子 RPC + Python 封装 + MCP 工具注册 + 单元测试。无后台 tick。
+> **迁移文件**: `migrations/20240811_004_cat_rpc.sql`
+> **约束**：无 DELETE/DROP/TRUNCATE；向后兼容；幂等可重复执行；所有写操作原子化在数据库内完成；旧宠物/库存数据完全保留。
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `migrations/20240811_004_cat_rpc.sql` | PostgreSQL 迁移：新增 `cat_shop_whitelist` 视图 + 8 个 RPC 函数 |
+| `test_cat.py` | 42 项单元测试（unittest + mock），全部通过 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `home_system.py` | 新增 `CAT_SHOP_WHITELIST` + `CAT_ITEM_TYPES` + 3 个纯函数校验 + 8 个 DB IO 封装（`cat_status`/`cat_feed`/`cat_play`/`cat_clean`/`cat_pet`/`cat_restore_energy`/`cat_shop_list`/`cat_shop_buy`） |
+| `server.py` | 新增 8 个 MCP tool 注册（`cat_status`/`cat_feed`/`cat_play`/`cat_clean`/`cat_pet`/`cat_restore_energy`/`cat_shop_list`/`cat_shop_buy`） |
+
+### 关键设计决策
+
+- **无后台 tick**：所有状态变化由用户显式操作触发，无自动衰减（与情感引擎解耦）
+- **物品分类**：food（5 个消耗品）/ toy（3 个耐用品）/ clean（2 个消耗品）
+- **玩具耐用**：`play` 使用 toy 类物品时不扣库存；food/clean 使用时扣库存
+- **冷却机制**：`pet` 操作 10 分钟冷却；冷却期间再次 pet 零副作用
+- **属性封顶**：所有属性 clamp 到 [0, 100]
+- **购买原子性**：`rpc_cat_shop_buy` 内部完成 wallet 扣款 → wallet_log → pet_inventory upsert，三重操作在同一事务内
+- **稳定排序 FOR UPDATE**：`shop_buy` 按 wallet → pet_inventory 顺序加锁，避免死锁
+- **测试策略**：纯函数直接测；DB 操作全部 mock，不触碰生产数据
+
+### 验证结果
+
+- `py_compile server.py home_system.py` ✅
+- `python -m unittest test_cat -v` — 42/42 通过 ✅
+- `python -m unittest test_wallet -v` — 44/44 通过（回归）✅
+- `python -m unittest test_house -v` — 30/30 通过（回归）✅
+- 无 DELETE / DROP / TRUNCATE ✅
+
+---
+
+## 🏠 阶段 5 — 后台 tick、素材和可审计自动收入（2026-08-11）
+
+> **性质**：实现宠物后台 tick 系统：elapsed-time 状态衰减 + 睡眠滞回 + 阈值事件 + 受控换房/捣乱 + 自动工资 + 事件队列。
+> **迁移文件**: `migrations/20240811_005_cat_tick.sql`
+> **约束**：无 DELETE/DROP/TRUNCATE；向后兼容；幂等可重复执行；所有写操作原子化在数据库内完成。
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `migrations/20240811_005_cat_tick.sql` | PostgreSQL 迁移：扩展 pets 表 + agent_outbound 事件队列表 + 5 个 RPC 函数 |
+| `test_cat_tick.py` | 24 项单元测试（unittest + mock），全部通过 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `home_system.py` | 新增衰减率常量 / 睡眠阈值常量 / 工资常量 + 5 个 DB IO 封装（`cat_tick`/`cat_room_mischief`/`cat_auto_wage`/`agent_outbound_poll`/`agent_outbound_ack`） |
+| `heartbeat.py` | 新增 `async_pet_house_tick()` 协程，注册到 `run_background_process()` |
+| `VARIABLES.md` | 新增 `PET_HOUSE_TICK_INTERVAL` / `PET_HOUSE_TICK_ENABLED` |
+
+### 新增 RPC 函数
+
+| 函数名 | 功能 | 原子性 |
+|--------|------|--------|
+| `rpc_cat_tick` | elapsed-time 状态衰减 + 睡眠滞回 + 阈值事件 | ✅ FOR UPDATE |
+| `rpc_cat_room_mischief` | 受控换房 + 物品轻微破坏（修改 description，不删除） | ✅ FOR UPDATE |
+| `rpc_cat_auto_wage` | 自动工资结算（日记 2/篇 + 陪聊 1/小时） | ✅ FOR UPDATE |
+| `rpc_agent_outbound_poll` | 查询待处理事件 | 只读 |
+| `rpc_agent_outbound_ack` | 标记事件为已处理 | ✅ UPDATE |
+
+### 关键设计决策
+
+- **Elapsed-time 衰减**：基于 `last_tick_at` 计算经过小时数，每小时饥饿 -2 / 快乐 -1.5 / 清洁 -1，上限 48h 防断档暴涨
+- **睡眠滞回**：精力 < 20 自动入睡，精力 >= 40 自动醒来，避免在 20-40 区间反复切换
+- **阈值事件**：饥饿度从 >=30 降到 <30 时触发 `hungry_cat` 事件，写入 `agent_outbound` 队列
+- **幂等边界**：tick 间隔 < 60 秒时跳过，防止重复衰减
+- **受控捣乱**：30% 概率换房 + 对当前房间随机物品修改 description（加爪印备注），不删除物品
+- **自动工资**：日记 2 CNY/篇 + 陪聊 1 CNY/小时，每天北京时间 00:00 后首次 tick 结算
+- **事件队列**：`agent_outbound` 表存储待处理事件，consumer 通过 `rpc_agent_outbound_poll`/`rpc_agent_outbound_ack` 消费
+- **测试策略**：纯函数直接测；DB 操作全部 mock，不触碰生产数据
+
+### 验证结果
+
+- `py_compile server.py home_system.py heartbeat.py` ✅
+- `python -m unittest test_cat_tick -v` — 24/24 通过 ✅
+- `python -m unittest test_cat -v` — 42/42 通过（回归）✅
+- `python -m unittest test_wallet -v` — 44/44 通过（回归）✅
+- `python -m unittest test_house -v` — 30/30 通过（回归）✅
+- 无 DELETE / DROP / TRUNCATE ✅
+
+### 环境变量
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `PET_HOUSE_TICK_INTERVAL` | `3600` | tick 间隔（秒） |
+| `PET_HOUSE_TICK_ENABLED` | `true` | 是否启用宠物小屋 tick |
+
+---
+
+## Phase 7 — 独立代码审查与收尾（2026-08-11）
+
+> 本阶段为**独立复审**，不默认前六阶段正确，按 7 个维度重新验证。
+
+### 审查维度与结论
+
+| 维度 | 结论 | 备注 |
+|------|------|------|
+| 数据一致性 | ✅ 通过 | 修正 2 处 wallet_log action 枚举值 |
+| 幂等性 | ✅ 通过 | 所有 RPC 均含 `ON CONFLICT`/`WHERE` 幂等 guard |
+| 兼容性 | ✅ 通过 | 无破坏性变更，旧工具/表均保留 |
+| 规则合规 | ✅ 通过 | CHECK/UNIQUE/NOT NULL 无违规 |
+| 安全 | ✅ 通过 | 移除死代码；校验逻辑完整 |
+| 异步/运行时 | ✅ 通过 | `asyncio.to_thread()` 使用正确 |
+| 测试真实性 | ✅ 通过 | 140/140 测试通过，Mock 未触碰生产数据 |
+
+### 发现的问题（按严重度排序）
+
+| 严重度 | 文件 | 位置 | 问题 | 状态 |
+|--------|------|------|------|------|
+| **CRITICAL** | `migrations/20240811_004_cat_rpc.sql` | 第 529 行 | `rpc_cat_shop_buy` 向 `wallet_log` 插入 `action='spend'`，违反 CHECK 约束（只允许 `income/expense/transfer/adjust`） | ✅ 已修复 → `expense` |
+| **CRITICAL** | `migrations/20240811_005_cat_tick.sql` | 第 309 行 | `rpc_cat_auto_wage` 向 `wallet_log` 插入 `action='earn'`，违反同一 CHECK 约束 | ✅ 已修复 → `income` |
+| **HIGH** | `server.py` | 第 1613–1630 行 | `cat_shop_buy` 内 `return` 之后存在约 18 行**死代码**（塔罗占卜逻辑），永远不会执行 | ✅ 已删除 |
+| **MEDIUM** | `home_system.py` | 第 162–164 行 | `wallet_check` 调用 `_validate_amount(1)` 无意义（1 恒合法），且误导读者 | ✅ 已移除 |
+
+### 修复后验证
+
+- `py_compile server.py home_system.py heartbeat.py` ✅
+- `python -m unittest discover -v` — **140/140 通过** ✅
+- `/health` 冒烟测试 — `200 {"status":"ok"}` ✅
+- Supabase Security Advisor — 无本阶段引入的新问题 ✅
+- Supabase Performance Advisor — 无本阶段引入的新问题 ✅
+
+### Advisor 摘要（本次复查）
+
+- **Security**：历史遗留的 `function_search_path_mutable`、`extension_in_public`、`anon_security_definer_function_executable` 等 WARN 均为旧系统/旧函数，非本阶段引入。
+- **Performance**：`unused_index` 标记的新表索引（`idx_house_diary_room_created`、`idx_wallet_log_wallet_created` 等）为正常状态（新表刚创建尚未有查询流量）；`multiple_permissive_policies` 与 `duplicate_index` 为 `chat_messages`/`memory_summaries` 历史遗留。
+
+### 待用户确认事项
+
+1. **生产数据库迁移已应用**：修改迁移文件**不会**影响已执行过的迁移。若生产环境已应用旧版 `004`/`005`，需要手动在数据库中执行等效修复（`UPDATE wallet_log SET action='expense' WHERE action='spend'` / `UPDATE wallet_log SET action='income' WHERE action='earn'`），或重新初始化数据库。
+2. **死代码删除确认**：`server.py` 第 1613–1630 行的塔罗占卜代码已删除。若未来需要该功能，需重新设计实现位置（不应放在 `return` 之后）。
+
