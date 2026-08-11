@@ -1170,7 +1170,6 @@ async def async_pet_house_tick():
     按 PET_HOUSE_TICK_INTERVAL（默认 3600s）触发：
     - 状态衰减（elapsed-time）
     - 受控换房 + 物品轻微破坏
-    - 自动工资结算（日记 + 陪聊）
     """
     from server import _get_now_bj
 
@@ -1208,19 +1207,6 @@ async def async_pet_house_tick():
                 mischief_result = await asyncio.to_thread(_hs.cat_room_mischief, "user_finn")
                 if mischief_result.get("ok") and not mischief_result.get("skipped"):
                     print(f"🐾 [宠物捣乱] {mischief_result.get('message')}")
-
-            # 3. 自动工资结算（每天一次，北京时间 00:00 后首次 tick）
-            now_bj = _get_now_bj()
-            if now_bj.hour == 0 and now_bj.minute < 10:
-                # 简化：这里传入固定值，实际可由外部统计
-                wage_result = await asyncio.to_thread(
-                    _hs.cat_auto_wage,
-                    _hs.DEFAULT_WALLET_ID,
-                    diary_count=2,   # 固定 2 篇/天
-                    chat_hours=1     # 简化：1 小时/天
-                )
-                if wage_result.get("ok") and wage_result.get("total", 0) > 0:
-                    print(f"💰 [自动工资] +{wage_result.get('total')} CNY")
 
         except Exception as e:
             print(f"❌ [宠物 tick] 出错: {e}")

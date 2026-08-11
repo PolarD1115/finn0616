@@ -169,8 +169,9 @@ def wallet_check(wallet_id: str = DEFAULT_WALLET_ID) -> dict:
     })
 
 
-def wallet_earn(wallet_id: str, amount: float, source_key: str, reason: str, meta: dict | None = None) -> dict:
-    """入账（原子 RPC）。"""
+def wallet_earn(wallet_id: str, amount: float, source_key: str, reason: str, meta: dict | None = None, bypass_cap: bool = False) -> dict:
+    """入账（原子 RPC）。
+    bypass_cap=True 时全额入余额、不计 week_earned、不进加班银行（用于零花钱/打赏）。"""
     ok, err = _validate_amount(amount)
     if not ok:
         return _format_result(False, "金额非法", error_code=err)
@@ -187,6 +188,7 @@ def wallet_earn(wallet_id: str, amount: float, source_key: str, reason: str, met
         "p_week_cap": WALLET_WEEK_CAP,
         "p_overtime_rate": WALLET_OVERTIME_RATE,
         "p_birthday_enabled": WALLET_BIRTHDAY_WEEK,
+        "p_bypass_cap": bool(bypass_cap),
     })
 
 
@@ -532,11 +534,6 @@ TICK_DECAY_RATES = {
 SLEEP_THRESHOLD = 20   # 精力 < 20 时入睡
 WAKE_THRESHOLD = 40    # 精力 >= 40 时醒来
 
-# 自动工资常量
-WAGE_DIARY_RATE = 2.0   # 日记每篇 2 CNY
-WAGE_CHAT_RATE = 1.0    # 陪聊每小时 1 CNY
-
-
 def cat_tick(user_id: str = "user_finn") -> dict:
     """触发宠物状态 tick（elapsed-time 衰减 + 睡眠滞回 + 阈值事件）。"""
     if not user_id or not isinstance(user_id, str):
@@ -549,17 +546,6 @@ def cat_room_mischief(user_id: str = "user_finn") -> dict:
     if not user_id or not isinstance(user_id, str):
         return _format_result(False, "用户ID无效", error_code="INVALID_USER")
     return _rpc("rpc_cat_room_mischief", {"p_user_id": user_id})
-
-
-def cat_auto_wage(wallet_id: str = DEFAULT_WALLET_ID, diary_count: int = 0, chat_hours: int = 0) -> dict:
-    """自动结算工资（日记 + 陪聊）。"""
-    if not wallet_id or not isinstance(wallet_id, str):
-        return _format_result(False, "钱包ID无效", error_code="INVALID_WALLET")
-    return _rpc("rpc_cat_auto_wage", {
-        "p_wallet_id": wallet_id,
-        "p_diary_count": int(diary_count),
-        "p_chat_hours": int(chat_hours),
-    })
 
 
 def agent_outbound_poll(agent_id: str = "pet_house", limit: int = 10) -> dict:

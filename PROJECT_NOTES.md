@@ -720,3 +720,110 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
 1. **生产数据库迁移已应用**：修改迁移文件**不会**影响已执行过的迁移。若生产环境已应用旧版 `004`/`005`，需要手动在数据库中执行等效修复（`UPDATE wallet_log SET action='expense' WHERE action='spend'` / `UPDATE wallet_log SET action='income' WHERE action='earn'`），或重新初始化数据库。
 2. **死代码删除确认**：`server.py` 第 1613–1630 行的塔罗占卜代码已删除。若未来需要该功能，需重新设计实现位置（不应放在 `return` 之后）。
 
+## 钱包改造-S1 删除后台自动结算（heartbeat.py）
+
+**时间**：2026-08-11
+
+**改动文件**：`heartbeat.py`
+
+**删除内容**：
+1. `async_pet_house_tick` 函数 docstring 中删除一行：`- 自动工资结算（日记 + 陪聊）`
+2. 删除「3. 自动工资结算」整段代码块（原约第 1212–1223 行），包括：
+   - 获取北京时间并判断 `hour == 0 and minute < 10` 的触发逻辑
+   - 调用 `_hs.cat_auto_wage(_hs.DEFAULT_WALLET_ID, diary_count=2, chat_hours=1)` 的自动入账逻辑
+   - 对应的成功打印 `💰 [自动工资] +{total} CNY`
+
+**原因**：日记和陪聊不再触发自动入账；状态衰减、受控换房和物品捣乱逻辑保留。`_get_now_bj` 的 import 保留（其它协程仍在引用）。
+
+**验证**：
+- `python -m py_compile heartbeat.py` ✅ 无语法错误
+- `heartbeat.py` 中已不含 `cat_auto_wage`、`diary_count`、`chat_hours` ✅
+
+## 钱包改造-S2 删除计件封装（home_system.py）
+
+**时间**：2026-08-11
+
+**改动文件**：`home_system.py`
+
+**删除内容**：
+1. 删除自动工资常量（原约第 535–537 行）：
+   - `WAGE_DIARY_RATE = 2.0`（日记每篇 2 CNY）
+   - `WAGE_CHAT_RATE = 1.0`（陪聊每小时 1 CNY）
+2. 删除 `cat_auto_wage()` 函数（原约第 554–562 行）—— 自动结算工资的 Python 封装层。
+
+**保留内容**：`cat_tick`、`cat_room_mischief`、`wallet_*`、`agent_outbound_*` 等函数均未动。
+
+**验证**：
+- `python -m py_compile home_system.py` ✅ 无语法错误
+- 全仓库已不含 `cat_auto_wage`、`WAGE_DIARY_RATE`、`WAGE_CHAT_RATE`、`rpc_cat_auto_wage` ✅
+
+## 钱包改造-S3 wallet_earn 增加 bypass_cap
+
+**时间**：2026-08-11
+
+**改动文件**：`home_system.py`、`server.py`
+
+**改动内容**：
+1. `home_system.py`：`wallet_earn()` 签名增加 `bypass_cap: bool = False` 参数；
+   - docstring 补充说明：`bypass_cap=True 时全额入余额、不计 week_earned、不进加班银行（用于零花钱/打赏）。`
+   - RPC 调用字典新增 `"p_bypass_cap": bool(bypass_cap),`
+2. `server.py`：MCP 工具 `wallet_earn` 签名同步增加 `bypass_cap: bool = False`；
+   - docstring 补充说明：`bypass_cap=True 时全额入账、不计周上限、不进加班银行（零花钱/打赏用）。`
+   - 底层调用改为 `_hs.wallet_earn(..., bypass_cap=bypass_cap)`
+
+**向后兼容**：`bypass_cap` 默认 `False`，不带参数调用时行为与改造前完全一致。
+
+**验证**：
+- `python -m py_compile server.py home_system.py` ✅ 无语法错误
+
+## 钱包改造-S4 rpc_wallet_earn 支持 bypass_cap（迁移）
+
+**时间**：2026-08-11
+
+**改动文件**：Supabase 迁移 `wallet_earn_bypass_cap`
+
+**改动内容**：
+1. `rpc_wallet_earn` 函数签名新增参数 `p_bypass_cap boolean DEFAULT false`。
+2. 在参数校验后、source_key 幂等前插入 bypass 逻辑：
+   - 全额进 `balance`、更新 `total_earned`
+   - **不动 `week_earned`**、**不进 `overtime_bank`**
+   - `week_start` 照常刷新
+   - 流水 `wallet_log` 照常写入 `action='income'`，`meta` 标记 `"mode":"bypass_cap"`
+3. 正常入账流水的 `meta` 改为 `p_meta || jsonb_build_object('mode','normal')`，方便与 bypass 流水分开审计。
+
+**验证**：
+- 迁移 `wallet_earn_bypass_cap` 应用成功 ✅
+- `SELECT proname, pg_get_function_arguments(oid)...` 确认 `p_bypass_cap boolean DEFAULT false` 已出现 ✅
+- Advisor (security)：无新增风险（`function_search_path_mutable` / `extension_in_public` / `anon_security_definer_function_executable` 均为历史遗留，非本阶段引入）✅
+
+## 钱包改造-S5 文档对齐（README / VARIABLES）
+
+**时间**：2026-08-11
+
+**改动文件**：`README.md`、`VARIABLES.md`
+
+**改动内容**：
+1. `README.md`：
+   - 删除“后台 Tick 系统”小节中 `- **自动工资**：日记 2 CNY/篇 + 陪聊 1 CNY/小时`
+   - `wallet_earn` 表格说明更新为“入账（幂等；bypass_cap=True 时不计周上限，用于零花钱/打赏）”
+   - 新增 `### 💸 收入来源（新版）`，说明零花钱/接活/打赏三种收入渠道及 bypass_cap 用法
+2. `VARIABLES.md`：
+   - 新增环境变量 `WALLET_ALLOWANCE_WEEKLY`（默认 25）
+   - 说明段落补充 `bypass_cap` 参数说明
+
+## 钱包改造 · 总览（S1–S5）
+
+| Segment | 文件/位置 | 改动内容 | 状态 |
+|---------|----------|----------|------|
+| S1 | `heartbeat.py` | 删除 `async_pet_house_tick` 中的「3. 自动工资结算」代码块；保留状态衰减与捣乱 | ✅ |
+| S2 | `home_system.py` | 删除 `WAGE_DIARY_RATE`、`WAGE_CHAT_RATE` 常量和 `cat_auto_wage()` 函数 | ✅ |
+| S3 | `home_system.py` + `server.py` | `wallet_earn` 新增可选参数 `bypass_cap`（默认 false）；Python 接入层透传 `p_bypass_cap` | ✅ |
+| S4 | Supabase 迁移 `wallet_earn_bypass_cap` | `rpc_wallet_earn` 函数新增 `p_bypass_cap boolean DEFAULT false`；bypass 时全额入余额、不动周上限/加班银行、流水标记 `mode=bypass_cap` | ✅ |
+| S5 | `README.md` + `VARIABLES.md` | 删除自动工资文档、更新 `wallet_earn` 说明、新增收入来源新版说明、`WALLET_ALLOWANCE_WEEKLY` 环境变量 | ✅ |
+
+**确认事项**：
+- ✅ 全仓库 Python 代码已不含 `cat_auto_wage`、`WAGE_DIARY_RATE`、`WAGE_CHAT_RATE`、`rpc_cat_auto_wage`
+- ✅ 未对数据库做任何 DROP 操作（迁移为 `CREATE OR REPLACE`）
+- ✅ 钱包余额与历史流水未动（S1 只删了 Python 层触发逻辑，S4 只改了函数定义，均未触碰现有数据）
+- ✅ 向后兼容：`bypass_cap` 默认 `false`，不带参数调用行为与改造前完全一致
+

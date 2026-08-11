@@ -386,8 +386,10 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `WALLET_OVERTIME_RATE` | ❌ | `0.5` | 超出周上限部分折算到加班银行的比率（0.5 = 超出 100 只存 50） |
 | `WALLET_BIRTHDAY_WEEK` | ❌ | `true` | 生日周（4月5日 / 11月15日所在周）是否取消上限 |
 | `WALLET_OVERTIME_WITHDRAW_MAX` | ❌ | `20` | 单次从加班银行取出的上限 |
+| `WALLET_ALLOWANCE_WEEKLY` | ❌ | `25` | 每周固定零花钱的建议默认金额（仅作 Finn 自助发放时的参考值，非强制）。 |
 
 **说明**：
+- `wallet_earn` 新增可选参数 `bypass_cap`（默认 false）；Finn 发零花钱/打赏时传 true，自行接活赚的钱传 false（正常计入周上限与加班银行）。
 - `wallet_check` / `wallet_earn` / `wallet_spend` / `wallet_exchange` / `wallet_overtime_withdraw` / `wallet_log` 六个 MCP 工具在 `server.py` 注册，调用 `home_system.py` 中对应的 DB IO 函数。
 - `wallet_exchange` 硬编码兑换率：`tea=50` / `gift=100`（单位与 `currency` 一致，默认 CNY）。
 - `source_key` 幂等：重复提交相同 `source_key` 时，`rpc_wallet_earn` 会返回 `DUPLICATE_SOURCE` 错误，防止重复入账。

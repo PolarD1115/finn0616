@@ -1418,10 +1418,11 @@ async def wallet_check():
 
 @mcp.tool()
 @mcp_error_handler
-async def wallet_earn(amount: float, source_key: str, reason: str):
-    """【小钱包·入账】向 finn_wallet 入账。source_key 用于幂等防重。"""
+async def wallet_earn(amount: float, source_key: str, reason: str, bypass_cap: bool = False):
+    """【小钱包·入账】向 finn_wallet 入账。source_key 用于幂等防重。
+    bypass_cap=True 时全额入账、不计周上限、不进加班银行（零花钱/打赏用）。"""
     def _call():
-        return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason)
+        return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason, bypass_cap=bypass_cap)
     return await asyncio.to_thread(_call)
 
 
