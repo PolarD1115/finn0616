@@ -441,6 +441,13 @@ def _role_client(role: str):
     try:
         from openai import OpenAI
         base_url = r["base_url"] or None
+        # 和 _handle_chat 保持一致的 URL 拼接逻辑：
+        # 当 base_url 是裸域名（不以 /vN 结尾）时，自动补 /v1，
+        # 避免 TG 等直接走 OpenAI 客户端的调用请求到错误的 /chat/completions 路径。
+        if base_url:
+            base = base_url.rstrip("/")
+            if not re.search(r"/chat/completions$", base) and not re.search(r"/v\d+[a-zA-Z]*$", base):
+                base_url = f"{base}/v1"
         client = OpenAI(api_key=r["api_key"], base_url=base_url, timeout=60.0)
         client.custom_model_name = r["model"]
         client.role_source = r["source"]   # 便于日志/调试
