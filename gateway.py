@@ -1027,6 +1027,11 @@ class HostFixMiddleware:
             await self._handle_profile_api(scope, receive, send, key=pkey)
             return
 
+        # ---------- 🐱 Tick 日志查询 ----------
+        if scope["path"] == "/api/ticks":
+            await self._handle_ticks_api(scope, receive, send)
+            return
+
         # ---------- 🎛️ 内置模型管理网页 ----------
         if scope["path"] == "/admin/models":
             await self._handle_admin_page(send)
@@ -2491,6 +2496,63 @@ class HostFixMiddleware:
 
         await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
 
+    # ------------------------------------------
+    # 🐱 Tick 日志查询 /api/ticks
+    # ------------------------------------------
+    async def _handle_ticks_api(self, scope, receive, send):
+        """GET /api/ticks?page=1&size=20&event=hungry_cat  → 分页查询 tick 日志"""
+        method = scope["method"]
+        sb = _get_supabase()
+        if not sb:
+            await _send_json_resp(send, 200, {"ok": False, "error": "未配置 Supabase"})
+            return
+        if method != "GET":
+            await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+            return
+        qs = scope.get("query_string", b"").decode("utf-8")
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                from urllib.parse import unquote
+                params[k] = unquote(v)
+        page = max(1, int(params.get("page", "1") or "1"))
+        size = min(100, max(1, int(params.get("size", "20") or "20")))
+        event = params.get("event", "").strip()
+
+        def _query():
+            tbl = sb.table("pet_tick_log").select(
+                "id,user_id,pet_id,ticked_at,hours_elapsed,"
+                "hunger_before,hunger_after,hunger_delta,"
+                "happiness_before,happiness_after,happiness_delta,"
+                "cleanliness_before,cleanliness_after,cleanliness_delta,"
+                "energy_before,energy_after,energy_delta,"
+                "status_before,status_after,threshold_event,skipped,skipped_reason"
+            )
+            if event:
+                tbl = tbl.eq("threshold_event", event)
+            tbl = tbl.order("ticked_at", desc=True).limit(size).offset((page - 1) * size)
+            return tbl.execute()
+
+        def _count():
+            tbl = sb.table("pet_tick_log").select("id", count="exact")
+            if event:
+                tbl = tbl.eq("threshold_event", event)
+            return tbl.execute()
+
+        try:
+            res = await asyncio.to_thread(_query)
+            cnt = await asyncio.to_thread(_count)
+        except Exception as e:
+            await _send_json_resp(send, 500, {"error": f"查询失败: {e}"})
+            return
+        rows = res.data or []
+        total = getattr(cnt, "count", len(rows)) if cnt else len(rows)
+        await _send_json_resp(send, 200, {
+            "ok": True, "items": rows, "total": total,
+            "page": page, "size": size,
+            "has_more": (page * size) < total,
+        })
 
     async def _handle_emotion_page(self, send):
         """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""

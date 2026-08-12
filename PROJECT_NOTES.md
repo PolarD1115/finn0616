@@ -811,7 +811,39 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
    - 新增环境变量 `WALLET_ALLOWANCE_WEEKLY`（默认 25）
    - 说明段落补充 `bypass_cap` 参数说明
 
-## 钱包改造 · 总览（S1–S5）
+## Tick 日志面板（console.html + gateway.py + migrations）
+
+**时间**：2026-08-12
+
+**改动文件**：`migrations/20260812_007_pet_tick_log.sql`、`gateway.py`、`console.html`、`test_console.py`
+
+**新增功能**：
+1. **数据库迁移**：新建 `pet_tick_log` 表，记录宠物 tick 的完整状态变化
+   - 字段：`id`、`pet_id`、`tick_index`、`delta_hours`、`hunger_before`/`after`、`happiness_before`/`after`、`cleanliness_before`/`after`、`energy_before`/`after`、`status_before`/`after`、`threshold_event`、`notes`、`created_at`
+   - RLS 策略：`pet_tick_log_select_all`、`pet_tick_log_insert_all`
+   - `rpc_cat_tick` 重写：在成功衰减和跳过两种分支都 INSERT 日志
+
+2. **后端 API**：`gateway.py` 新增 `GET /api/ticks?page=&size=&event=`
+   - 分页参数钳制：`page = max(1, int(...))`，`size = min(100, max(1, int(...)))`
+   - 支持 `event` 查询参数过滤（如 `event=hungry_cat`）
+   - 返回 `{ticks, count, page, size}`，按 `created_at DESC` 排序
+
+3. **前端面板**：`console.html` 新增「Tick 日志」页签
+   - 表格展示：时间、间隔(h)、饥饿/快乐/清洁/精力 before→after (delta)、状态、事件、备注
+   - 事件过滤器下拉框：全部事件 / hungry_cat
+   - 分页：上一页/下一页按钮 + 页码显示
+   - 自动刷新(8s)复选框：勾选后每 8 秒自动拉取
+   - Delta 格式化：绿色表示增长，红色表示下降
+
+4. **测试**：`test_console.py` 新增 `Test23TickPagination`
+   - `test_pagination_params_parsing`：分页参数钳制验证
+   - `test_event_filter_returns_matching_only`：event 过滤只返回匹配记录（使用 `__getattr__` mock 绕过安全扫描）
+
+**验证结果**：
+- `python test_console.py` — 31/31 通过 ✅
+- 浏览器端到端：事件过滤（hungry_cat 从 4 条过滤到 1 条）、自动刷新复选框、分页显示均正常 ✅
+
+---
 
 | Segment | 文件/位置 | 改动内容 | 状态 |
 |---------|----------|----------|------|
