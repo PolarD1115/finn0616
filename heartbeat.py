@@ -463,9 +463,8 @@ async def async_free_activity():
             if len(recent_keys) >= 2 and recent_keys[0] == recent_keys[1]:
                 avoid = recent_keys[0]
 
-            options = [f"{name}（{desc}）" for name, desc in _FREE_ACTIVITIES if name != avoid]
-            options_text = "\n".join(f"- {o}" for o in options)
-            avoid_hint = f"\n注意：你最近连着做了两次「{avoid}」，这次换点别的。" if avoid else ""
+            # 注：options/options_text/avoid_hint 的构造已搬入 tool_loop 内部
+            # （由 avoid 参数驱动），主循环不再重复构造。
 
             # ── 欲望驱动引擎（灰度）：算一拍情感→驱动→意图快照 ──
             # DESIRE_DRIVEN 关（默认）：只算 + 只存快照观测，不覆盖行为。
@@ -510,36 +509,26 @@ async def async_free_activity():
             #    让"想对方了"这类外向活动结合近况、有温度。
             system_ctx = await _build_channel_context("最近的近况、想对她说的话", channel_tag="TG_MSG")
 
-            out_names = "、".join(_OUTGOING_ACTIVITIES)
-            act_prompt = f"""
-            现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（星期{now_bj.isoweekday()}）。
-
-            这是属于你自己的一段自由时间。从下面的活动里挑一件你此刻最想做的：
-            {options_text}{avoid_hint}{desire_hint}
-
-            关于 log 字段怎么写，分两种情况：
-            - 如果你选的是【{out_names}】这类"要发消息给对方"的活动：
-              log 就写**你要直接发给对方的那句原话**（口语、自然、简短，就像平时微信发的，
-              可结合 system 里 TA 的近况，别写成"我给她发了..."这种旁白）。
-            - 其他活动：log 写第一人称"我刚才做了什么、有什么感受"的行动记录(80字内)。
-
-            只输出一行 JSON，不要多余文字：
-            {{"activity": "你选的活动名(必须是上面列出的名字之一)", "log": "按上面规则写的内容"}}
-            """
-            raw = await _ask_llm_async(client, act_prompt, system_prompt=system_ctx, temperature=0.9)
-
-            decision = _parse_decision_json(raw)
-            activity = (decision.get("activity") or "").strip()
-            log_text = (decision.get("log") or "").strip()
-
-            # 校验活动名合法
-            valid_names = {name for name, _ in _FREE_ACTIVITIES}
-            if activity not in valid_names:
-                # 模型没按格式选，兜底随机挑一个
-                activity = random.choice([n for n in valid_names if n != avoid])
-            if not log_text:
-                print("🎈 [自由活动] 行动记录为空，跳过本轮")
+            # 🛠️ 自由活动工具调用循环（v3.3 口子落地）：
+            # - FREE_ACTIVITY_TOOL_LOOP=false（默认）：内部只走阶段1（单次 LLM 出
+            #   {activity, log}），行为与改造前轻量版完全一致。
+            # - FREE_ACTIVITY_TOOL_LOOP=true：有工具的活动（如"记点小账"→wallet_*、
+            #   "逛虚拟小屋"→house_*/cat_*）会真正调用 home_system 纯函数执行副作用，
+            #   再基于真实工具结果生成 log。安全护栏：白名单 + 按 activity 动态裁剪
+            #   + JSON Schema 参数校验 + 单轮上限 + 错误隔离 + 固定身份注入。
+            import tool_loop
+            _fa_result = await tool_loop.run_free_activity_tool_loop(
+                client=client,
+                ask_llm=_ask_llm_async,
+                system_ctx=system_ctx,
+                now_bj=now_bj,
+                avoid=avoid,
+                desire_hint=desire_hint,
+            )
+            if _fa_result is None:
+                # 循环内部已打印跳过原因
                 continue
+            activity, log_text = _fa_result
 
             await asyncio.to_thread(
                 _save_memory_to_db,

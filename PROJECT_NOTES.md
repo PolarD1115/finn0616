@@ -859,3 +859,66 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
 - ✅ 钱包余额与历史流水未动（S1 只删了 Python 层触发逻辑，S4 只改了函数定义，均未触碰现有数据）
 - ✅ 向后兼容：`bypass_cap` 默认 `false`，不带参数调用行为与改造前完全一致
 
+## 自由活动 MCP 工具调用循环（v3.3 口子落地）
+
+**时间**：2026-08-12
+
+**背景**：v3.3 留的口子——自由活动（`async_free_activity`）此前是"让模型描述做了什么并写日志"的轻量实现，**未真正调用各生活工具的副作用**（选"记点小账"只是描述记账，没真扣钱；选"逛虚拟小屋"没真调 `house_look`）。本次落地为"真的执行工具"。
+
+**设计决策**（三选一已由用户拍板）：
+- **JSON 指令兼容**（非 OpenAI function-calling）：模型输出 `{activity, log}` 与 `{tool_calls:[{name,args}]}` JSON，任何 background 角色模型都能用（含便宜的硅基流动 Qwen），不依赖 `tools=` 参数。
+- **按 activity 动态裁剪**：每个活动只暴露 `ACTIVITY_TOOL_MAP` 里登记的工具（如"记点小账"只暴露 `wallet_*`、"逛虚拟小屋"只暴露 `house_*`/`cat_*`），prompt 短、误调风险低。
+- **两阶段循环**：阶段1 选 activity+草稿 log → 阶段2 模型基于该 activity 的工具 schema 出 tool_calls → 阶段2b 执行（上限 N，错误隔离）→ 阶段3 基于真实工具结果生成最终 log。
+
+**新增文件**：
+
+| 文件 | 说明 |
+|------|------|
+| `tool_loop.py` | 工具循环主体：`TOOL_REGISTRY`（18 个工具含 schema+callable+fixed_args）+ `ACTIVITY_TOOL_MAP`（10 活动→工具裁剪）+ `call_tool`（白名单+参数校验+固定身份注入+错误隔离）+ `run_free_activity_tool_loop`（两阶段编排） |
+| `test_tool_loop.py` | 49 项单元测试（unittest + mock，不触生产数据） |
+
+**修改文件**：
+
+| 文件 | 改动 |
+|------|------|
+| `heartbeat.py` | `async_free_activity` 中间段（原 `act_prompt` + 单次 LLM + JSON 解析 + 兜底）替换为 `tool_loop.run_free_activity_tool_loop(...)` 调用；清理死变量 `options/options_text/avoid_hint`（已搬入 tool_loop）。主循环骨架不变：间隔/防重复/欲望驱动注入/外向推送/写 memories/satisfy 全保留。 |
+| `VARIABLES.md` | 新增 `12.2 自由活动 + 工具调用循环`：`FREE_ACTIVITY_ENABLED` / `FREE_ACTIVITY_INTERVAL` / `FREE_ACTIVITY_TOOL_LOOP` / `FREE_ACTIVITY_TOOL_MAX_CALLS` |
+
+**未改文件**（零侵入复用）：
+- `server.py`：`@mcp.tool()` 工具不动；已验证 FastMCP v1 `@mcp.tool()` 返回原 async 函数，`tool_loop` 对 `save_memory`/`search_memory` 通过延迟 `import server; getattr(...)` 直接 await 调用。
+- `gateway.py` / `home_system.py`：完全不动。`tool_loop` 复用 `home_system` 的纯函数（`_hs.wallet_*` / `_hs.house_*` / `_hs.cat_*`），`wallet_id`/`user_id` 等固定身份由 `fixed_args` 注入，不让 LLM 控制。
+
+**安全护栏**：
+
+| 护栏 | 实现 |
+|------|------|
+| 工具白名单 | `TOOL_REGISTRY` 登记 `wallet_check`/`wallet_earn`/`wallet_spend`/`wallet_log`/`house_*`/`cat_*`/`save_memory`/`search_memory` 共 18 个；模型乱编名字 → `call_tool` 返回 `不在白名单` |
+| 活动二次裁剪 | `ACTIVITY_TOOL_MAP[activity]` 之外的即不暴露也不执行；跨活动工具（如"记点小账"里调 `house_look`）被拒 |
+| 参数校验 | JSON Schema `required` + `type` + `enum` 基础校验；缺字段/类型错/enum 非法 → 拒 |
+| 单轮上限 | `FREE_ACTIVITY_TOOL_MAX_CALLS`（默认 5）防 LLM 刷工具；超出截断 |
+| 错误隔离 | 单个工具失败只写 `result.text="❌..."`，不中断循环、不崩心跳 |
+| 幂等保护 | `wallet_earn` 依赖现有 `source_key` 唯一索引；其他写操作天然可重复 |
+| 固定身份 | `wallet_id=finn_wallet` / `user_id=user_finn` 由 `fixed_args` 注入，LLLM 不可控 |
+| 灰度 | `FREE_ACTIVITY_TOOL_LOOP=false`（默认）→ 所有活动退化到现状轻量版（只走阶段1），零行为变化 |
+
+**验证结果**：
+- `python -m py_compile tool_loop.py heartbeat.py test_tool_loop.py` ✅
+- `python -m unittest test_tool_loop -v` — **49/49 通过** ✅
+- 全套回归（`test_wallet`/`test_house`/`test_cat`/`test_cat_tick`/`test_console`）见下
+- `FREE_ACTIVITY_TOOL_LOOP=false`（默认）时 `async_free_activity` 行为与改造前完全一致（阶段1 单次 LLM 出 `{activity, log}` → 写库/推送）✅
+
+**ACTIVITY_TOOL_MAP 映射**：
+
+| 活动 | 可调工具 |
+|------|---------|
+| 写秘密日记 | `save_memory` |
+| 逛虚拟小屋 | `house_look`/`house_do`/`house_put`/`house_take`/`house_update_desc`/`cat_status`/`cat_pet`/`cat_play`/`cat_feed`/`cat_clean`/`cat_restore_energy`/`cat_shop_list` |
+| 查天气 | （无工具，退化轻量版） |
+| 抽张塔罗 | （无工具） |
+| 翻旧回忆 | `search_memory` |
+| 发呆放空 | （无工具） |
+| 记点小账 | `wallet_check`/`wallet_spend`/`wallet_earn`/`wallet_log` |
+| 想对方了 | （无工具，外向推送走主循环 `_push_wechat`） |
+| 分享发现 | `search_memory` |
+| 偷偷关心 | （无工具） |
+
