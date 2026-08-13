@@ -25,6 +25,13 @@ import time
 import datetime
 import requests
 
+# ---------- 日志静音：屏蔽 httpx 的 "HTTP Request: ..." 请求噪音 ----------
+# supabase-py 底层 (postgrest→httpx) 在 INFO 级别逐条打印数据库请求日志
+#   HTTP Request: GET https://xxx.supabase.co/rest/v1/... "HTTP/2 200 OK"
+# 把 httpx 日志级别抬到 WARNING，只保留网关自己的活动日志（宠物 tick / 聊天注入等）。
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ==========================================
 # 全局连接（延迟初始化，避免启动时无 Supabase 就崩）
 # ==========================================

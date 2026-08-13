@@ -69,6 +69,14 @@ ORIGINAL_ENV = dict(os.environ)
 # 🛡️ 接口安全密钥：所有 /api/* 接口必须校验（防止未授权调用）
 API_SECRET = os.environ.get("API_SECRET", "").strip()
 
+# ---------- 日志静音：屏蔽库的 "HTTP Request: ..." 请求噪音 ----------
+# supabase-py 底层走 httpx，会在 INFO 级别逐条打印
+#   HTTP Request: GET https://xxx.supabase.co/rest/v1/user_facts?select=value... "HTTP/2 200 OK"
+# 这类数据库访问日志。把 httpx 日志级别抬到 WARNING 后不再输出，
+# 只保留网关自己的活动日志（宠物 tick / 聊天注入等 print 输出）。
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ---------- 数据库客户端 (Supabase) ----------
 supabase = None
 try:
@@ -1907,4 +1915,6 @@ if __name__ == "__main__":
 
     app = HostFixMiddleware(mcp_http_app)
     print(f"🚀 Generic MCP Gateway running on port {port}... (MCP transport: {_mcp_transport})")
-    uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+    # access_log=False：关掉 uvicorn 自带访问日志（INFO: ... - "GET /health HTTP/1.1" 200 OK），
+    # 与上方 httpx 静音配合，日志只保留网关自己的活动输出（宠物 tick / 聊天注入等）。
+    uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*", access_log=False)
