@@ -1215,6 +1215,19 @@ class HostFixMiddleware:
             _HAS_WEATHER_TOOLS and weather_tools is not None and weather_tools.enabled()
             and os.environ.get("WEATHER_TOOL_LOOP", "false").strip().lower() in ("1", "true", "yes")
         )
+        # 🛡️ 请求已带客户端工具（非天气工具）时不接管 tool loop——网关无法本地执行这些工具，
+        # 强行接管会把客户端工具调用误判为 Unknown tool 耗尽轮次，最终给出误导性报错。
+        # 交还客户端自行执行 function-call，天气能力仍由 WEATHER_KEYWORD_INJECT 关键词注入保障。
+        if _weather_loop and isinstance(req_data.get("tools"), list):
+            _client_tools = [
+                t.get("function", {}).get("name", "")
+                for t in req_data["tools"]
+                if isinstance(t, dict) and t.get("type") == "function"
+                and t.get("function", {}).get("name", "") not in weather_tools.TOOL_NAMES
+            ]
+            if _client_tools:
+                _log(f"➡️ [Weather] 请求已带客户端工具 {_client_tools}，跳过网关 tool loop（交还客户端执行）")
+                _weather_loop = False
         if _weather_loop:
             try:
                 weather_tools.merge_tools_into_request(req_data)
@@ -1610,6 +1623,8 @@ class HostFixMiddleware:
             return
 
         max_rounds = weather_tools.max_tool_rounds()
+        # 循环耗尽 / 遇到无法执行的工具时的中性兜底文案（避免误导性的"天气工具调用次数达上限"）
+        _TOOL_LOOP_FALLBACK_TEXT = "（工具调用未能在限定轮次内完成，请稍后重试或换种方式提问）"
         client_headers = {
             k.decode("utf-8", "ignore").lower(): v.decode("utf-8", "ignore")
             for k, v in scope.get("headers", [])
@@ -1672,6 +1687,18 @@ class HostFixMiddleware:
                 collected_reasoning += str(message.get("reasoning_content") or "")
 
             if tool_calls:
+                # 🛡️ 防御：模型调用了网关无法本地执行的工具（客户端 web_search / mcp__* 或幻觉出的工具名）。
+                # 继续执行只会得到 Unknown tool 反馈空耗轮次，提前退出并把已收集内容交还客户端。
+                _unknown = [
+                    (tc.get("function") or {}).get("name", "?")
+                    for tc in tool_calls
+                    if not weather_tools.is_weather_tool_call(tc)
+                ]
+                if _unknown:
+                    _log(f"⚠️ [WeatherLoop] 检测到网关无法执行的工具 {_unknown}，退出循环交还客户端")
+                    final_text = collected_content or _TOOL_LOOP_FALLBACK_TEXT
+                    break
+
                 assistant_msg = {"role": "assistant", "tool_calls": tool_calls}
                 if content:
                     assistant_msg["content"] = content
@@ -1697,7 +1724,7 @@ class HostFixMiddleware:
             collected_content = final_text
             break
         else:
-            final_text = collected_content or "（天气工具调用次数已达上限，请稍后再试）"
+            final_text = collected_content or _TOOL_LOOP_FALLBACK_TEXT
 
         await self._sse_final_text(send, req_data, final_text)
 
