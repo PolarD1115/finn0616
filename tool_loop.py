@@ -86,14 +86,18 @@ TOOL_REGISTRY: dict[str, dict] = {
         "fixed_args": {"wallet_id": _hs.DEFAULT_WALLET_ID},
     },
     "wallet_earn": {
-        "description": "钱包入账（如往储蓄罐存心意/记账收入）。bypass_cap=true 时不计周上限（零花钱/打赏），接活赚钱传 false",
+        "description": "钱包入账（往储蓄罐存收入）。"
+            "bypass_cap=false（默认）：接活赚钱，计入周上限80元，超额部分按50%进加班银行。"
+            "适用场景：完成自主任务后领取报酬，如写随笔/观察笔记/短篇(5-10元)、研究话题整理笔记(8-15元)、给小屋做建设(5-12元)。"
+            "bypass_cap=true：不计周上限、不进加班银行。适用场景：每周零花钱(source_key=allowance_YYYYW##)、打赏(source_key=tip_<时间戳>)。"
+            "source_key 用于幂等防重，相同 source_key 重复调用会被拒绝。",
         "parameters": {
             "type": "object",
             "properties": {
                 "amount": {"type": "number", "description": "金额（CNY）"},
-                "source_key": {"type": "string", "description": "唯一标识防重复入账，如 tip_20260812_001"},
+                "source_key": {"type": "string", "description": "唯一标识防重复入账，如 task_essay_20260814_001 或 allowance_2026W33"},
                 "reason": {"type": "string", "description": "入账理由"},
-                "bypass_cap": {"type": "boolean", "description": "是否不计周上限"},
+                "bypass_cap": {"type": "boolean", "description": "false=接活赚钱(计周上限)，true=零花钱/打赏(不计周上限)"},
             },
             "required": ["amount", "source_key", "reason"],
         },

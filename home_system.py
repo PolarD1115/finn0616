@@ -26,6 +26,10 @@ WALLET_OVERTIME_RATE = float(os.environ.get("WALLET_OVERTIME_RATE", "0.5"))
 WALLET_BIRTHDAY_WEEK = os.environ.get("WALLET_BIRTHDAY_WEEK", "true").strip().lower() in ("1", "true", "yes")
 WALLET_OVERTIME_WITHDRAW_MAX = float(os.environ.get("WALLET_OVERTIME_WITHDRAW_MAX", "20"))
 
+# 每周零花钱参考金额（bypass_cap，不计周上限）。仅作 wallet_allowance() 默认值，
+# 非强制。注意：wallet_allowance() 目前无调用方，为未来定时自动发放扩展备用。
+WALLET_ALLOWANCE_WEEKLY = float(os.environ.get("WALLET_ALLOWANCE_WEEKLY", "25"))
+
 # 默认钱包 ID（阶段 1 seed 的 singleton）
 DEFAULT_WALLET_ID = "finn_wallet"
 
@@ -189,6 +193,52 @@ def wallet_earn(wallet_id: str, amount: float, source_key: str, reason: str, met
         "p_overtime_rate": WALLET_OVERTIME_RATE,
         "p_birthday_enabled": WALLET_BIRTHDAY_WEEK,
         "p_bypass_cap": bool(bypass_cap),
+    })
+
+
+def _iso_week_label(dt: datetime.datetime) -> str:
+    """计算 ISO 周标签，格式 YYYYW##（如 2026W33）。
+    北京时间（UTC+8）为准，与 console.html 端 JS 计算保持一致。"""
+    bj = dt + datetime.timedelta(hours=8)
+    iso_year, iso_week, _ = bj.isocalendar()
+    return f"{iso_year}W{iso_week:02d}"
+
+
+def wallet_allowance(wallet_id: str = DEFAULT_WALLET_ID,
+                     amount: float | None = None,
+                     week_label: str | None = None) -> dict:
+    """发放每周零花钱（bypass_cap=True，不计周上限、不进加班银行）。
+
+    source_key = "allowance_<YYYYW##>"，同一周幂等防重（重复发放会被拒绝）。
+    amount 默认 WALLET_ALLOWANCE_WEEKLY（25），week_label 默认自动算当前 ISO 周。
+
+    注意：此函数目前无调用方，为未来定时自动发放扩展备用。
+    当前每周零花钱由用户通过 console.html 面板手动触发，或由 AI 自行调用 wallet_earn。
+    """
+    amt = float(amount) if amount is not None else WALLET_ALLOWANCE_WEEKLY
+    ok, err = _validate_amount(amt)
+    if not ok:
+        return _format_result(False, "金额非法", error_code=err)
+
+    # ISO 周标签：外部传入优先，否则自动计算
+    if week_label is None:
+        week_label = _iso_week_label(datetime.datetime.utcnow())
+    else:
+        week_label = str(week_label).strip()
+
+    source_key = f"allowance_{week_label}"
+    reason = f"本周零花钱（{week_label}）"
+
+    return _rpc("rpc_wallet_earn", {
+        "p_wallet_id": wallet_id,
+        "p_amount": amt,
+        "p_source_key": source_key,
+        "p_reason": reason,
+        "p_meta": {"type": "allowance", "week": week_label},
+        "p_week_cap": WALLET_WEEK_CAP,
+        "p_overtime_rate": WALLET_OVERTIME_RATE,
+        "p_birthday_enabled": WALLET_BIRTHDAY_WEEK,
+        "p_bypass_cap": True,
     })
 
 

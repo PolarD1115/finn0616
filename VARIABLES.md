@@ -399,7 +399,7 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `WALLET_OVERTIME_RATE` | ❌ | `0.5` | 超出周上限部分折算到加班银行的比率（0.5 = 超出 100 只存 50） |
 | `WALLET_BIRTHDAY_WEEK` | ❌ | `true` | 生日周（4月5日 / 11月15日所在周）是否取消上限 |
 | `WALLET_OVERTIME_WITHDRAW_MAX` | ❌ | `20` | 单次从加班银行取出的上限 |
-| `WALLET_ALLOWANCE_WEEKLY` | ❌ | `25` | 每周固定零花钱的建议默认金额（仅作 Finn 自助发放时的参考值，非强制）。 |
+| `WALLET_ALLOWANCE_WEEKLY` | ✅ | `25` | 每周固定零花钱的默认金额。已由 `home_system.py` 的 `WALLET_ALLOWANCE_WEEKLY` 读取，作为 `wallet_allowance()` 函数的默认金额。当前 `wallet_allowance()` 无调用方（备用扩展），实际发放由 console.html 面板或 AI 调用 `wallet_earn(bypass_cap=True)` 触发。 |
 
 **说明**：
 - `wallet_earn` 新增可选参数 `bypass_cap`（默认 false）；Finn 发零花钱/打赏时传 true，自行接活赚的钱传 false（正常计入周上限与加班银行）。

@@ -55,7 +55,7 @@
 
 ### 💸 收入来源（新版）
 
-- **零花钱**：Finn 每周手动给自己发一次，调用 `wallet_earn(amount, source_key="allowance_<年W周>", reason="本周零花钱", bypass_cap=True)`，金额由 Finn 定（建议 20~30，参考 `WALLET_ALLOWANCE_WEEKLY`）。不占周上限、不进加班银行。
+- **零花钱**：Finn 每周手动给自己发一次，调用 `wallet_earn(amount, source_key="allowance_YYYYW##", reason="本周零花钱", bypass_cap=True)`，金额由 Finn 定（建议 20~30，参考 `WALLET_ALLOWANCE_WEEKLY`）。不占周上限、不进加班银行。`YYYYW##` 为 ISO 周标签（如 `2026W33`），北京时间（UTC+8）为准，Python 端 `_iso_week_label()` 与 console.html 端 `_isoWeekLabel()` 格式对齐。也可通过 console.html 面板「发零花钱」按钮手动触发。
 - **接活赚钱**：Finn 自己挑时间、挑任务（写非日记的文章 / 整理话题笔记 / 给小屋建模做建设），完成后调用 `wallet_earn(amount, source_key="task_<唯一id>", reason="<任务标题>")`（不带 `bypass_cap`），按难度 5~15 元，正常计入周上限与加班银行。
 - **打赏**：你觉得 Finn 哪里做得好可以打赏，`wallet_earn(amount, source_key="tip_<唯一id>", reason="打赏：<理由>", bypass_cap=True)`，金额随意，非主要收入。
 - **日记与陪聊不再产生任何收入**；收入由 Finn 自己决定干不干活、干什么、干完自己领。
