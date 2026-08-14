@@ -681,7 +681,8 @@ async def async_telegram_polling():
             return
 
         try:
-            system_ctx = await _build_channel_context(text, channel_tag="TG_MSG")
+            import gateway as _gw
+            system_ctx = await _build_channel_context(text, channel_tag="TG_MSG", inject_device=_gw._device_context_enabled())
             _tg_log(f"准备调用主模型 chat={chat_label} system上下文={len(system_ctx)}字")
             prompt = f"""
             用户发来消息: {text}

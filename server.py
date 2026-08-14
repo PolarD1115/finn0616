@@ -33,6 +33,7 @@ import datetime
 import requests
 from functools import wraps
 from email.mime.text import MIMEText
+from typing import Optional
 
 import uvicorn
 
@@ -581,7 +582,7 @@ def _query_weather_hit(text: str) -> bool:
     return False
 
 
-async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -> str:
+async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", inject_device: Optional[bool] = None) -> str:
     """
     🧠 全渠道智能体上下文（TG / QQ 渠道注入用）
     与网页渠道 /v1/chat/completions 的 _inject_context 对齐，统一注入：
@@ -643,7 +644,13 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
                                      filters={"user_id": user_id}, limit=5))
 
     # 6. 设备状态快照（复用 gateway 渲染，可开关）
-    if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
+    #    inject_device=None（后台自主活动调用）→ 沿用环境变量 DEVICE_CONTEXT_ENABLED，保持后台行为不变；
+    #    inject_device 显式传值（前台 TG/QQ 调用）→ 受控制台开关 device_context_enabled 控制（仅影响前台聊天）。
+    if inject_device is None:
+        _dev_on = os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    else:
+        _dev_on = inject_device
+    if _dev_on:
         try:
             import gateway as _gw
             if supabase:
@@ -1610,6 +1617,27 @@ async def house_update_desc(room_id: str, description: str):
     """
     def _call():
         return _hs.house_update_desc(room_id, description)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 📱 设备数据查询
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def device_status():
+    """【设备状态查询】查询手机最新上报的设备状态快照，包括位置、前台应用、健康数据（心率/步数/血氧/睡眠等）、应用使用 Top5、最近通知、设备事件。无需参数，返回最新一条 device_data 记录的渲染文本；数据由用户手机端定期上报。
+    注意：本工具是 AI 按需主动查询，不受控制台「设备数据注入」开关影响（该开关只控制是否把设备快照自动注入到对话上下文）。"""
+    def _call():
+        if not supabase:
+            return "❌ 数据库未连接"
+        try:
+            import gateway as _gw
+            snap = _gw._fetch_device_snapshot(supabase)
+            return snap or "（暂无设备数据上报，手机端可能尚未上传或已离线）"
+        except Exception as e:
+            return f"❌ 设备数据查询失败: {e}"
     return await asyncio.to_thread(_call)
 
 

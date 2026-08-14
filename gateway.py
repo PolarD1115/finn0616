@@ -514,6 +514,8 @@ def _default_runtime_config() -> dict:
         "desire_driven": os.environ.get("DESIRE_DRIVEN", "false").strip().lower() in ("1", "true", "yes", "on"),
         "chat_history_write_enabled": True,
         "vector_memory_injection_enabled": True,
+        # 设备状态快照注入：仅前台聊天门控（后台自主活动仍走 DEVICE_CONTEXT_ENABLED 环境变量）
+        "device_context_enabled": True,
     }
 
 
@@ -587,6 +589,16 @@ def _chat_write_enabled() -> bool:
 def _vector_injection_enabled() -> bool:
     """向量记忆检索注入门控（构建 prompt 时跳过 Pinecone 检索）。"""
     return _get_runtime_config().get("vector_memory_injection_enabled", True)
+
+
+def _device_context_enabled() -> bool:
+    """设备状态快照注入门控（仅前台聊天生效，不影响后台自主活动）。
+
+    前台渠道（网页 _inject_context / TG / QQ 的 _build_channel_context）读取此开关；
+    后台自主活动（主动问候 / 自由活动）调用 _build_channel_context 时不传 inject_device，
+    仍沿用 DEVICE_CONTEXT_ENABLED 环境变量，不受此开关影响。
+    """
+    return _get_runtime_config().get("device_context_enabled", True)
 
 
 def _config_source_of(key: str) -> str:
@@ -1507,9 +1519,10 @@ class HostFixMiddleware:
         except Exception:
             channel_display = chat_tag
 
-        # 🆕 设备状态快照（device_data 最新一条，含更新时间标注；可开关）
+        # 🆕 设备状态快照（device_data 最新一条，含更新时间标注）
+        #    前台开关门控：device_context_enabled=false 时跳过（仅影响前台聊天）。
         device_snapshot = ""
-        if os.environ.get("DEVICE_CONTEXT_ENABLED", "true").strip().lower() not in ("0", "false", "no"):
+        if _device_context_enabled():
             try:
                 device_snapshot = _fetch_device_snapshot(sb)
             except Exception as e:
@@ -2326,7 +2339,7 @@ class HostFixMiddleware:
 
             allowed = {"telegram_enabled", "qq_enabled", "emotion_enabled",
                        "desire_driven", "chat_history_write_enabled",
-                       "vector_memory_injection_enabled"}
+                       "vector_memory_injection_enabled", "device_context_enabled"}
             bad = [k for k in patch if k not in allowed]
             if bad:
                 await _send_json_resp(send, 400, {"error": f"不允许的字段: {', '.join(bad)}", "allowed": sorted(allowed)})
@@ -2430,7 +2443,8 @@ class HostFixMiddleware:
             "process": process,
             "config_sources": {k: _config_source_of(k) for k in (
                 "telegram_enabled", "qq_enabled", "emotion_enabled", "desire_driven",
-                "chat_history_write_enabled", "vector_memory_injection_enabled")},
+                "chat_history_write_enabled", "vector_memory_injection_enabled",
+                "device_context_enabled")},
             "recent_logs": recent_logs,
         })
 

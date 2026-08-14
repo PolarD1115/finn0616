@@ -416,6 +416,11 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
           <div class="hint">关闭后，网页/Telegram/QQ 三个渠道构建 prompt 时都跳过 Pinecone 检索。不影响普通 user_facts 画像注入、Core_Cognition 注入、Pinecone 数据本身。</div>
         </div>
         <div class="card">
+          <h3>设备数据注入 <span class="sub" id="dcSrc"></span></h3>
+          <div id="dcToggle"></div>
+          <div class="hint">控制前台聊天（网页/Telegram/QQ）是否自动把手机最新设备状态（位置、前台应用、健康、睡眠、通知等）注入对话上下文。关闭后前台对话不再自动附带设备快照，但 AI 仍可通过「设备状态查询」工具主动查询。不影响后台自主活动（主动问候/自由活动仍按 DEVICE_CONTEXT_ENABLED 环境变量注入）。</div>
+        </div>
+        <div class="card">
           <h3>安全重启 <span class="sub">部分进程级配置需重启生效</span></h3>
           <div class="hint">所有开关均为运行时读取（5s 热生效），无需重启。仅当修改环境变量（.env）或 NapCat 连接参数时才需要重启进程。</div>
         </div>
@@ -980,10 +985,13 @@ async function loadStorage(){
     const cfg=d.config||{};
     const cw=cfg.chat_history_write_enabled||{};
     const vi=cfg.vector_memory_injection_enabled||{};
+    const dc=cfg.device_context_enabled||{};
     document.getElementById("cwSrc").textContent="来源: "+cw.source+" · "+(cw.hot_effective?"已热生效":"需重启");
     document.getElementById("viSrc").textContent="来源: "+vi.source+" · "+(vi.hot_effective?"已热生效":"需重启");
+    document.getElementById("dcSrc").textContent="来源: "+dc.source+" · "+(dc.hot_effective?"已热生效":"需重启");
     document.getElementById("cwToggle").innerHTML=toggleRow("chat_history_write_enabled","聊天记录写入",cw.value,"",cw.value,cw.source);
     document.getElementById("viToggle").innerHTML=toggleRow("vector_memory_injection_enabled","向量记忆检索注入",vi.value,"",vi.value,vi.source);
+    document.getElementById("dcToggle").innerHTML=toggleRow("device_context_enabled","设备数据注入",dc.value,"",dc.value,dc.source);
     refreshIcons();
   }catch(e){document.getElementById("cwToggle").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
 }

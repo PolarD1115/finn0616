@@ -338,7 +338,8 @@ def _get_qq_aggregator(send):
             return
 
         try:
-            system_ctx = await dep._build_channel_context(text, channel_tag="QQ_MSG")
+            import gateway as _gw
+            system_ctx = await dep._build_channel_context(text, channel_tag="QQ_MSG", inject_device=_gw._device_context_enabled())
             prompt = f"""
             收到一条 QQ 消息: {text}
             发送者: {sender_nick}
