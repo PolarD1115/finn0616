@@ -927,6 +927,28 @@ class _ThinkingTagRewriter:
         return out
 
 
+# 🆕 天气工具（软导入）：关键词注入 + 可选 tool loop
+# 软导入：漏传 weather_tools.py 时网关仍可启动
+try:
+    import weather_tools  # type: ignore
+    _HAS_WEATHER_TOOLS = True
+except ImportError:
+    weather_tools = None  # type: ignore
+    _HAS_WEATHER_TOOLS = False
+    print("[Weather] 未找到 weather_tools.py，天气关键词注入已降级关闭")
+
+# 天气关键词（子串匹配；"好热啊"/"好冷啊"可命中）
+_WEATHER_KEYWORDS = ("天气", "几度", "下雨", "下雪", "出门", "带伞", "穿什么",
+                     "冷不冷", "热不热", "气温", "多少度", "会不会下雨", "好热", "好冷")
+
+
+def _weather_keyword_hit(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in text or k in t for k in _WEATHER_KEYWORDS)
+
+
 class HostFixMiddleware:
     """ASGI 中间件：路由分发 + OpenAI 兼容代理 + MCP 下游转发"""
 
@@ -1187,6 +1209,22 @@ class HostFixMiddleware:
         else:
             if sb:
                 _log("➡️ [透传] 无 user 消息或无 Supabase，直接转发")
+
+        # 🌤️ 可选天气 tool loop（默认关 WEATHER_TOOL_LOOP=false）：开启时注入 schema + 走本地 function-call 循环
+        _weather_loop = (
+            _HAS_WEATHER_TOOLS and weather_tools is not None and weather_tools.enabled()
+            and os.environ.get("WEATHER_TOOL_LOOP", "false").strip().lower() in ("1", "true", "yes")
+        )
+        if _weather_loop:
+            try:
+                weather_tools.merge_tools_into_request(req_data)
+            except Exception as e:
+                _log(f"⚠️ [Weather] tools 注入失败: {e}")
+                _weather_loop = False
+            if _weather_loop and req_data.get("tools"):
+                await self._handle_chat_with_tool_loop(scope, send, req_data, upstream_url, upstream_key, sb, user_msg)
+                return
+        # 关闭时：不注入 tools，纯流式透传（天气已由关键词注入到 volatile_block）
 
         # 强制流式（便于边透传边收集）
         req_data["stream"] = True
@@ -1495,6 +1533,26 @@ class HostFixMiddleware:
             f"📡 当前聊天渠道：{channel_display}"
         )
 
+        # 🌤️ 关键词命中：主动拉真实天气（用户GPS）注入 volatile_block，保流式零中断
+        if (_HAS_WEATHER_TOOLS and weather_tools is not None
+                and os.environ.get("WEATHER_KEYWORD_INJECT", "true").strip().lower() == "true"
+                and _weather_keyword_hit(current_query) and sb):
+            try:
+                _w = await asyncio.wait_for(
+                    asyncio.to_thread(weather_tools.get_weather, None, sb), timeout=6
+                )
+                if _w.get("success"):
+                    volatile_block += (
+                        f"\n🌤️ 实时天气（用户当前定位）: "
+                        f"{_w.get('city','?')} {_w.get('description','')} "
+                        f"{_w.get('temperature','')} 体感{_w.get('feels_like','')} "
+                        f"湿度{_w.get('humidity','')} "
+                        f"{_w.get('wind_direction','')}{_w.get('wind_speed','')}"
+                    )
+                    _log(f"🌤️ [Weather] 关键词命中，已注入天气（{_w.get('city','?')}）")
+            except Exception as e:
+                _log(f"⚠️ [Weather] 关键词天气注入失败: {e}")
+
         # ① 注入稳定前缀到 system：已有 system 就「前置」拼接（保证稳定内容仍在最前，
         #    维持缓存前缀不被前端自带 system 内容顶开），没有就插入到最前。
         has_system = False
@@ -1536,6 +1594,157 @@ class HostFixMiddleware:
             msgs.append(volatile_msg)
 
         _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
+
+    # ------------------------------------------
+    # 🌤️ 天气 tools 循环（OpenAI function calling，可选）
+    # ------------------------------------------
+
+    async def _handle_chat_with_tool_loop(self, scope, send, req_data, upstream_url, upstream_key, sb, user_msg):
+        """
+        OpenAI tools 循环：模型 tool_call → 网关本地执行 weather_tools → 回灌 role=tool → 再请求，
+        直到模型给出最终文本，再以 SSE 形式回给客户端。兼容现有流式前端。
+        """
+        import copy
+        if not _HAS_WEATHER_TOOLS or weather_tools is None:
+            await self._sse_plain_error(send, req_data, "[Weather] weather_tools 未加载")
+            return
+
+        max_rounds = weather_tools.max_tool_rounds()
+        client_headers = {
+            k.decode("utf-8", "ignore").lower(): v.decode("utf-8", "ignore")
+            for k, v in scope.get("headers", [])
+        }
+        client_ua = client_headers.get("user-agent", "")
+        fwd_headers = {
+            "Authorization": f"Bearer {upstream_key}",
+            "Content-Type": "application/json",
+            "User-Agent": client_ua or "Mozilla/5.0 (compatible; mcp-gateway-weather/1.2)",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+        }
+
+        messages = list(req_data.get("messages") or [])
+        base_payload = copy.deepcopy(req_data)
+        base_payload.pop("stream", None)
+
+        collected_content = ""
+        collected_reasoning = ""
+        tool_calls_dict = {}
+        final_text = ""
+
+        for round_i in range(max_rounds):
+            payload = copy.deepcopy(base_payload)
+            payload["messages"] = messages
+            payload["stream"] = False
+            if payload.get("tools") and "tool_choice" not in payload:
+                payload["tool_choice"] = "auto"
+
+            _log(f"🌤️ [WeatherLoop] round={round_i + 1}/{max_rounds} messages={len(messages)}")
+
+            try:
+                def _do_post():
+                    return requests.post(upstream_url, headers=fwd_headers, json=payload, timeout=120)
+                resp = await asyncio.to_thread(_do_post)
+                status = resp.status_code
+                text = resp.text
+            except Exception as e:
+                _log(f"❌ [WeatherLoop] 上游请求失败: {e}")
+                await self._sse_plain_error(send, req_data, f"[连接错误] {e}")
+                return
+
+            if status != 200:
+                _log(f"❌ [WeatherLoop] 上游 HTTP {status}: {text[:300]}")
+                await self._sse_plain_error(send, req_data, f"[上游错误 HTTP {status}] {text[:200]}")
+                return
+
+            try:
+                data = json.loads(text)
+            except Exception:
+                await self._sse_plain_error(send, req_data, "[上游错误] 非 JSON 响应")
+                return
+
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            tool_calls = message.get("tool_calls") or []
+
+            if message.get("reasoning_content"):
+                collected_reasoning += str(message.get("reasoning_content") or "")
+
+            if tool_calls:
+                assistant_msg = {"role": "assistant", "tool_calls": tool_calls}
+                if content:
+                    assistant_msg["content"] = content
+                messages.append(assistant_msg)
+                for tc in tool_calls:
+                    tool_calls_dict[len(tool_calls_dict)] = tc
+                try:
+                    tool_msgs = weather_tools.run_tool_calls(tool_calls, sb)
+                except Exception as e:
+                    tool_msgs = [{
+                        "role": "tool",
+                        "tool_call_id": (tool_calls[0].get("id") if tool_calls else "err"),
+                        "content": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False),
+                    }]
+                for tm in tool_msgs:
+                    messages.append(tm)
+                    _log(f"🌤️ [WeatherLoop] executed {tm.get('name') or tm.get('tool_call_id')}")
+                if round_i >= max_rounds - 1:
+                    base_payload["tool_choice"] = "none"
+                continue
+
+            final_text = content or ""
+            collected_content = final_text
+            break
+        else:
+            final_text = collected_content or "（天气工具调用次数已达上限，请稍后再试）"
+
+        await self._sse_final_text(send, req_data, final_text)
+
+        if sb and user_msg and (collected_content or tool_calls_dict):
+            asyncio.create_task(
+                self._save_conversation(sb, user_msg, collected_content, collected_reasoning, tool_calls_dict)
+            )
+
+    async def _sse_final_text(self, send, req_data, text: str):
+        """把最终文本包装成 OpenAI SSE，兼容现有流式客户端。"""
+        model = req_data.get("model", "unknown")
+        created = int(time.time())
+        chunk_id = f"chatcmpl-weather-{created}"
+
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"text/event-stream; charset=utf-8"),
+                (b"cache-control", b"no-cache, no-transform"),
+                (b"connection", b"keep-alive"),
+                (b"access-control-allow-origin", b"*"),
+                (b"x-accel-buffering", b"no"),
+            ],
+        })
+
+        def _chunk(delta, finish_reason=None):
+            return (
+                "data: " + json.dumps({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                }, ensure_ascii=False) + "\n\n"
+            ).encode("utf-8")
+
+        await send({"type": "http.response.body", "body": _chunk({"role": "assistant"}), "more_body": True})
+        if text:
+            step = 400
+            for i in range(0, len(text), step):
+                await send({"type": "http.response.body", "body": _chunk({"content": text[i:i + step]}), "more_body": True})
+        await send({"type": "http.response.body", "body": _chunk({}, "stop") + b"data: [DONE]\n\n", "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _sse_plain_error(self, send, req_data, err: str):
+        await self._sse_final_text(send, req_data, f"\n\n{err}")
 
     async def _save_conversation(self, sb, user_msg, ai_msg, reasoning, tool_calls):
         """异步把本轮对话存到 Supabase memories 表 + Pinecone"""

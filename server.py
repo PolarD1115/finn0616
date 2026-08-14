@@ -91,6 +91,15 @@ except Exception as e:
 # ---------- 小屋/小满/小钱包 业务模块 ----------
 import home_system as _hs
 
+# 🌤️ 天气工具（软导入：漏传 weather_tools.py 时降级，不影响启动）
+try:
+    import weather_tools  # type: ignore
+    _HAS_WEATHER_TOOLS = True
+except ImportError:
+    weather_tools = None  # type: ignore
+    _HAS_WEATHER_TOOLS = False
+    print("[Weather] 未找到 weather_tools.py，天气 MCP 工具已降级关闭")
+
 # ---------- 长期记忆客户端 (Pinecone 单写) ----------
 # v2.1: 已移除 Mem0，统一使用 Pinecone 作为唯一向量记忆库
 MEM0_USER_ID = os.environ.get("MEM0_USER_ID", "default").strip()  # 兼容旧变量名
@@ -563,6 +572,15 @@ def _channel_display_name(tag: str) -> str:
     return tag or "未知渠道"
 
 
+def _query_weather_hit(text: str) -> bool:
+    if not text:
+        return False
+    for k in ("天气", "几度", "下雨", "下雪", "出门", "带伞", "穿什么", "冷不冷", "热不热", "气温", "多少度", "好热", "好冷"):
+        if k in text:
+            return True
+    return False
+
+
 async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -> str:
     """
     🧠 全渠道智能体上下文（TG / QQ 渠道注入用）
@@ -691,6 +709,19 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG") -
         f"⏰ 当前时间：{time_str}（北京时间）\n"
         f"📡 当前聊天渠道：{_channel_display_name(channel_tag)}"
     )
+
+    # 🌤️ 关键词命中：QQ/TG 渠道也注入真实天气
+    try:
+        if weather_tools and weather_tools.enabled() and _query_weather_hit(query):
+            _w = await asyncio.to_thread(weather_tools.get_weather, None, supabase)
+            if _w and _w.get("success"):
+                volatile_parts.append(
+                    f"🌤️ 实时天气（用户当前定位）: {_w.get('city','?')} {_w.get('description','')} "
+                    f"{_w.get('temperature','')} 体感{_w.get('feels_like','')} 湿度{_w.get('humidity','')}"
+                )
+    except Exception:
+        pass
+
     parts = stable_parts + volatile_parts
 
     # Feed injection statistics into the shared gateway buffer without logging private context.
@@ -869,6 +900,56 @@ async def where_is_user() -> str:
         return f"{current_status}\n\n📱 今日手机轨迹: {app_timeline}"
     except Exception as e:
         return f"❌ 查询失败: {e}"
+
+
+# ==========================================
+# 🌤️ 天气 MCP 工具
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def query_weather(city: str = ""):
+    """【查天气】查当前详细天气。city 留空=用户当前定位（自动取最新GPS），填城市名可查指定城市。"""
+    if not _HAS_WEATHER_TOOLS or weather_tools is None:
+        return "❌ weather_tools 未部署到容器"
+    try:
+        r = await asyncio.to_thread(weather_tools.get_weather, city or None, supabase)
+    except Exception as e:
+        return f"❌ 天气查询失败: {e}"
+    if not r.get("success"):
+        return f"❌ {r.get('error', '查询失败')}"
+    return (
+        f"🌤️ {r.get('city','?')}（{r.get('location_source','?')}）\n"
+        f"天气: {r.get('description','')}\n"
+        f"温度: {r.get('temperature','')} 体感{r.get('feels_like','')}\n"
+        f"湿度: {r.get('humidity','')} 气压: {r.get('pressure','')}\n"
+        f"风: {r.get('wind_direction','')}{r.get('wind_speed','')}\n"
+        f"能见度: {r.get('visibility','')} 紫外线: {r.get('uv_index','?')}\n"
+        f"云量: {r.get('cloud_cover','')} 降水: {r.get('precipitation','')}"
+    )
+
+
+@mcp.tool()
+@mcp_error_handler
+async def query_weather_forecast(city: str = "", days: int = 3):
+    """【查天气预报】查未来1-3天天气。city 留空=用户当前定位。"""
+    if not _HAS_WEATHER_TOOLS or weather_tools is None:
+        return "❌ weather_tools 未部署到容器"
+    try:
+        r = await asyncio.to_thread(weather_tools.get_weather_forecast, city or None, days, supabase)
+    except Exception as e:
+        return f"❌ 天气预报失败: {e}"
+    if not r.get("success"):
+        return f"❌ {r.get('error', '查询失败')}"
+    lines = [f"📅 {r.get('city','?')} 未来{r.get('forecast_days','?')}天预报"]
+    for f in r.get("forecasts", []):
+        ast = f.get("astronomy") or {}
+        lines.append(
+            f"\n• {f.get('date','')} {f.get('description','')} "
+            f"{f.get('min_temp','')}~{f.get('max_temp','')} "
+            f"降雨{f.get('chance_of_rain','')} 日出{ast.get('sunrise','?')} 日落{ast.get('sunset','?')}"
+        )
+    return "\n".join(lines)
 
 
 # ==========================================

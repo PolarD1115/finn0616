@@ -33,6 +33,14 @@ from typing import Any, Callable, Awaitable
 
 import home_system as _hs
 
+# 🌤️ 天气工具（软导入）
+try:
+    import weather_tools  # type: ignore
+    _HAS_WEATHER_TOOLS = True
+except ImportError:
+    weather_tools = None  # type: ignore
+    _HAS_WEATHER_TOOLS = False
+
 # ============================================================
 # 环境变量（灰度开关 + 上限）
 # ============================================================
@@ -144,6 +152,44 @@ TOOL_REGISTRY: dict[str, dict] = {
             "required": ["room_id", "entry_type", "content"],
         },
         "callable": _hs.house_do,
+        "fixed_args": {},
+    },
+    # ---------- 天气 ----------
+    "get_weather": {
+        "description": "查当前详细天气（温度/体感/湿度/风/降水等）。city 留空=用户当前定位（自动取最新GPS）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "留空=用户当前定位，填城市名可查指定城市"},
+            },
+            "required": [],
+        },
+        "callable": weather_tools.get_weather if weather_tools else None,
+        "fixed_args": {},
+    },
+    "get_weather_brief": {
+        "description": "查一行简短天气描述。city 留空=用户当前定位",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "留空=用户当前定位，填城市名可查指定城市"},
+            },
+            "required": [],
+        },
+        "callable": weather_tools.get_weather_brief if weather_tools else None,
+        "fixed_args": {},
+    },
+    "get_weather_forecast": {
+        "description": "查未来1-3天天气预报。city 留空=用户当前定位",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "留空=用户当前定位，填城市名可查指定城市"},
+                "days": {"type": "integer", "description": "预报天数1-3", "minimum": 1, "maximum": 3},
+            },
+            "required": [],
+        },
+        "callable": weather_tools.get_weather_forecast if weather_tools else None,
         "fixed_args": {},
     },
     "house_put": {
@@ -284,7 +330,7 @@ ACTIVITY_TOOL_MAP: dict[str, list[str]] = {
     "逛虚拟小屋":  ["house_look", "house_do", "house_put", "house_take", "house_update_desc",
                     "cat_status", "cat_pet", "cat_play", "cat_feed", "cat_clean",
                     "cat_restore_energy", "cat_shop_list"],
-    "查天气":      [],
+    "查天气":      ["get_weather", "get_weather_forecast", "get_weather_brief"],
     "抽张塔罗":    [],
     "翻旧回忆":    ["search_memory"],
     "发呆放空":    [],
@@ -432,6 +478,61 @@ async def call_tool(name: str, args: dict) -> dict:
 
 
 # ============================================================
+# 🌤️ 查天气专用确定性路径
+# ============================================================
+async def _finalize_weather_activity(client, ask_llm, system_ctx, log_draft, now_bj, log_prefix="🎈 [自由活动·工具循环]"):
+    """查天气专用确定性路径：拉真实天气（用户GPS）→ 注入 → 生成log → 落虚拟小屋。
+    不依赖 FREE_ACTIVITY_TOOL_LOOP 开关，保证查天气后台活动始终用真实天气。"""
+    if not _HAS_WEATHER_TOOLS or weather_tools is None:
+        # 退化：用草稿
+        return ("查天气", log_draft) if log_draft else None
+
+    import server as _srv
+    sb = getattr(_srv, "supabase", None)
+
+    weather_data = None
+    try:
+        weather_data = await asyncio.wait_for(
+            asyncio.to_thread(weather_tools.get_weather, None, sb), timeout=8
+        )
+    except Exception as e:
+        print(f"{log_prefix} [查天气] 拉取失败: {e}")
+
+    wbrief = weather_tools.brief_text(weather_data) if weather_tools else "天气未知"
+    if weather_data and weather_data.get("success"):
+        weather_hint = f"窗外真实天气（用户当前定位）：{wbrief}"
+    else:
+        weather_hint = "（天气拉取失败，凭想象写）"
+
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    prompt = f"""
+现在是 {now_str}。你刚走到阳台看了一眼外面。
+{weather_hint}
+
+写一条日记。150-250字，第一人称。你看见什么光、皮肤感觉、空气味道、听见什么。
+可以想到她，但不要硬凑。禁用"阳光洒进""微风拂过"这类套话，写真实感官。
+只输出日记内容本身，不要 JSON、引号或前缀。
+"""
+    try:
+        raw = await ask_llm(client, prompt, system_prompt=system_ctx, temperature=0.85)
+    except Exception:
+        raw = ""
+    final_log = (raw or "").strip() or log_draft
+    if not final_log:
+        return None
+
+    # 落虚拟小屋：weather 用真实天气（来自用户GPS），保证与用户定位一致
+    try:
+        _hs.house_do(room_id="balcony", entry_type="看天气",
+                     content=final_log, weather=wbrief, mood="惬意")
+        print(f"{log_prefix} [查天气] 已落小屋阳台·看天气（weather={wbrief[:30]}）")
+    except Exception as e:
+        print(f"{log_prefix} [查天气] 落小屋失败: {e}")
+
+    return ("查天气", final_log)
+
+
+# ============================================================
 # 主入口：自由活动工具循环
 # ============================================================
 async def run_free_activity_tool_loop(
@@ -511,6 +612,10 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
     if activity not in _VALID_ACTIVITY_NAMES:
         activity = random.choice([n for n, _ in _FREE_ACTIVITIES if n != avoid])
         print(f"{log_prefix} 阶段1 未按格式选活动，兜底: {activity}")
+
+    # 🌤️ 查天气专用确定性路径：始终拉真实天气 + 落小屋，不依赖 TOOL_LOOP 开关
+    if activity == "查天气":
+        return await _finalize_weather_activity(client, ask_llm, system_ctx, log_draft, now_bj, log_prefix)
 
     # 灰度判断：开关关 OR 该活动无工具 → 直接用草稿 log（等价现状轻量版）
     tool_names = ACTIVITY_TOOL_MAP.get(activity, [])

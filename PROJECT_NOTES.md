@@ -30,6 +30,57 @@
 
 ## 📦 变更日志
 
+### v5.1 — 天气工具缝合（wttr.in 真实天气：后台活动 / 聊天关键词注入 / MCP 工具）
+**需求**：把基于 wttr.in 的天气工具完整缝进网关——后台"查天气"活动调真实天气、聊天命中天气关键词时自动拉天气注入 prompt（保流式）、注册为 MCP 工具供客户端调用。
+
+**定位优先级**：显式 `city` > 用户最新 GPS（`device_data` 表 lat/lon）> `WEATHER_DEFAULT_CITY`（默认韶关）。
+
+- **新增 `weather_tools.py`**（自包含，不 import server）：
+  - 3 个工具函数：`get_weather`（当前详细天气）/ `get_weather_brief`（一行简短描述）/ `get_weather_forecast`（未来 1-3 天预报）
+  - 坐标查法 `https://wttr.in/24.8,113.6?format=j1`；`_resolve_location` 返回 (kind, value)，`_fetch_latest_gps` 直查 `device_data` 表
+  - **SSRF 防御** `_check_url_safe`：协议强制 HTTPS、host 强制 wttr.in、解析 IP 阻断私网/环回/链路本地
+  - 辅助：`execute_tool` / `execute_tool_json` / `merge_tools_into_request` / `run_tool_calls` / `brief_text`
+
+- **`server.py`**（修改）：
+  - 顶部软导入 weather_tools（`_HAS_WEATHER_TOOLS`，漏传文件不影响启动）
+  - 新增两个 MCP 工具：`query_weather(city="")` → `weather_tools.get_weather`；`query_weather_forecast(city="", days=3)` → `weather_tools.get_weather_forecast`
+  - `_build_channel_context` 末尾追加 TG/QQ 渠道天气注入（命中 `_query_weather_hit` 时）
+
+- **`tool_loop.py`**（修改）：
+  - `TOOL_REGISTRY` 追加 3 个天气工具（get_weather / get_weather_brief / get_weather_forecast）
+  - `ACTIVITY_TOOL_MAP["查天气"]` 从 `[]` 改为 `["get_weather", "get_weather_forecast", "get_weather_brief"]`
+  - 新增 `_finalize_weather_activity` **查天气专用确定性路径**：不依赖 `FREE_ACTIVITY_TOOL_LOOP` 开关，始终拉真实天气（用户 GPS）→ 注入 LLM 生成感官日记 → 落小屋 `house_do(room_id="balcony", entry_type="看天气", weather=wbrief)`，保证小屋 weather 与用户定位一致
+  - `run_free_activity_tool_loop` 阶段1 后插入 `if activity == "查天气"` 分支
+
+- **`gateway.py`**（修改）：
+  - 顶部软导入 weather_tools + `_WEATHER_KEYWORDS` + `_weather_keyword_hit(text)`
+  - `_inject_context` volatile_block 末尾：关键词命中时 `asyncio.to_thread(weather_tools.get_weather, None, sb)` 注入实时天气（**默认开**，保流式）
+  - `_handle_chat`：`_weather_loop` 判断 + `merge_tools_into_request`；开启时走新增的 `_handle_chat_with_tool_loop`（OpenAI tools 循环 + 本地执行 weather_tools + `_sse_final_text` 包装回 SSE）
+  - **双路设计**：关键词注入（默认开，WEATHER_KEYWORD_INJECT=true）与 tool loop（默认关，WEATHER_TOOL_LOOP=false）解耦——默认配置下聊天仍纯流式透传，天气已注入 prompt
+
+- **`VARIABLES.md`**（修改）：末尾追加天气工具环境变量文档
+
+**环境变量**（7 个，全部可选）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `WEATHER_DEFAULT_CITY` | 韶关 | 无 GPS 时的兜底城市 |
+| `WEATHER_TOOL_LOOP` | false | 聊天是否走 OpenAI tools 循环（关=流式） |
+| `WEATHER_KEYWORD_INJECT` | true | 聊天命中天气关键词是否注入实时天气 |
+| `WEATHER_KEYWORDS` | 内置词表 | 自定义关键词（逗号分隔） |
+| `WEATHER_TIMEOUT` | 8 | 天气请求超时（秒） |
+| `WEATHER_TOOL_MAX_CALLS` | 3 | tool loop 单轮最多调几次天气 |
+| `WEATHER_DAYS` | 3 | 预报天数上限 |
+
+**验证结果**（7 步自测全过）：
+1. 网络可达（curl wttr.in）✅
+2. `WEATHER_DEFAULT_CITY=韶关` 环境变量生效 ✅
+3. 单测 `weather_tools.get_weather(None, None)` → 回退韶关，`success=true, city=韶关` ✅
+4. 单测指定城市 `city=北京` → 返回北京天气 ✅
+5. import 无环检查：weather_tools / tool_loop / server / gateway 全部 OK ✅
+6. `_finalize_weather_activity` 集成测试 → 日志 `[查天气] 已落小屋阳台·看天气（weather=Beijing Sunny 31°C 体感31°C 湿度42）` ✅
+7. 关键词命中静态验证：`今天好热`/`下雨了`/`韶关天气` → True，`你好` → False ✅
+
 ### v5.0 — 桌面控制台 + 角色化多模型 + 运行时门控（架构改造第 5 步）
 **需求**：给网关增加一个电脑端管理控制台，同时解决多模型角色归属混乱和运行时功能门控问题。
 - **新增 `console.html`**（`gateway.py` `/console` 路由返回）：

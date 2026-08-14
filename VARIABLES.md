@@ -440,3 +440,19 @@ AI_PERSONA=你是一个通用智能助手。
 - **重启生效**：修改变量后，调用 `POST /api/restart` 或在云平台重新部署即可完整生效。
 
 > 📚 部署细节请参考 [DEPLOY_ZEABUR.md](DEPLOY_ZEABUR.md)，项目总览请参考 [README.md](README.md)。
+
+---
+
+## 天气工具（wttr.in，无需 API Key）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| WEATHER_TOOLS_ENABLED | true | 天气功能总开关 |
+| WEATHER_DEFAULT_CITY | Beijing（建议设韶关） | GPS 缺失时回退城市 |
+| WEATHER_TIMEOUT_SEC | 12 | wttr.in 请求超时秒 |
+| WEATHER_KEYWORD_INJECT | true | 聊天命中天气关键词时主动注入（保流式） |
+| WEATHER_TOOL_LOOP | false | 网页聊天天气 tool loop 开关（开则模型可 function-call 天气，轮次内非真流式） |
+| WEATHER_TOOL_MAX_ROUNDS | 3 | tool loop 最大轮次 |
+| FREE_ACTIVITY_TOOL_LOOP | false | 后台活动工具循环总开关（不影响查天气专用路径） |
+
+定位策略：默认取 device_data 表最新 lat/lon → wttr.in/{lat},{lon}；无 GPS 回退 WEATHER_DEFAULT_CITY；city 入参可查任意城市。虚拟小屋"查天气"活动落 house_do 时 weather 字段取自用户 GPS 天气，与用户定位一致。
