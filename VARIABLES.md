@@ -65,6 +65,8 @@
 | `DEVICE_CONTEXT_ENABLED` | ❌ | `true` | 🆕 是否把 `device_data` 最新一条快照注入 system prompt（只注入最新一条并标注更新时间）。网页/TG/QQ 全渠道生效。设 `false`/`0` 关闭。 |
 | `DEVICE_CONTEXT_TOP_APPS` | ❌ | `5` | 🆕 设备快照中「应用使用榜单」条数（1–10） |
 | `DEVICE_CONTEXT_MAX_NOTIFS` | ❌ | `3` | 🆕 设备快照中「最近通知」条数（去重后取最近 N 条，设 `0` 不要通知） |
+| `INJECT_DB_HISTORY` | ❌ | `auto` | 🆕 对话历史注入策略：`auto`=客户端已带 >1 条非 system 消息时跳过 DB 历史注入（维持 prompt cache 前缀稳定，默认）、`always`=总是注入、`never`=从不注入。仅网页渠道 (`/v1/chat/completions`) 生效。 |
+| `INJECT_CORE_SUMMARIES` | ❌ | `auto` | 🆕 阶段总结（`Core_Cognition`）注入策略：`auto`=客户端已带 >1 条非 system 消息时跳过（与 `INJECT_DB_HISTORY` 同模式，默认）、`always`=总是注入（=旧行为）、`never`=从不注入。仅网页渠道生效；TG/QQ 渠道始终注入。 |
 
 ---
 

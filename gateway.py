@@ -1585,19 +1585,38 @@ class HostFixMiddleware:
         except Exception:
             pass
 
-        # 阶段总结（带 TTL 缓存 —— 内容不变才能维持 prompt cache 前缀稳定）
-        core_summaries = _stable_cached("core_summaries", _CORE_SUMMARIES_TTL)
-        if core_summaries is not None:
-            _log(f"📦 [Cache] core_summaries 命中 TTL 缓存（{_CORE_SUMMARIES_TTL}s）")
+        # 自适应注入共用：客户端自带非 system 消息条数（user/assistant 白名单）
+        _client_msg_count = sum(
+            1 for m in req_data.get("messages", [])
+            if m.get("role") in ("user", "assistant")
+        )
+
+        # 阶段总结自适应注入（与 INJECT_DB_HISTORY 同模式）
+        # 📦 客户端已自带上下文（非 system 消息 >1）时跳过，维持 stable_system 前缀稳定。
+        #    由环境变量 INJECT_CORE_SUMMARIES 控制：auto=自适应（默认）、always=总是注入、never=从不注入。
+        _inject_core_summaries_mode = os.environ.get("INJECT_CORE_SUMMARIES", "auto").strip().lower()
+        _skip_core_summaries = (
+            _inject_core_summaries_mode == "never"
+            or (_inject_core_summaries_mode == "auto" and _client_msg_count > 1)
+        )
+        core_summaries = "无长期记忆"
+        if not _skip_core_summaries:
+            # 阶段总结（带 TTL 缓存 —— 内容不变才能维持 prompt cache 前缀稳定）
+            core_summaries = _stable_cached("core_summaries", _CORE_SUMMARIES_TTL)
+            if core_summaries is not None:
+                _log(f"📦 [Cache] core_summaries 命中 TTL 缓存（{_CORE_SUMMARIES_TTL}s）")
+            else:
+                core_summaries = "无长期记忆"
+                try:
+                    sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
+                    if sr and sr.data:
+                        core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
+                except Exception:
+                    pass
+                _stable_set("core_summaries", core_summaries)
         else:
-            core_summaries = "无长期记忆"
-            try:
-                sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
-                if sr and sr.data:
-                    core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
-            except Exception:
-                pass
-            _stable_set("core_summaries", core_summaries)
+            if _inject_core_summaries_mode == "auto" and _client_msg_count > 1:
+                _log(f"📦 [Cache] 客户端已带 {_client_msg_count} 条历史消息，跳过阶段总结注入（维持缓存前缀稳定）")
 
         # 用户画像（带 TTL 缓存 —— 同理）
         user_prof = _stable_cached("user_prof", _STABLE_PREFIX_TTL)
@@ -1639,10 +1658,6 @@ class HostFixMiddleware:
         #    由环境变量 INJECT_DB_HISTORY 控制：auto=自适应（默认）、always=总是注入、never=从不注入。
         _inject_db_history_mode = os.environ.get("INJECT_DB_HISTORY", "auto").strip().lower()
         history_msgs = []
-        _client_msg_count = sum(
-            1 for m in req_data.get("messages", [])
-            if m.get("role") in ("user", "assistant")
-        )
         _skip_db_history = (
             _inject_db_history_mode == "never"
             or (_inject_db_history_mode == "auto" and _client_msg_count > 1)
@@ -1708,7 +1723,8 @@ class HostFixMiddleware:
         if persona:
             stable_parts.append(persona)
         stable_parts.append(f"【{user_name}的核心画像】:\n{user_prof}")
-        stable_parts.append(f"【近3次阶段总结】:\n{core_summaries}")
+        if not _skip_core_summaries:
+            stable_parts.append(f"【近3次阶段总结】:\n{core_summaries}")
         stable_system = "\n\n".join(stable_parts)
 
         volatile_block = (
@@ -1785,7 +1801,8 @@ class HostFixMiddleware:
         else:
             msgs.append(volatile_msg)
 
-        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{len(core_summaries)}字 + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
+        _summ_tag = "跳过" if _skip_core_summaries else f"{len(core_summaries)}字"
+        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{_summ_tag} + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
 
     # ------------------------------------------
     # 🌤️ 天气 tools 循环（OpenAI function calling，可选）
