@@ -574,7 +574,7 @@ def cat_shop_buy(user_id: str, item_id: str, qty: int = 1) -> dict:
 
 # 衰减率常量（每小时）
 TICK_DECAY_RATES = {
-    "hunger": -2.0,      # 饥饿度每小时 -2
+    "hunger": -2.0,      # 饱食度每小时 -2
     "happiness": -1.5,   # 快乐度每小时 -1.5
     "cleanliness": -1.0, # 清洁度每小时 -1
     "energy_sleep": 2.0, # 睡觉时精力每小时 +2

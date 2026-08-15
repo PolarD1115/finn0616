@@ -1154,6 +1154,52 @@ def start_message_process_bg():
 # 9. 宠物小屋后台 tick（状态衰减 + 素材 + 自动收入）
 # ==========================================
 
+# 宠物照料冷却：event_type → 上次触发 epoch 秒
+_pet_care_last_fire: dict[str, float] = {}
+_PET_CARE_COOLDOWN_SECS = 1800  # 30 分钟
+
+
+async def _try_pet_care(event_type: str, now_bj):
+    """阈值事件触发后，若不在冷却期，发起 LLM 照料循环并写日记。"""
+    import time
+    now_ts = time.time()
+    last = _pet_care_last_fire.get(event_type, 0)
+    if now_ts - last < _PET_CARE_COOLDOWN_SECS:
+        remaining = int(_PET_CARE_COOLDOWN_SECS - (now_ts - last))
+        print(f"🐱 [宠物照料] {event_type} 在冷却期内（剩余 {remaining}s），跳过")
+        return
+
+    try:
+        from server import _get_llm_client, _ask_llm_async, _save_memory_to_db, _build_channel_context
+        import tool_loop
+
+        client = _get_llm_client("background")
+        if not client:
+            print(f"🐱 [宠物照料] 无 LLM 客户端，跳过")
+            return
+
+        system_ctx = await _build_channel_context("小满需要照顾，去看看它", channel_tag="TG_MSG")
+        care_result = await tool_loop.run_pet_care_tool_loop(
+            client=client,
+            ask_llm=_ask_llm_async,
+            system_ctx=system_ctx,
+            now_bj=now_bj,
+            event_type=event_type,
+        )
+        if care_result is None:
+            return
+
+        _pet_care_last_fire[event_type] = now_ts
+        _, log_text = care_result
+        await asyncio.to_thread(
+            _save_memory_to_db,
+            f"🐱 宠物照料·{event_type}", log_text, "记事", "牵挂", "Pet_Care"
+        )
+        print(f"🐱 [宠物照料] 完成 {event_type}: {log_text[:30]}...")
+    except Exception as e:
+        print(f"❌ [宠物照料] 出错: {e}")
+
+
 async def async_pet_house_tick():
     """
     🐱 宠物小屋后台 tick 协程。
@@ -1181,14 +1227,18 @@ async def async_pet_house_tick():
                     print(f"🐱 [宠物 tick] {tick_result.get('message')}")
                 else:
                     print(
-                        f"🐱 [宠物 tick] 饥饿={tick_result.get('hunger')} "
+                        f"🐱 [宠物 tick] 饱食度={tick_result.get('hunger')} "
                         f"快乐={tick_result.get('happiness')} "
                         f"清洁={tick_result.get('cleanliness')} "
                         f"精力={tick_result.get('energy')} "
                         f"状态={tick_result.get('status')}"
                     )
-                    if tick_result.get("threshold_event"):
-                        print(f"⚠️ [宠物事件] 触发阈值事件: {tick_result['threshold_event']}")
+                    _event = tick_result.get("threshold_event")
+                    if _event:
+                        print(f"⚠️ [宠物事件] 触发阈值事件: {_event}")
+                        # 状态驱动照料：检查冷却 → LLM 自主决策照料 → 写日记
+                        now_bj = _get_now_bj()
+                        await _try_pet_care(_event, now_bj)
             else:
                 print(f"❌ [宠物 tick] 失败: {tick_result.get('message')}")
 

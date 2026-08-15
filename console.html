@@ -1215,7 +1215,7 @@ async function loadPets(sb){
     document.getElementById("petSub").textContent = (pet.name || "—") + " · " + fmtStatus(pet.status);
 
     const bars = [
-      {k:"饥饿", v:pet.hunger, cls:""},
+      {k:"饱食度", v:pet.hunger, cls:""},
       {k:"快乐", v:pet.happiness, cls:"blue"},
       {k:"清洁", v:pet.cleanliness, cls:"teal"},
       {k:"精力", v:pet.energy, cls:""},

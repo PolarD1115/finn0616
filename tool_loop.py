@@ -44,7 +44,7 @@ except ImportError:
 # ============================================================
 # 环境变量（灰度开关 + 上限）
 # ============================================================
-TOOL_LOOP_ENABLED = os.environ.get("FREE_ACTIVITY_TOOL_LOOP", "false").strip().lower() in ("1", "true", "yes")
+TOOL_LOOP_ENABLED = os.environ.get("FREE_ACTIVITY_TOOL_LOOP", "true").strip().lower() in ("1", "true", "yes")
 MAX_TOOL_CALLS = int(os.environ.get("FREE_ACTIVITY_TOOL_MAX_CALLS", "5"))
 
 # ============================================================
@@ -297,6 +297,19 @@ TOOL_REGISTRY: dict[str, dict] = {
         "callable": _hs.cat_shop_list,
         "fixed_args": {},
     },
+    "cat_shop_buy": {
+        "description": "购买猫用品（钱包扣款+库存+流水）。库存不足时先买再喂。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "enum": ["fish", "cat_milk", "tuna_can", "wet_food", "apple", "ball", "catnip", "feather", "brush", "soap"]},
+                "qty": {"type": "integer", "description": "数量（1-99，默认1）"},
+            },
+            "required": ["item_id"],
+        },
+        "callable": _hs.cat_shop_buy,
+        "fixed_args": {"user_id": "user_finn"},
+    },
     # ---------- 记忆（延迟从 server 取 @mcp.tool 函数） ----------
     "save_memory": {
         "description": "保存一条记忆到长期记忆库（含价值判断+语义去重，太碎/重复会跳过）",
@@ -333,7 +346,7 @@ ACTIVITY_TOOL_MAP: dict[str, list[str]] = {
     "写秘密日记":  ["save_memory"],
     "逛虚拟小屋":  ["house_look", "house_do", "house_put", "house_take", "house_update_desc",
                     "cat_status", "cat_pet", "cat_play", "cat_feed", "cat_clean",
-                    "cat_restore_energy", "cat_shop_list"],
+                    "cat_restore_energy", "cat_shop_list", "cat_shop_buy"],
     "查天气":      ["get_weather", "get_weather_forecast", "get_weather_brief"],
     "抽张塔罗":    [],
     "翻旧回忆":    ["search_memory"],
@@ -704,3 +717,144 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
 
     print(f"{log_prefix} 完成「{activity}」(调了 {len(results)} 个工具): {final_log[:30]}...")
     return (activity, final_log)
+
+
+# ============================================================
+# 🐱 宠物状态驱动照料循环（阈值事件触发）
+# ============================================================
+# 宠物照料可用工具（状态驱动，不受 ACTIVITY_TOOL_MAP 限制）
+_PET_CARE_TOOLS = [
+    "cat_status", "cat_feed", "cat_clean", "cat_play",
+    "cat_pet", "cat_restore_energy", "cat_shop_buy", "cat_shop_list",
+]
+
+# 事件类型 → 中文描述（喂给 LLM 的提示）
+_PET_CARE_EVENT_DESC = {
+    "hungry_cat": "小满的饱食度降到了危险低位（<30），它饿了，需要喂食",
+    "dirty_cat": "小满的清洁度降到了低位（<30），它脏了，需要清洁",
+    "tired_cat": "小满的精力降到了低位（<20），它累了，需要恢复精力",
+}
+
+
+async def run_pet_care_tool_loop(
+    client,
+    ask_llm: Callable[..., Awaitable[str]],
+    system_ctx: str,
+    now_bj,
+    event_type: str,
+    log_prefix: str = "🐱 [宠物照料·工具循环]",
+) -> tuple[str, str] | None:
+    """宠物状态驱动照料循环。
+
+    当 cat_tick 检测到阈值穿越事件（hungry_cat/dirty_cat/tired_cat）时调用。
+    先查猫当前状态，然后让 LLM 自主决定照料动作（喂食/清洁/恢复/购买），
+    执行工具调用，最后生成一条照料日记。
+
+    参数：
+      client      LLM 客户端（background 角色）
+      ask_llm     server._ask_llm_async 函数引用
+      system_ctx  已构建好的 system prompt 上下文
+      now_bj      当前北京时间
+      event_type  触发的事件类型（hungry_cat/dirty_cat/tired_cat）
+
+    返回 (event_type, log_text)；None 表示本轮应跳过。
+    """
+    event_desc = _PET_CARE_EVENT_DESC.get(event_type, f"小满状态异常（{event_type}）")
+
+    # ── 阶段 1：查猫当前状态 ──
+    status_res = await call_tool("cat_status", {})
+    status_text = status_res["text"] if status_res.get("ok") else f"❌ {status_res.get('text', '')}"
+
+    # ── 阶段 2：构建工具 schema + 让 LLM 自主决策 ──
+    schema_lines = []
+    for n in _PET_CARE_TOOLS:
+        spec = TOOL_REGISTRY.get(n)
+        if not spec:
+            continue
+        props = spec["parameters"].get("properties", {})
+        req = spec["parameters"].get("required", [])
+        if props:
+            pstr = ", ".join(
+                f'{pn}:{pinfo.get("type", "any")}'
+                + ("(必填)" if pn in req else "")
+                + (f'{pinfo["enum"]}' if "enum" in pinfo else "")
+                for pn, pinfo in props.items()
+            )
+        else:
+            pstr = "无参数"
+        schema_lines.append(f'- {n}（{spec["description"]}）参数: {pstr}')
+    schema_block = "\n".join(schema_lines)
+
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    stage2_prompt = f"""
+现在是 {now_str}。你收到了一个宠物状态告警：
+{event_desc}
+
+小满当前状态：
+{status_text}
+
+你可以调用以下工具来照料小满：
+{schema_block}
+
+规则：
+- 最多调用 {MAX_TOOL_CALLS} 个工具。
+- 参数必须符合上面的类型与枚举。
+- 如果库存不足，先 cat_shop_buy 购买再使用。
+- 不要调用上面没列出的工具。
+
+只输出一行 JSON，不要多余文字：
+{{"tool_calls": [{{"name": "工具名", "args": {{...}}}}]}}
+"""
+    try:
+        raw2 = await ask_llm(client, stage2_prompt, system_prompt=system_ctx, temperature=0.6)
+    except Exception as e:
+        print(f"{log_prefix} LLM 决策失败: {e}")
+        return None
+    d2 = _parse_json_block(raw2)
+    tc_list = d2.get("tool_calls") or []
+    if not isinstance(tc_list, list):
+        tc_list = []
+
+    # ── 阶段 3：执行 tool_calls（白名单 + 错误隔离）──
+    allowed = set(_PET_CARE_TOOLS)
+    results = []
+    for tc in tc_list[:MAX_TOOL_CALLS]:
+        if not isinstance(tc, dict):
+            continue
+        name = (tc.get("name") or "").strip()
+        args = tc.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        if name not in allowed:
+            results.append({"name": name, "ok": False, "text": "不在宠物照料允许的工具范围内"})
+            continue
+        res = await call_tool(name, args)
+        results.append({"name": name, "ok": res["ok"], "text": res["text"]})
+        print(f"{log_prefix} 工具 {name}: {'OK' if res['ok'] else 'FAIL'} {res['text'][:60]}")
+
+    # ── 阶段 4：基于真实工具结果生成照料日记 ──
+    if results:
+        results_text = "\n".join(
+            f"- {r['name']}: {'✅' if r['ok'] else '❌'} {r['text']}"
+            for r in results
+        )
+    else:
+        results_text = "（模型未指定任何工具）"
+
+    stage3_prompt = f"""
+你刚才照料了小满（触发原因：{event_desc}），执行了以下操作：
+{results_text}
+
+写一条简短的照料日记。80字以内，第一人称。记录你做了什么、小满的反应。
+只输出日记内容本身，不要 JSON、引号或前缀。
+"""
+    try:
+        raw3 = await ask_llm(client, stage3_prompt, system_prompt=system_ctx, temperature=0.85)
+    except Exception:
+        raw3 = ""
+    final_log = (raw3 or "").strip()
+    if not final_log:
+        final_log = f"照料了小满（{event_type}）"
+
+    print(f"{log_prefix} 完成「{event_type}」(调了 {len(results)} 个工具): {final_log[:30]}...")
+    return (event_type, final_log)

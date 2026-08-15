@@ -1660,7 +1660,7 @@ async def cat_status():
 @mcp.tool()
 @mcp_error_handler
 async def cat_feed(item_id: str):
-    """【小满·喂食】给小满喂食（仅 food 类型物品）。扣消耗品库存，增加饥饿度。
+    """【小满·喂食】给小满喂食（仅 food 类型物品）。扣消耗品库存，增加饱食度。
     item_id: 物品ID（如 fish, cat_milk, tuna_can, wet_food, apple）
     """
     def _call():
