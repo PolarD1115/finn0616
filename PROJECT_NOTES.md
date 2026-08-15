@@ -30,6 +30,42 @@
 
 ## 📦 变更日志
 
+### v5.2 — Prompt Cache 命中率修复（TTL 缓存 + 可观测性 + 自适应历史 + Claude 标记）
+**背景**：缓存命中率极度不稳定——高时 60-70%，大部分时候只有 4-5% 甚至不 cached。参考 Haven-Ombre 仓库的缓存统计做法后诊断出 4 个根因，逐一修复。
+
+**根因诊断**（按影响排序）：
+1. **stable_system 前缀每轮都查 DB**（最致命）：`core_summaries`/`user_prof` 每次请求都 `SELECT`，内容一变（哪怕一个字符）整个前缀就变 → 上游 prompt cache 严格前缀匹配 → 后面全部无法命中。
+2. **DB 历史注入每轮窗口滚动**：每轮从 DB 拉最近 10 条插到 system 和 user 之间，对话后 DB 新增一条、窗口滚动 → history 内容每轮移位 → 破坏前缀连续性。
+3. **Claude（中转站）没打 cache_control**：DeepSeek/Kimi/GLM 自动前缀缓存无需参数，但 Claude 需手动 `cache_control:{type:ephemeral}`，不打就完全不缓存。
+4. **网关侧无缓存可观测性**：没设 `stream_options`，不解析 usage，只能去上游控制台被动看百分比。
+
+**上游确认**：用户实际用 Kimi、GLM、DeepSeek（自动缓存，靠前缀匹配）、中转站 Claude（需手动 cache_control）。非 MiniMax（VARIABLES.md 默认值误导）。
+
+**改动**（仅 `gateway.py` + `VARIABLES.md`，无新增文件、不改 DB schema）：
+
+- **`gateway.py`**（4 项改动）：
+  - **改动 1 · TTL 缓存 stable_system 组件**：新增 `_stable_prefix_cache` + `_stable_cached()`/`_stable_set()` 辅助函数。`core_summaries` 和 `user_prof` 查询前先查 TTL 缓存，命中则直接用（打 `📦 [Cache]` 日志），过期才重新查 DB 并回填。保证窗口内前缀字节不变。
+  - **改动 2 · 缓存命中可观测性**：流式路径加 `stream_options:{include_usage:true}`（不支持的上游自动忽略）；流收集循环两个分支（透传 + thinking 改写）均解析 `dj.get("usage")` 存入 `collected_usage`；tool_loop 路径从非流式 response JSON 取 `loop_usage`。新增 `_log_cache_usage(model, usage)` 模块级函数，覆盖三家字段命名（DeepSeek `prompt_cache_hit/miss_tokens`、GLM `prompt_tokens_details.cached_tokens`、Claude `cache_read/creation_input_tokens`），自动算命中率百分比，打 `📊 [Cache]` 日志。
+  - **改动 3 · 自适应 DB 历史注入**：`_inject_context` 历史拉取段开头检测 `messages` 里非 system 消息数，>1 条时跳过 DB 历史（打 `📦 [Cache]` 日志），保留客户端自带历史的自然增长前缀模式。由 `INJECT_DB_HISTORY` 控制（`auto`/`always`/`never`）。
+  - **改动 4 · Claude cache_control 标记**：新增 `_apply_claude_cache_control(req_data)` 模块级函数，转发前调用。`auto` 模式下 model 含 `claude` 时把 system 消息 content 从字符串转为 content-block 数组并加 `cache_control:{type:ephemeral}`，tools 定义末尾也加标记。打 `🏷️ [Cache]` 日志。⚠️ 依赖中转站透传该字段，需实测。
+
+- **`VARIABLES.md`**（修改）：第 13 节追加 4 个新环境变量文档。
+
+**环境变量**（4 个，全部可选）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `STABLE_PREFIX_TTL` | `300` | 画像 TTL 缓存秒数；`0` 关闭（命中率会下降） |
+| `CORE_SUMMARIES_TTL` | 同上 | 总结 TTL 缓存秒数；可设更长（如 `600`） |
+| `INJECT_DB_HISTORY` | `auto` | DB 历史注入模式：`auto`=自适应/`always`=旧行为/`never`=从不 |
+| `CLAUDE_CACHE_CONTROL` | `auto` | Claude cache_control：`auto`=仅 claude/`true`=强制/`false`=关 |
+
+**验证**：`python -m py_compile gateway.py` 通过。部署后看日志 `📊 [Cache]` 行验证命中率变化，`📦 [Cache]` 行确认 TTL 缓存命中。
+
+**参考来源**：Haven-Ombre 仓库（`Yinglianchun/Haven-Ombre`）的 `_log_cache_usage` / `upstream_usage` 表模式，提取文档见 `haven_ombre_cache_hit_rate.md`。
+
+**与 v3.7-v3.9 的关系**：v3.7 做了 prompt 注入位置重排（两段式 stable/volatile），v3.8 把 desire 状态迁出 user_facts，v3.9 修画像注入排序/截断。本次是同一条线的延续——前缀位置和内容来源已稳定，但"每轮都查 DB 导致前缀字节变化"这一根因此前未解决。
+
 ### v5.1 — 天气工具缝合（wttr.in 真实天气：后台活动 / 聊天关键词注入 / MCP 工具）
 **需求**：把基于 wttr.in 的天气工具完整缝进网关——后台"查天气"活动调真实天气、聊天命中天气关键词时自动拉天气注入 prompt（保流式）、注册为 MCP 工具供客户端调用。
 

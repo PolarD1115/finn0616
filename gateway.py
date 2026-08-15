@@ -504,6 +504,130 @@ _SYS_CONFIG_KEY = "sys_config"
 _runtime_config_cache = {"data": None, "ts": 0.0}
 _RUNTIME_CONFIG_TTL = 5.0  # 秒
 
+# ==========================================
+# 📦 Prompt Cache 友好：stable_system 组件 TTL 缓存
+#   core_summaries / user_prof 每轮都查 DB，一旦内容变化（哪怕一个字符），
+#   整个 stable_system 前缀就变 → 上游 prompt cache 严格前缀匹配 → 命中率归零。
+#   用 TTL 缓存让它们在一个窗口内保持字节不变，窗口内连续对话才能命中缓存。
+# ==========================================
+_stable_prefix_cache: dict[str, dict] = {}  # key -> {"value": str, "ts": float}
+_STABLE_PREFIX_TTL = max(0, int(os.environ.get("STABLE_PREFIX_TTL", "300")))      # 默认 5 分钟
+_CORE_SUMMARIES_TTL = max(0, int(os.environ.get("CORE_SUMMARIES_TTL", str(_STABLE_PREFIX_TTL))))  # 默认同上，可单独调长
+
+
+def _stable_cached(key: str, ttl: int) -> str | None:
+    """读 TTL 缓存；未过期返回缓存值，过期/不存在返回 None。"""
+    if ttl <= 0:
+        return None
+    entry = _stable_prefix_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < ttl:
+        return entry["value"]
+    return None
+
+
+def _stable_set(key: str, value: str) -> None:
+    _stable_prefix_cache[key] = {"value": value, "ts": time.time()}
+
+
+def _log_cache_usage(model: str, usage: dict | None) -> None:
+    """
+    解析上游 usage 里的 prompt cache 字段并打日志。
+    覆盖三家厂商的不同字段命名：
+      - DeepSeek: prompt_cache_hit_tokens / prompt_cache_miss_tokens
+      - GLM/OpenAI: prompt_tokens_details.cached_tokens
+      - Anthropic(中转): cache_read_input_tokens / cache_creation_input_tokens
+    """
+    if not isinstance(usage, dict) or not usage:
+        return
+    hit = usage.get("prompt_cache_hit_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    cached_tokens = None
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        cached_tokens = prompt_details.get("cached_tokens")
+    cache_read = usage.get("cache_read_input_tokens")
+    cache_creation = usage.get("cache_creation_input_tokens")
+
+    # 没有任何缓存字段就不记，减少噪音
+    if all(v is None for v in (hit, miss, cached_tokens, cache_read, cache_creation)):
+        return
+
+    prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+
+    # 计算命中率百分比（按厂商口径分别算）
+    rate_str = ""
+    if hit is not None or miss is not None:
+        h, m = hit or 0, miss or 0
+        total = h + m
+        rate_str = f" hit_rate={h / total * 100:.1f}%" if total else ""
+    elif cached_tokens is not None and prompt_tokens:
+        rate_str = f" cached_rate={cached_tokens / prompt_tokens * 100:.1f}%"
+    elif cache_read is not None or cache_creation is not None:
+        r, c = cache_read or 0, cache_creation or 0
+        total = r + c
+        rate_str = f" hit_rate={r / total * 100:.1f}%" if total else ""
+
+    _log(
+        f"📊 [Cache] model={model} prompt={prompt_tokens} completion={completion_tokens}"
+        f" ds_hit={hit} ds_miss={miss} cached={cached_tokens}"
+        f" cc_read={cache_read} cc_creation={cache_creation}{rate_str}"
+    )
+
+
+def _apply_claude_cache_control(req_data: dict) -> None:
+    """
+    给 Claude（中转站）的 system 消息加 cache_control: {type: ephemeral} 标记。
+    Anthropic 需要手动标记才会缓存；DeepSeek/Kimi/GLM 是自动缓存，不需要此标记。
+    ⚠️ 依赖中转站透传 cache_control 字段——部分中转站会剥离未知字段导致无效，需实测。
+
+    环境变量 CLAUDE_CACHE_CONTROL：
+      - auto（默认）：仅当 model 名含 'claude' 时启用
+      - true / 1 / yes：强制对所有模型启用
+      - false / 0 / no：强制关闭
+    """
+    _mode = os.environ.get("CLAUDE_CACHE_CONTROL", "auto").strip().lower()
+    if _mode in ("false", "0", "no", "off"):
+        return
+    model_name = str(req_data.get("model", "")).lower()
+    if _mode in ("auto",) and "claude" not in model_name:
+        return
+    if _mode not in ("auto", "true", "1", "yes", "on"):
+        return
+
+    messages = req_data.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    _MARKER = {"type": "ephemeral"}
+    _applied = False
+
+    # 给第一条 system 消息加缓存标记（把字符串 content 转成 content-block 数组格式）
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content")
+            if isinstance(content, str):
+                m["content"] = [{"type": "text", "text": content, "cache_control": _MARKER}]
+                _applied = True
+            elif isinstance(content, list) and content:
+                # 已是数组格式：给最后一个 block 加标记（避免重复标记）
+                last_block = content[-1]
+                if isinstance(last_block, dict) and "cache_control" not in last_block:
+                    last_block["cache_control"] = _MARKER
+                    _applied = True
+            break
+
+    # 给 tools 定义也加缓存标记（Anthropic 建议 tools 也标记）
+    tools = req_data.get("tools")
+    if isinstance(tools, list) and tools:
+        last_tool = tools[-1]
+        if isinstance(last_tool, dict) and "cache_control" not in last_tool:
+            last_tool["cache_control"] = _MARKER
+            _applied = True
+
+    if _applied:
+        _log(f"🏷️ [Cache] 已为 model={model_name} 添加 Claude cache_control(ephemeral) 标记")
+
 
 def _default_runtime_config() -> dict:
     """默认值：未配置 sys_config 或某键缺失时的回退（与现有行为一致）。"""
@@ -1253,8 +1377,14 @@ class HostFixMiddleware:
 
         # 强制流式（便于边透传边收集）
         req_data["stream"] = True
+        # 让上游在流末尾返回 usage（含 cached_tokens / prompt_cache_hit_tokens 等），
+        # 不支持的上游（Kimi/GLM 等）会自动忽略此字段，不报错。
+        req_data.setdefault("stream_options", {})["include_usage"] = True
         if req_data.get("tools"):
             req_data["tool_choice"] = "auto"
+
+        # 🏷️ Claude cache_control（opt-in）：给 system 消息加 ephemeral 缓存标记
+        _apply_claude_cache_control(req_data)
 
         # 构造请求头（修复 python-requests UA 被拦截 + 透传客户端头）
         client_headers = {k.decode("utf-8", "ignore").lower(): v.decode("utf-8", "ignore") for k, v in scope.get("headers", [])}
@@ -1309,6 +1439,7 @@ class HostFixMiddleware:
         collected_content = ""
         collected_reasoning = ""
         tool_calls_dict = {}
+        collected_usage = None  # 上游返回的 usage（含缓存命中字段）
 
         # 🏷️ 是否把 Claude 的 <thinking> 标签改写成 <think>（跨 chunk 状态机）
         rewrite_thinking = _should_rewrite_thinking(req_data.get("model", ""))
@@ -1340,6 +1471,8 @@ class HostFixMiddleware:
                 if chunk.startswith("data: ") and chunk != "data: [DONE]":
                     try:
                         dj = json.loads(chunk[6:])
+                        if dj.get("usage"):
+                            collected_usage = dj["usage"]
                         if dj.get("choices"):
                             delta = dj["choices"][0].get("delta", {})
                             if delta.get("content"):
@@ -1368,6 +1501,8 @@ class HostFixMiddleware:
                 continue
 
             rewritten = False
+            if dj.get("usage"):
+                collected_usage = dj["usage"]
             if dj.get("choices"):
                 delta = dj["choices"][0].get("delta", {})
                 if delta.get("content"):
@@ -1408,6 +1543,11 @@ class HostFixMiddleware:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
         # ==========================================
+        # 📊 Prompt Cache 命中观测（流结束后打日志，不阻塞响应）
+        # ==========================================
+        _log_cache_usage(req_data.get("model", ""), collected_usage)
+
+        # ==========================================
         # 💾 异步双写：把本轮对话存到 Supabase + Pinecone（不阻塞响应）
         # ==========================================
         if sb and user_msg and (collected_content or tool_calls_dict):
@@ -1445,26 +1585,36 @@ class HostFixMiddleware:
         except Exception:
             pass
 
-        # 阶段总结
-        core_summaries = "无长期记忆"
-        try:
-            sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
-            if sr and sr.data:
-                core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
-        except Exception:
-            pass
+        # 阶段总结（带 TTL 缓存 —— 内容不变才能维持 prompt cache 前缀稳定）
+        core_summaries = _stable_cached("core_summaries", _CORE_SUMMARIES_TTL)
+        if core_summaries is not None:
+            _log(f"📦 [Cache] core_summaries 命中 TTL 缓存（{_CORE_SUMMARIES_TTL}s）")
+        else:
+            core_summaries = "无长期记忆"
+            try:
+                sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
+                if sr and sr.data:
+                    core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
+            except Exception:
+                pass
+            _stable_set("core_summaries", core_summaries)
 
-        # 用户画像
-        user_prof = "暂无"
-        try:
-            # 画像查询：排除系统配置键；desire_ 前缀在 Python 侧精细过滤（见 _is_profile_key）。
-            # 加 .order("key") 稳定排序 —— 顺序固定，注入进稳定前缀的内容才不会变，缓存前缀才能命中。
-            pr = await asyncio.to_thread(lambda: sb.table("user_facts").select("key, value").neq("key", "sys_config").neq("key", "llm_settings").neq("key", "llm_models").order("key").execute())
-            if pr and pr.data:
-                rows = [r for r in pr.data if _is_profile_key(r.get("key", ""))]
-                user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in rows[:60]])
-        except Exception:
-            pass
+        # 用户画像（带 TTL 缓存 —— 同理）
+        user_prof = _stable_cached("user_prof", _STABLE_PREFIX_TTL)
+        if user_prof is not None:
+            _log(f"📦 [Cache] user_prof 命中 TTL 缓存（{_STABLE_PREFIX_TTL}s）")
+        else:
+            user_prof = "暂无"
+            try:
+                # 画像查询：排除系统配置键；desire_ 前缀在 Python 侧精细过滤（见 _is_profile_key）。
+                # 加 .order("key") 稳定排序 —— 顺序固定，注入进稳定前缀的内容才不会变，缓存前缀才能命中。
+                pr = await asyncio.to_thread(lambda: sb.table("user_facts").select("key, value").neq("key", "sys_config").neq("key", "llm_settings").neq("key", "llm_models").order("key").execute())
+                if pr and pr.data:
+                    rows = [r for r in pr.data if _is_profile_key(r.get("key", ""))]
+                    user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in rows[:60]])
+            except Exception:
+                pass
+            _stable_set("user_prof", user_prof)
 
         # Pinecone 向量记忆（可选）
         # 🚫 向量记忆注入门控：vector_memory_injection_enabled=false 时跳过 Pinecone 检索
@@ -1484,32 +1634,48 @@ class HostFixMiddleware:
                 _log(f"Pinecone 检索失败（跳过）: {e}")
 
         # 最近对话历史（按 tag 拉，转成 user/assistant 交替）
+        # 📦 自适应注入：客户端已自带历史（非 system 消息 >1）时跳过 DB 历史，
+        #    避免每轮 DB 窗口滚动导致前缀移位、破坏 prompt cache 命中。
+        #    由环境变量 INJECT_DB_HISTORY 控制：auto=自适应（默认）、always=总是注入、never=从不注入。
+        _inject_db_history_mode = os.environ.get("INJECT_DB_HISTORY", "auto").strip().lower()
         history_msgs = []
-        try:
-            _TAGS = [chat_tag, "TG_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
-            hr = await asyncio.to_thread(lambda: sb.table("memories").select("content, tags").in_("tags", _TAGS).order("created_at", desc=True).limit(20).execute())
-            if hr and hr.data:
-                rows = list(reversed(hr.data))[-10:]
-                for row in rows:
-                    c = str(row.get("content", "")).strip()
-                    if not c:
-                        continue
-                    if c.startswith(user_name):
-                        history_msgs.append({"role": "user", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
-                    elif c.startswith("我(") or c.startswith(f"我({ai_name})"):
-                        history_msgs.append({"role": "assistant", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
-                # 合并相邻同 role
-                merged = []
-                for m in history_msgs:
-                    if merged and merged[-1]["role"] == m["role"]:
-                        merged[-1]["content"] += "\n" + m["content"]
-                    else:
-                        merged.append(m)
-                history_msgs = merged
-                while history_msgs and history_msgs[0]["role"] != "user":
-                    history_msgs.pop(0)
-        except Exception as e:
-            _log(f"拉取上文失败（跳过）: {e}")
+        _client_msg_count = sum(
+            1 for m in req_data.get("messages", [])
+            if m.get("role") in ("user", "assistant")
+        )
+        _skip_db_history = (
+            _inject_db_history_mode == "never"
+            or (_inject_db_history_mode == "auto" and _client_msg_count > 1)
+        )
+        if _skip_db_history:
+            if _inject_db_history_mode == "auto" and _client_msg_count > 1:
+                _log(f"📦 [Cache] 客户端已带 {_client_msg_count} 条历史消息，跳过 DB 历史注入（维持缓存前缀稳定）")
+        else:
+            try:
+                _TAGS = [chat_tag, "TG_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
+                hr = await asyncio.to_thread(lambda: sb.table("memories").select("content, tags").in_("tags", _TAGS).order("created_at", desc=True).limit(20).execute())
+                if hr and hr.data:
+                    rows = list(reversed(hr.data))[-10:]
+                    for row in rows:
+                        c = str(row.get("content", "")).strip()
+                        if not c:
+                            continue
+                        if c.startswith(user_name):
+                            history_msgs.append({"role": "user", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
+                        elif c.startswith("我(") or c.startswith(f"我({ai_name})"):
+                            history_msgs.append({"role": "assistant", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
+                    # 合并相邻同 role
+                    merged = []
+                    for m in history_msgs:
+                        if merged and merged[-1]["role"] == m["role"]:
+                            merged[-1]["content"] += "\n" + m["content"]
+                        else:
+                            merged.append(m)
+                    history_msgs = merged
+                    while history_msgs and history_msgs[0]["role"] != "user":
+                        history_msgs.pop(0)
+            except Exception as e:
+                _log(f"拉取上文失败（跳过）: {e}")
 
         # 拼装 system prompt
         # 渠道显示名：懒加载 server 模块的映射（避免模块级循环依赖）
@@ -1659,6 +1825,7 @@ class HostFixMiddleware:
         collected_reasoning = ""
         tool_calls_dict = {}
         final_text = ""
+        loop_usage = None  # 收集最后一轮的 usage（含缓存命中字段）
 
         for round_i in range(max_rounds):
             payload = copy.deepcopy(base_payload)
@@ -1690,6 +1857,9 @@ class HostFixMiddleware:
             except Exception:
                 await self._sse_plain_error(send, req_data, "[上游错误] 非 JSON 响应")
                 return
+
+            if data.get("usage"):
+                loop_usage = data["usage"]
 
             choice = (data.get("choices") or [{}])[0]
             message = choice.get("message") or {}
@@ -1740,6 +1910,8 @@ class HostFixMiddleware:
             final_text = collected_content or _TOOL_LOOP_FALLBACK_TEXT
 
         await self._sse_final_text(send, req_data, final_text)
+
+        _log_cache_usage(req_data.get("model", ""), loop_usage)
 
         if sb and user_msg and (collected_content or tool_calls_dict):
             asyncio.create_task(

@@ -361,6 +361,10 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `OCR_MAX_IMAGES` | ❌ | `3` | 单次最多识别图片数 |
 | `SAVE_THINKING` | ❌ | `false` | 存库时是否保留模型思考过程（`<think>…</think>`）。默认 `false`：写入 Supabase `memories`（及 Pinecone）前剥离思考块，只存正文，避免 thinking 占满字数导致正文被 2000 字截断。设 `true` 则保留旧行为（把 reasoning 包成 `<think>` 块拼在正文前）。仅影响存库内容，不影响实时回复。 |
 | `REWRITE_THINKING_TAG` | ❌ | 空（自动） | 转发时是否把响应正文里的 `<thinking>…</thinking>` 标签改写成 `<think>…</think>`。留空=**自动**：仅当上游 `model` 名含 `claude` 时启用；设 `true/1/yes` 强制对所有模型开启，`false/0/no` 强制关闭。流式下用跨 chunk 状态机处理被切碎的标签，不会漏改。改写后的正文同时用于存库，可与 `SAVE_THINKING` 的 `<think>` 剥离逻辑对齐。 |
+| `STABLE_PREFIX_TTL` | ❌ | `300` | 🆕 **Prompt Cache**：`user_prof`（用户画像）TTL 缓存秒数。窗口内不重新查 DB，保证 stable_system 前缀字节不变，让上游 prompt cache 能命中。设 `0` 关闭缓存（每轮都查 DB，缓存命中率会下降）。 |
+| `CORE_SUMMARIES_TTL` | ❌ | 同 `STABLE_PREFIX_TTL` | 🆕 **Prompt Cache**：`core_summaries`（阶段总结）TTL 缓存秒数。总结只在日记/总结生成时变，可单独设比画像更长（如 `600`）进一步提升命中率。设 `0` 关闭。 |
+| `INJECT_DB_HISTORY` | ❌ | `auto` | 🆕 **Prompt Cache**：DB 历史注入模式。`auto`=客户端已带历史（非 system 消息 >1）时跳过 DB 历史注入，避免每轮 DB 窗口滚动破坏缓存前缀；`always`=总是注入（旧行为）；`never`=从不注入。 |
+| `CLAUDE_CACHE_CONTROL` | ❌ | `auto` | 🆕 **Prompt Cache**：是否给 Claude（中转站）的 system 消息加 `cache_control:{type:ephemeral}` 标记。`auto`=仅 model 含 `claude` 时启用；`true`/`1`/`yes`=强制对所有模型启用；`false`/`0`/`no`=关闭。⚠️ 依赖中转站透传该字段，部分中转站会剥离导致无效，需实测。 |
 | `SILICON_API_KEY` | ❌ | 空 | STT 语音识别 Key（硅基流动） |
 | `SILICON_STT_BASE_URL` | ❌ | 空 | STT 服务地址 |
 | `SILICON_STT_MODEL` | ❌ | 空 | STT 模型名 |
