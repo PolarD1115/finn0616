@@ -550,7 +550,7 @@ def _get_current_persona() -> str:
 # 可用环境变量 CHANNEL_DISPLAY_MAP（JSON）覆盖，例如：
 #   CHANNEL_DISPLAY_MAP={"Web_Chat":"橘子岛","QQ_MSG":"QQ","TG_MSG":"TG"}
 DEFAULT_CHANNEL_DISPLAY = {
-    "Web_Chat": "橘子岛",
+    "Web_Chat": "网页对话",
     "QQ_MSG": "QQ",
     "QQ_Chat": "QQ",
     "QQ_Group": "QQ",
