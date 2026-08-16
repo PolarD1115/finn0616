@@ -1009,3 +1009,14 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
 | 分享发现 | `search_memory` |
 | 偷偷关心 | （无工具） |
 
+## 移动端网关 Mini App（2026-08-16）
+
+- 以 `console.html` 为完整功能基线重构 `miniapp.html`，保留系统概览、模型设置、消息渠道、情绪与欲望、记忆库、用户画像、上下文与存储、状态面板全部功能。
+- Mini App 继续复用原控制台的 `/api/admin/*`、`/api/models`、`/api/desire`、`/api/memories`、`/api/profile` 接口及状态面板 Supabase 查询/RPC，不新增后端接口。
+- 页面改为移动端固定顶部状态栏和底部横向导航；内容采用单列响应式布局，表格支持横向滚动，弹窗改为底部面板，控件扩大到触控尺寸并适配安全区域。
+- 顶部密钥按钮用于展开或收起 `API_SECRET` 配置；进入状态面板时同时显示 Supabase URL 与 anon key 配置。
+- 更新 `gateway.py` 的 `/miniapp` 页面说明，使其与当前“管理 API + 状态面板按需直连 Supabase”的实现一致。
+- 验证：`gateway.py` 通过 `py_compile`；内联 JavaScript 通过 Node 语法解析；Mini App 与 Console 均为 8 个页面、87 个唯一元素 ID、57 个功能函数，管理 API 集合一致。
+- Playwright 在 360x800、390x844、768x1024 三种视口完成页面切换和几何检查：无页面横向溢出、底部导航固定可见、连接配置可展开、8 个页面均可切换且无浏览器脚本错误。
+- 未新增环境变量，未修改或删除任何 Supabase 数据。
+
