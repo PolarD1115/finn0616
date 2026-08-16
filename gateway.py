@@ -2314,7 +2314,9 @@ class HostFixMiddleware:
         await send({"type": "http.response.body", "body": html.encode("utf-8")})
 
     async def _handle_miniapp_page(self, send):
-        """返回 Mini App 配置面板（纯静态 HTML，前端直连 Supabase）。
+        """返回移动端网关管理 Mini App。
+
+        管理功能走网关 /api/*；状态面板按需直连 Supabase。
         页面从同目录 miniapp.html 读取；找不到则返回提示。
         """
         try:
