@@ -60,7 +60,7 @@
 | `USER_ID` | ❌ | `default` | 用户隔离 ID（Pinecone 向量记忆按此区分不同用户） |
 | `AI_PERSONA` | ❌ | 空 | AI 人设完整文本，会拼接到 system 提示最前面 |
 | `CHAT_TAG` | ❌ | `Web_Chat` | 存库时给本轮对话打的标签（用于区分网页/TG/QQ 渠道） |
-| `CHANNEL_DISPLAY_MAP` | ❌ | 见默认 | 🆕 渠道标签→显示名映射（JSON），注入到 system prompt「当前聊天渠道」。默认：`{"Web_Chat":"橘子岛","QQ_MSG":"QQ","QQ_Chat":"QQ","QQ_Group":"QQ","TG_MSG":"TG","Email_Process":"邮件"}`。例：`CHANNEL_DISPLAY_MAP={"Web_Chat":"橘子岛","QQ_MSG":"qq","TG_MSG":"tg"}` |
+| `CHANNEL_DISPLAY_MAP` | ❌ | 见默认 | 🆕 渠道标签→显示名映射（JSON），注入到 system prompt「当前聊天渠道」。默认：`{"Web_Chat":"网页对话","QQ_MSG":"QQ","QQ_Chat":"QQ","QQ_Group":"QQ","TG_MSG":"TG","Email_Process":"邮件"}`。例：`CHANNEL_DISPLAY_MAP={"Web_Chat":"网页对话","QQ_MSG":"qq","TG_MSG":"tg"}` |
 | `SUMMARY_THRESHOLD` | ❌ | `30` | 🆕 自动总结阈值：全渠道（网页/QQ/TG/邮件）对话流水累计达到该条数时，自动调用聊天模型（`main_chat`）生成第一人称阶段总结，存入 `Core_Cognition` 并归档旧记录。依赖 `CHAT_API_KEY`。 |
 | `DEVICE_CONTEXT_ENABLED` | ❌ | `true` | 🆕 是否把 `device_data` 最新一条快照注入 system prompt（只注入最新一条并标注更新时间）。网页/TG/QQ 全渠道生效。设 `false`/`0` 关闭。 |
 | `DEVICE_CONTEXT_TOP_APPS` | ❌ | `5` | 🆕 设备快照中「应用使用榜单」条数（1–10） |
