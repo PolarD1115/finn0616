@@ -1020,3 +1020,9 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
 - Playwright 在 360x800、390x844、768x1024 三种视口完成页面切换和几何检查：无页面横向溢出、底部导航固定可见、连接配置可展开、8 个页面均可切换且无浏览器脚本错误。
 - 未新增环境变量，未修改或删除任何 Supabase 数据。
 
+## 网页渠道显示名恢复（2026-08-16）
+
+- 将 `server.py` 中 `Web_Chat` 的默认渠道显示名由“橘子岛”恢复为“网页对话”。
+- 同步更新 `CHANNEL_DISPLAY_MAP` 的代码示例及 `VARIABLES.md` 默认值说明。
+- 未新增环境变量，未修改或删除任何 Supabase 数据。
+
