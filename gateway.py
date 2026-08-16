@@ -640,6 +640,9 @@ def _default_runtime_config() -> dict:
         "vector_memory_injection_enabled": True,
         # 设备状态快照注入：仅前台聊天门控（后台自主活动仍走 DEVICE_CONTEXT_ENABLED 环境变量）
         "device_context_enabled": True,
+        # Agent 赚钱系统：false 时禁止 Agent 自主入账（wallet_earn bypass_cap=False），
+        # 但不关闭钱包（余额查询/消费/猫用品购买/零花钱/打赏不受影响）。
+        "money_earning_enabled": True,
     }
 
 
@@ -723,6 +726,19 @@ def _device_context_enabled() -> bool:
     仍沿用 DEVICE_CONTEXT_ENABLED 环境变量，不受此开关影响。
     """
     return _get_runtime_config().get("device_context_enabled", True)
+
+
+def _money_earning_enabled() -> bool:
+    """Agent 赚钱系统门控（sys_config 运行时开关，5s 热生效）。
+
+    True（默认）：允许 Agent 通过 wallet_earn（bypass_cap=False）自主赚钱。
+    False：禁止 Agent 自主入账，但不关闭钱包——
+      wallet_check / wallet_log / wallet_spend / cat_shop_buy /
+      手动零花钱（bypass_cap=True）/ 手动打赏（bypass_cap=True）均不受影响。
+    门控必须放在实际入账调用入口，tool_loop.call_tool 与 server.py 的 wallet_earn
+    都会调用本函数，防止仅前端隐藏后被 MCP 直调绕过。
+    """
+    return _get_runtime_config().get("money_earning_enabled", True)
 
 
 def _config_source_of(key: str) -> str:
@@ -2556,7 +2572,8 @@ class HostFixMiddleware:
 
             allowed = {"telegram_enabled", "qq_enabled", "emotion_enabled",
                        "desire_driven", "chat_history_write_enabled",
-                       "vector_memory_injection_enabled", "device_context_enabled"}
+                       "vector_memory_injection_enabled", "device_context_enabled",
+                       "money_earning_enabled"}
             bad = [k for k in patch if k not in allowed]
             if bad:
                 await _send_json_resp(send, 400, {"error": f"不允许的字段: {', '.join(bad)}", "allowed": sorted(allowed)})
@@ -2648,6 +2665,7 @@ class HostFixMiddleware:
             "vector_injection_enabled": cfg.get("vector_memory_injection_enabled", True),
             "emotion_enabled": cfg.get("emotion_enabled", True),
             "desire_driven": cfg.get("desire_driven", False),
+            "money_earning_enabled": cfg.get("money_earning_enabled", True),
         }
         recent_logs = _system_logs_buffer[-30:]
 
@@ -2661,7 +2679,7 @@ class HostFixMiddleware:
             "config_sources": {k: _config_source_of(k) for k in (
                 "telegram_enabled", "qq_enabled", "emotion_enabled", "desire_driven",
                 "chat_history_write_enabled", "vector_memory_injection_enabled",
-                "device_context_enabled")},
+                "device_context_enabled", "money_earning_enabled")},
             "recent_logs": recent_logs,
         })
 

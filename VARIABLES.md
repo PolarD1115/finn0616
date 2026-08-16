@@ -25,14 +25,16 @@
 - [14. 欲望驱动系统 (情感 / 欲望引擎)](#14-欲望驱动系统-情感--欲望引擎)
 - [最小可运行配置示例](#最小可运行配置示例)
 
-> 💡 **运行时门控**：以下功能开关均通过桌面控制台 `/console` 管理，存储在 Supabase `user_facts.sys_config` JSON 字段中，无需重启即可生效：
+> 💡 **运行时门控**：以下功能开关均通过桌面控制台 `/console` 或 Mini App `/miniapp` 管理，存储在 Supabase `user_facts.sys_config` JSON 字段中，无需重启即可生效：
 > - `telegram_enabled` / `qq_enabled` —— 通讯渠道轮询
 > - `emotion_enabled` —— 情感引擎总闸
 > - `desire_driven` —— 欲望驱动总闸（另见 §14）
 > - `chat_write_enabled` —— 对话写入数据库（网页/TG/QQ）
 > - `vector_injection_enabled` —— Pinecone 向量记忆注入
+> - `device_context_enabled` —— 前台设备状态快照注入（后台自主活动仍走 `DEVICE_CONTEXT_ENABLED` 环境变量）
+> - `money_earning_enabled` —— Agent 赚钱系统门控（`true` 时允许 `wallet_earn` 自主入账；`false` 时禁止 Agent 自主赚钱，但不关闭钱包：余额查询/消费/猫用品购买/零花钱/打赏不受影响）。门控在实际入账调用入口（`tool_loop.call_tool` + `server.wallet_earn`），非仅前端隐藏。
 >
-> 所有开关默认 `true`（兼容旧行为），控制台关闭后 5 秒内生效。
+> 以上字段均存储在 `sys_config`（非环境变量），默认 `true`（`desire_driven` 默认 `false`），控制台关闭后 5 秒内热生效。
 
 ---
 

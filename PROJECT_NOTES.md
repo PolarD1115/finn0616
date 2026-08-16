@@ -1060,3 +1060,119 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://localhost
 - 同步更新 `CHANNEL_DISPLAY_MAP` 的代码示例及 `VARIABLES.md` 默认值说明。
 - 未新增环境变量，未修改或删除任何 Supabase 数据。
 
+## 自由活动猫状态检查 + Agent 赚钱系统开关（2026-08-17）
+
+### 需求
+
+- **目标一**：Agent 醒来后 3 轮自由活动唤醒内至少检查一次猫状态；低指标（hunger/happiness/cleanliness < 30）触发现有宠物照料 LLM 工具循环；区分"检查完成"与"照料完成"。
+- **目标三**：给 Console 和 Mini App 增加 `money_earning_enabled` 运行时开关，门控 Agent 自主赚钱（`wallet_earn` bypass_cap=False），不关闭钱包其他功能。
+
+### 已确认根因
+
+1. **`cat_status` 返回结构被误解析**：RPC `rpc_cat_status` 返回 `{ok, pet:{hunger,happiness,cleanliness,...}, inventory:[...]}`，指标嵌套在 `pet` 子对象里。但 `tool_loop._stringify` 只识别 `{ok,message,data}` 结构，对 `cat_status` 退化为 `"成功"`，真实数值从未喂给 LLM —— 宠物照料循环一直基于空状态决策。
+2. **无 happiness 低位事件**：`_PET_CARE_EVENT_DESC` 只有 `hungry_cat/dirty_cat/tired_cat`，happiness 低时无对应事件类型，无法触发照料。
+3. **无自由活动轮次计数器**：`async_free_activity` 无进程内状态跟踪检查频率，无法保证"3 轮内至少检查一次"。
+4. **`run_pet_care_tool_loop` 返回值不区分照料是否生效**：只返回 `(event_type, log_text)`，调用方无法判断模型是否真的调用了改善工具（空 tool_calls 也算"完成"）。
+5. **`wallet_earn` 无运行时门控**：MCP 直调（`server.wallet_earn`）和自由活动（`tool_loop.call_tool`）两个入口都没有 `money_earning_enabled` 检查，仅前端隐藏会被绕过。
+
+### 修改文件
+
+| 文件 | 目标 | 改动 |
+|------|------|------|
+| `tool_loop.py` | 一+三 | 新增 `_format_cat_status_for_llm` 正确解析 pet 子对象；`call_tool` 返回增加 `raw` 字段；新增 `unhappy_cat` 事件 + `_PET_CARE_EVENT_TOOLS_HINT`；`run_pet_care_tool_loop` 返回 4 元组含 `care_effective`/`cat_status_ok`；阶段2 prompt 强化"必须调用改善工具"要求；新增 `_money_earning_enabled()` helper + `_build_tool_schema_block` 暴露层裁剪 + `call_tool` 入口门控 |
+| `heartbeat.py` | 一 | 新增 `_free_activity_cat_check`（3 轮规则 + 失败重试 + tick 协调 + 低指标触发照料）；`_try_pet_care` 返回 dict 含 `ran/care_effective/cat_status_ok/skipped_cooldown`；`async_free_activity` 唤醒流程集成猫检查 |
+| `gateway.py` | 三 | `_default_runtime_config` 增加 `money_earning_enabled=true`；新增 `_money_earning_enabled()` helper；PATCH 白名单 + status config_sources + process dict |
+| `server.py` | 三 | `wallet_earn` MCP 入口门控（bypass_cap=False 且关闭 → `MONEY_EARNING_DISABLED`） |
+| `console.html` | 三 | 存储页增加"Agent 赚钱系统"卡片 + `loadStorage` 渲染 |
+| `miniapp.html` | 三 | 同 console.html |
+| `test_cat_check.py` | 一 | 新增 31 项测试 |
+| `test_money_earning.py` | 三 | 新增 23 项测试 |
+| `VARIABLES.md` | 三 | 运行时门控说明补充 `money_earning_enabled`（明确非环境变量） |
+
+### 轮次定义
+
+- 一"轮" = `async_free_activity` 成功进入一次后台自由活动唤醒流程（非 LLM 内部工具调用轮次）。
+- 进程内内存计数（`_free_activity_cat_check`），不落库，进程重启从首轮重新检查。
+
+### 猫检查和失败重试规则
+
+| 情况 | 检查计数 | care_pending | 下一轮行为 |
+|------|---------|-------------|-----------|
+| cat_status 成功 + 无低指标 | 重置为 0 | False | 按 3 轮规则 |
+| cat_status 成功 + 低指标 + 照料生效 | 重置为 0 | False | 按 3 轮规则 |
+| cat_status 成功 + 低指标 + 照料未生效（空 tool_calls/只 cat_status/工具全失败/无LLM） | 重置为 0 | True | 下一轮必须重试 |
+| cat_status 成功 + 低指标 + 照料因冷却期跳过（tick 刚处理过） | 重置为 0 | False | 按 3 轮规则 |
+| cat_status 失败（DB 不可用/异常） | 不重置，递增 | 不变 | 下一轮必须重试 |
+| cat_status 返回结构异常（缺 pet） | 不重置，递增 | 不变 | 下一轮必须重试 |
+| 宠物 tick 侧成功 cat_status 后 | 重置为 0 | False | 避免与 tick 重复检查 |
+
+- 阈值：检查成功后允许最多跳过 2 轮，第 3 轮必须查（`rounds_since_check >= 2` 触发）。
+- 低指标优先级：hunger > happiness > cleanliness。
+- 协调：全局 `_cat_status_last_ok_ts` 时间戳，tick 照料成功 cat_status 后更新，自由活动唤醒时检测到更新则重置计数。
+
+### money_earning_enabled 的准确语义
+
+- 默认 `true`，存储在 `user_facts.sys_config`，5s 热生效，非环境变量。
+- `true`：Agent 可通过 `wallet_earn`（bypass_cap=False）自主赚钱。
+- `false`：禁止 Agent 自主入账，但不关闭钱包。
+- **不受影响**：`wallet_check`、`wallet_log`、`wallet_spend`、`cat_shop_buy`、手动零花钱（bypass_cap=True）、手动打赏（bypass_cap=True）、查看余额和历史流水。
+- **门控位置**（最终入口，非仅前端隐藏）：
+  - `tool_loop.call_tool`（自由活动工具循环入口）
+  - `server.wallet_earn`（MCP 直调入口）
+  - `tool_loop._build_tool_schema_block`（暴露层裁剪，减少无效调用）
+- 被拒返回：`{ok: false, error_code: "MONEY_EARNING_DISABLED", message: "赚钱系统已关闭..."}`。
+- 前端：Console 与 Mini App 存储页一致，复用 `toggleRow()`/`patchConfig()`，显示值/来源/已热生效。
+
+### 验证命令和结果
+
+```
+# 语法检查
+python -c "import ast; [ast.parse(open(f,encoding='utf-8').read()) for f in ['tool_loop.py','heartbeat.py','gateway.py','server.py','home_system.py','test_cat_check.py','test_money_earning.py']]"
+→ 全部 OK
+
+# 前端 JS 语法 + money_earning_enabled 存在性
+node -e "..."  # 检查 console.html / miniapp.html
+→ 3 script block(s) OK each, money_earning_enabled count: 2 each
+
+# 目标一测试
+python -m unittest test_cat_check -v
+→ Ran 31 tests, OK
+
+# 目标三测试
+python -m unittest test_money_earning -v
+→ Ran 23 tests, OK
+
+# 两个新测试套件合跑
+python -m unittest test_cat_check test_money_earning
+→ Ran 54 tests, OK
+
+# 回归测试（宠物照料 + 钱包 + 猫 + tick + console）
+python -m unittest test_tool_loop.TestPetCareLoop test_wallet test_cat test_cat_tick test_console
+→ 111 tests, OK
+
+# 全套回归
+python -m unittest test_tool_loop test_wallet test_cat test_cat_tick test_console test_cat_check test_money_earning test_import test_keywords
+→ 248 tests, 5 failures（全部为预先存在的"查天气"确定性路径相关失败，与本次改动无关）, 2 skipped
+```
+
+### 未验证内容及原因
+
+- **生产 Supabase 写入测试**：按需求约束未连接生产数据库，数据库相关测试全部使用 mock。
+- **前端实际渲染**：未启动网关用浏览器访问 `/console`、`/miniapp` 验证开关交互；仅做了 JS 语法解析和 `money_earning_enabled` 存在性检查。复用现有 `toggleRow()`/`patchConfig()`/`loadStorage()` 框架，视觉与交互方式与同页其他开关一致。
+- **3 轮规则的真实后台时序**：测试用 mock 直接调用 `_free_activity_check_cat` 验证计数逻辑，未在真实 `async_free_activity` 多小时运行中验证（进程内状态、无副作用、逻辑可测）。
+- **多进程热生效**：5s TTL 缓存机制为现有设计（进程 A/B 各自缓存），未新增多进程测试。
+
+### 明确声明
+
+- **未删除或迁移任何 Supabase 数据**。本次改动不涉及任何数据库 DDL/DML，不创建新表、新 RPC、新迁移。
+- **未新增环境变量**（`money_earning_enabled` 存储在 `sys_config`，非环境变量）。
+- **未改变**：猫商品价格/物品效果/RPC、猫状态衰减速度/数据库阈值、`wallet_earn` 工具定义、自由活动原有选择/写日记/外向推送/欲望驱动逻辑、其他运行时开关行为。
+
+### 已知风险或副作用
+
+1. **`run_pet_care_tool_loop` 返回值从 2 元组变 4 元组**：`_try_pet_care` 已同步更新解包；现有测试 `test_tool_loop.TestPetCareLoop` 用索引访问 `result[0]`/`result[1]` 仍兼容，4 项全通过。但若有外部调用方按 2 元组解包会报错（已确认仅 `_try_pet_care` 调用）。
+2. **`call_tool` 返回增加 `raw` 字段**：现有调用方读 `ok`/`text` 不受影响；`raw` 仅在需要原始结构时使用。
+3. **猫检查增加后台开销**：每 3 轮自由活动多一次 `cat_status` RPC 调用（轻量查询），可忽略。
+4. **`unhappy_cat` 事件不走 SQL 阈值**：`rpc_cat_tick` 不会主动产生 `unhappy_cat` 事件（SQL 无 happiness 阈值块），该事件仅由自由活动猫检查在 happiness<30 时触发。这是设计选择：不修改 SQL 阈值（需求约束），由 Python 侧补充 happiness 检查。
+5. **5 个预先存在的测试失败**：`test_tool_loop` 中 5 项与"查天气"确定性路径相关的失败在本次改动前已存在，与本次两个目标无关，未修复（不在需求范围内）。
+

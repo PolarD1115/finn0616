@@ -1517,6 +1517,18 @@ async def wallet_check():
 async def wallet_earn(amount: float, source_key: str, reason: str, bypass_cap: bool = False):
     """【小钱包·入账】向 finn_wallet 入账。source_key 用于幂等防重。
     bypass_cap=True 时全额入账、不计周上限、不进加班银行（零花钱/打赏用）。"""
+    # 赚钱系统运行时门控：bypass_cap=False（Agent 自主赚钱）且 money_earning_enabled=false
+    # 时拒绝。bypass_cap=True（零花钱/打赏）不受影响。这是 MCP 直调的最终入口门控，
+    # 防止仅在前端/自由活动暴露层隐藏后被 MCP 直调绕过。
+    if not bypass_cap:
+        try:
+            import gateway as _gw
+            if not _gw._money_earning_enabled():
+                return {"ok": False, "error_code": "MONEY_EARNING_DISABLED",
+                        "message": "赚钱系统已关闭，Agent 暂不能自主入账。"
+                                   "不影响钱包余额、消费、猫用品购买、零花钱和打赏。"}
+        except Exception:
+            pass  # 读不到配置时保持默认开启，不阻断
     def _call():
         return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason, bypass_cap=bypass_cap)
     return await asyncio.to_thread(_call)

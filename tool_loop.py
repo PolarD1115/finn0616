@@ -411,6 +411,60 @@ def _stringify(result: Any) -> str:
     return str(result)
 
 
+def _format_cat_status_for_llm(raw: Any, text: str, ok: bool) -> tuple[str, bool]:
+    """从 cat_status 的真实返回结构提取关键指标，格式化成 LLM 可读文本。
+
+    cat_status RPC（rpc_cat_status）返回 {ok, pet:{hunger,happiness,cleanliness,
+    health,energy,status,mood,...}, inventory:[...]}，指标嵌套在 pet 子对象里
+    （既不在顶层，也不在 data 字段里）。
+
+    call_tool 的 _stringify 只识别 {ok,message,data} 结构，对 cat_status 会退化成
+    "成功"，导致真实数值喂不到 LLM。这里基于 raw 原始返回重新解析。
+
+    参数：
+      raw   call_tool 返回的 raw 字段（原始 dict）
+      text  call_tool 返回的 text 字段（兜底）
+      ok    call_tool 返回的 ok 字段
+
+    返回 (status_text, cat_status_ok)。
+    cat_status_ok=True 表示成功拿到 pet 结构；False 表示查询失败或结构异常。
+    """
+    # 优先用原始返回结构解析
+    if isinstance(raw, dict) and raw.get("ok"):
+        pet = raw.get("pet")
+        if isinstance(pet, dict):
+            inv = raw.get("inventory") or []
+            inv_names = []
+            if isinstance(inv, list):
+                for it in inv:
+                    if isinstance(it, dict):
+                        n = it.get("item_id") or it.get("name") or it.get("id")
+                        q = it.get("qty", it.get("quantity", ""))
+                        if n:
+                            inv_names.append(f"{n}×{q}" if q not in ("", None) else str(n))
+            parts = [
+                f"饱食度={pet.get('hunger')}",
+                f"快乐={pet.get('happiness')}",
+                f"清洁={pet.get('cleanliness')}",
+                f"精力={pet.get('energy')}",
+                f"健康={pet.get('health')}",
+                f"状态={pet.get('status')}",
+                f"心情={pet.get('mood')}",
+            ]
+            txt = " ".join(parts)
+            txt += " 库存: " + (", ".join(inv_names) if inv_names else "空")
+            return txt, True
+        # ok=True 但缺 pet 字段：结构异常
+        return "❌ 猫状态返回结构异常（缺少 pet 字段）", False
+    # raw 不可用：退回 text（可能已是错误文本或退化的"成功"）
+    if ok:
+        # text 退化为"成功"时，无法判断真实指标，标记为不可用
+        if not text or text == "成功":
+            return "❌ 猫状态返回不可用", False
+        return text, True
+    return text or "❌ 猫状态查询失败", False
+
+
 def _parse_json_block(raw: str) -> dict:
     """稳健解析模型输出的 JSON（去围栏 + 截花括号块）。失败返回 {}。"""
     if not raw:
@@ -430,11 +484,25 @@ def _parse_json_block(raw: str) -> dict:
         return {}
 
 
+def _money_earning_enabled() -> bool:
+    """读取 money_earning_enabled 运行时开关（sys_config，5s 热生效）。
+    默认 True。延迟 import gateway 避免循环依赖（gateway 在进程 A/B 都可用）。"""
+    try:
+        import gateway as _gw
+        return _gw._money_earning_enabled()
+    except Exception:
+        return True  # 读不到配置时保持默认开启，不阻断现有行为
+
+
 def _build_tool_schema_block(activity: str) -> str:
     """为指定 activity 生成可用工具列表的 prompt 文本。"""
     names = ACTIVITY_TOOL_MAP.get(activity, [])
     if not names:
         return ""
+    # 赚钱系统关闭时，从暴露层隐藏自主赚钱工具（减少无效调用）。
+    # 最终入口门控在 call_tool，这里只是提示层裁剪。
+    if not _money_earning_enabled():
+        names = [n for n in names if n != "wallet_earn"]
     lines = []
     for n in names:
         spec = TOOL_REGISTRY.get(n)
@@ -472,7 +540,7 @@ async def _resolve_callable(spec: dict):
 
 async def call_tool(name: str, args: dict) -> dict:
     """进程内调用单个工具（白名单 + 参数校验 + 固定身份注入 + 错误隔离）。
-    返回 {ok, text}。任何失败都吞掉，绝不向上抛。
+    返回 {ok, text}（成功时额外带 raw）。任何失败都吞掉，绝不向上抛。
     """
     spec = TOOL_REGISTRY.get(name)
     if not spec:
@@ -484,12 +552,24 @@ async def call_tool(name: str, args: dict) -> dict:
     if fn is None:
         return {"ok": False, "text": f"❌ 工具 {name} 不可用（callable 未解析）"}
     full_args = {**spec.get("fixed_args", {}), **(args or {})}
+
+    # 赚钱系统入口门控：wallet_earn 且 bypass_cap=False（Agent 自主赚钱）时，
+    # 若 money_earning_enabled=false 则拒绝。bypass_cap=True（零花钱/打赏）不受影响。
+    # 这是最终入口门控，防止仅在前端/暴露层隐藏后被 MCP 直调绕过。
+    if name == "wallet_earn" and not _money_earning_enabled():
+        bypass_cap = bool(full_args.get("bypass_cap", False))
+        if not bypass_cap:
+            return {"ok": False,
+                    "text": "❌ 赚钱系统已关闭，Agent 暂不能自主入账 (MONEY_EARNING_DISABLED)"}
+
     try:
         if inspect.iscoroutinefunction(fn):
             result = await fn(**full_args)
         else:
             result = await asyncio.to_thread(fn, **full_args)
-        return {"ok": True, "text": _stringify(result)}
+        # 返回原始 result（raw）供需要完整结构的调用方解析；
+        # text 是 _stringify 的简要文本（喂 LLM 用）。多一个字段不破坏现有调用方。
+        return {"ok": True, "text": _stringify(result), "raw": result}
     except Exception as e:
         return {"ok": False, "text": f"❌ {name} 执行失败: {e}"}
 
@@ -733,7 +813,19 @@ _PET_CARE_EVENT_DESC = {
     "hungry_cat": "小满的饱食度降到了危险低位（<30），它饿了，需要喂食",
     "dirty_cat": "小满的清洁度降到了低位（<30），它脏了，需要清洁",
     "tired_cat": "小满的精力降到了低位（<20），它累了，需要恢复精力",
+    "unhappy_cat": "小满的快乐值降到了低位（<30），它心情不好/孤单，需要陪伴玩耍",
 }
+
+# 事件类型 → 建议优先调用的改善工具（仅作 prompt 提示，不强制，仍由 LLM 决策）
+_PET_CARE_EVENT_TOOLS_HINT = {
+    "hungry_cat": "cat_feed（喂食）；库存不足先 cat_shop_buy 购买食物再喂",
+    "dirty_cat": "cat_clean（清洁）",
+    "tired_cat": "cat_restore_energy（恢复精力）",
+    "unhappy_cat": "cat_pet（抚摸，快乐+5）或 cat_play（玩耍）；也可先 cat_shop_buy 购买玩具再玩",
+}
+
+# 仅查看状态、不算实际照料改善的工具名（care_effective 判断时排除）
+_PET_CARE_OBSERVE_ONLY_TOOLS = {"cat_status", "cat_shop_list"}
 
 
 async def run_pet_care_tool_loop(
@@ -746,24 +838,32 @@ async def run_pet_care_tool_loop(
 ) -> tuple[str, str] | None:
     """宠物状态驱动照料循环。
 
-    当 cat_tick 检测到阈值穿越事件（hungry_cat/dirty_cat/tired_cat）时调用。
-    先查猫当前状态，然后让 LLM 自主决定照料动作（喂食/清洁/恢复/购买），
-    执行工具调用，最后生成一条照料日记。
+    当 cat_tick 检测到阈值穿越事件（hungry_cat/dirty_cat/tired_cat/unhappy_cat）时调用，
+    或由自由活动的猫状态检查在发现低指标时触发。
+    先查猫当前状态（正确解析 pet 子对象里的 hunger/happiness/cleanliness），
+    然后让 LLM 自主决定照料动作（喂食/清洁/玩耍/抚摸/购买），执行工具调用，
+    最后生成一条照料日记。
 
     参数：
       client      LLM 客户端（background 角色）
       ask_llm     server._ask_llm_async 函数引用
       system_ctx  已构建好的 system prompt 上下文
       now_bj      当前北京时间
-      event_type  触发的事件类型（hungry_cat/dirty_cat/tired_cat）
+      event_type  触发的事件类型（hungry_cat/dirty_cat/tired_cat/unhappy_cat）
 
-    返回 (event_type, log_text)；None 表示本轮应跳过。
+    返回 (event_type, log_text, care_effective, cat_status_ok)；
+      care_effective  是否实际调用了至少一个非查看类的成功改善工具
+      cat_status_ok   阶段1 cat_status 是否成功拿到 pet 结构
+      None 表示本轮应跳过（LLM 决策阶段异常）。
     """
     event_desc = _PET_CARE_EVENT_DESC.get(event_type, f"小满状态异常（{event_type}）")
+    tools_hint = _PET_CARE_EVENT_TOOLS_HINT.get(event_type, "")
 
-    # ── 阶段 1：查猫当前状态 ──
+    # ── 阶段 1：查猫当前状态（正确解析 pet 子对象）──
     status_res = await call_tool("cat_status", {})
-    status_text = status_res["text"] if status_res.get("ok") else f"❌ {status_res.get('text', '')}"
+    status_text, cat_status_ok = _format_cat_status_for_llm(
+        status_res.get("raw"), status_res.get("text", ""), status_res.get("ok", False)
+    )
 
     # ── 阶段 2：构建工具 schema + 让 LLM 自主决策 ──
     schema_lines = []
@@ -786,6 +886,7 @@ async def run_pet_care_tool_loop(
     schema_block = "\n".join(schema_lines)
 
     now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    tools_hint_line = f"\n本事件建议优先：{tools_hint}。" if tools_hint else ""
     stage2_prompt = f"""
 现在是 {now_str}。你收到了一个宠物状态告警：
 {event_desc}
@@ -799,8 +900,10 @@ async def run_pet_care_tool_loop(
 规则：
 - 最多调用 {MAX_TOOL_CALLS} 个工具。
 - 参数必须符合上面的类型与枚举。
-- 如果库存不足，先 cat_shop_buy 购买再使用。
-- 不要调用上面没列出的工具。
+- ⚠️ 发现低指标后不能只查看状态（cat_status）或写日记，必须尝试调用至少一个能改善对应低指标的动作工具（喂食/清洁/抚摸/玩耍/恢复精力）。
+- 如果库存不足，先 cat_shop_buy 购买再使用对应工具。
+- 快乐值低时可优先 cat_pet，也可以 cat_play。
+- 不要调用上面没列出的工具。{tools_hint_line}
 
 只输出一行 JSON，不要多余文字：
 {{"tool_calls": [{{"name": "工具名", "args": {{...}}}}]}}
@@ -856,5 +959,14 @@ async def run_pet_care_tool_loop(
     if not final_log:
         final_log = f"照料了小满（{event_type}）"
 
-    print(f"{log_prefix} 完成「{event_type}」(调了 {len(results)} 个工具): {final_log[:30]}...")
-    return (event_type, final_log)
+    # care_effective：是否实际调用了至少一个非查看类的成功改善工具。
+    # 仅查看状态（cat_status/cat_shop_list）或模型未指定任何工具、或改善工具全失败，
+    # 都不算"照料成功"，调用方应据此保留待重试标记。
+    care_effective = any(
+        r.get("ok") and r.get("name") not in _PET_CARE_OBSERVE_ONLY_TOOLS
+        for r in results
+    )
+
+    print(f"{log_prefix} 完成「{event_type}」(调了 {len(results)} 个工具, "
+          f"care_effective={care_effective}, cat_status_ok={cat_status_ok}): {final_log[:30]}...")
+    return (event_type, final_log, care_effective, cat_status_ok)

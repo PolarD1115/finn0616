@@ -456,6 +456,17 @@ async def async_free_activity():
                 continue
 
             now_bj = _get_now_bj()
+
+            # 🐱 自由活动猫状态检查（3 轮规则）：
+            # 一"轮"= 成功进入一次后台自由活动唤醒流程（此处）。
+            # 首轮必查；此后任意连续 3 轮内至少调用一次 cat_status；
+            # 低指标触发现有照料循环；照料未生效则置 care_pending 下轮重试。
+            # 单独 try/except 隔离，绝不影响自由活动原有逻辑。
+            try:
+                await _free_activity_check_cat(now_bj)
+            except Exception as _cate:
+                print(f"🐱 [自由活动·猫检查] 异常（不影响自由活动）: {_cate}")
+
             recent_keys = await asyncio.to_thread(_recent_activity_keys, 2)
 
             # 防连续重复：若最近两轮做了同一件事，就从候选里排除它
@@ -1158,16 +1169,57 @@ def start_message_process_bg():
 _pet_care_last_fire: dict[str, float] = {}
 _PET_CARE_COOLDOWN_SECS = 1800  # 30 分钟
 
+# ── 自由活动猫状态检查：进程内轮次计数（不落库，进程重启从首轮重新检查）──
+# 一"轮"= async_free_activity 成功进入一次后台自由活动唤醒流程（非 LLM 内部工具调用轮次）。
+# 规则：
+#   - 进程启动后第一次自由活动唤醒就检查猫状态。
+#   - 此后任意连续 3 次自由活动唤醒内必须至少调用一次 cat_status
+#     （检查轮后允许最多跳过 2 轮，第 3 轮必须查；rounds_since_check>=2 触发）。
+#   - cat_status 成功返回有效结构 → 本轮检查完成，重置计数（最多 3 轮后再查）。
+#   - cat_status 失败 → 检查未完成，不重置计数，下一轮继续尝试。
+#   - 低指标触发照料但照料未生效（空 tool_calls / 只 cat_status / 工具全失败）→
+#     检查本身已完成（计数重置），但置 care_pending=True，下一轮再次检查并尝试照料。
+#   - 宠物 tick 告警照料流程已成功 cat_status → 重置自由活动计数，避免紧接着重复检查。
+_free_activity_cat_check = {
+    "rounds_since_check": 0,   # 自上次成功 cat_status 检查起累计的自由活动唤醒轮数
+    "care_pending": False,     # True=上次低指标触发的照料未生效，下一轮需重试
+    "last_check_ts": 0.0,      # 自由活动侧上次成功 cat_status 的 epoch
+}
+# 全局：任意路径（自由活动 / 宠物 tick 照料）最后成功 cat_status 的 epoch。
+# 用于自由活动与 tick 之间的最小协调：tick 照料成功 cat_status 后更新此值，
+# 自由活动唤醒时若发现此值 > 自己的 last_check_ts，则重置计数。
+_cat_status_last_ok_ts = 0.0
+
+# 猫状态低水位阈值（hunger/happiness/cleanliness 低于此值触发照料）
+_PET_LOW_THRESHOLD = 30
+# 低指标 → 事件类型映射（按优先级顺序检查）
+_LOW_STAT_EVENT_MAP = (
+    ("hunger", "hungry_cat"),
+    ("happiness", "unhappy_cat"),
+    ("cleanliness", "dirty_cat"),
+)
+
 
 async def _try_pet_care(event_type: str, now_bj):
-    """阈值事件触发后，若不在冷却期，发起 LLM 照料循环并写日记。"""
+    """阈值事件触发后，若不在冷却期，发起 LLM 照料循环并写日记。
+
+    返回 dict：
+      {"ran": bool, "care_effective": bool, "cat_status_ok": bool, "skipped_cooldown": bool}
+    - ran=True 表示实际执行了照料循环（run_pet_care_tool_loop 返回非 None）
+    - skipped_cooldown=True 表示因冷却期跳过（最近已被其他路径处理）
+    - care_effective=True 表示实际调用了至少一个非查看类的成功改善工具
+    - cat_status_ok=True 表示阶段1 cat_status 成功拿到 pet 结构
+    调用方（tick）可忽略返回值；自由活动侧据此决定 care_pending。
+    """
     import time
+    global _cat_status_last_ok_ts
     now_ts = time.time()
     last = _pet_care_last_fire.get(event_type, 0)
     if now_ts - last < _PET_CARE_COOLDOWN_SECS:
         remaining = int(_PET_CARE_COOLDOWN_SECS - (now_ts - last))
         print(f"🐱 [宠物照料] {event_type} 在冷却期内（剩余 {remaining}s），跳过")
-        return
+        return {"ran": False, "care_effective": False, "cat_status_ok": False,
+                "skipped_cooldown": True}
 
     try:
         from server import _get_llm_client, _ask_llm_async, _save_memory_to_db, _build_channel_context
@@ -1176,7 +1228,8 @@ async def _try_pet_care(event_type: str, now_bj):
         client = _get_llm_client("background")
         if not client:
             print(f"🐱 [宠物照料] 无 LLM 客户端，跳过")
-            return
+            return {"ran": False, "care_effective": False, "cat_status_ok": False,
+                    "skipped_cooldown": False}
 
         system_ctx = await _build_channel_context("小满需要照顾，去看看它", channel_tag="TG_MSG")
         care_result = await tool_loop.run_pet_care_tool_loop(
@@ -1187,17 +1240,124 @@ async def _try_pet_care(event_type: str, now_bj):
             event_type=event_type,
         )
         if care_result is None:
-            return
+            return {"ran": False, "care_effective": False, "cat_status_ok": False,
+                    "skipped_cooldown": False}
+
+        # 解包 4 元组：(event_type, log_text, care_effective, cat_status_ok)
+        _, log_text, care_effective, cat_status_ok = care_result
+
+        # cat_status 成功 → 更新全局协调时间戳（供自由活动侧重置计数）
+        if cat_status_ok:
+            _cat_status_last_ok_ts = time.time()
 
         _pet_care_last_fire[event_type] = now_ts
-        _, log_text = care_result
         await asyncio.to_thread(
             _save_memory_to_db,
             f"🐱 宠物照料·{event_type}", log_text, "记事", "牵挂", "Pet_Care"
         )
-        print(f"🐱 [宠物照料] 完成 {event_type}: {log_text[:30]}...")
+        print(f"🐱 [宠物照料] 完成 {event_type} (care_effective={care_effective}): {log_text[:30]}...")
+        return {"ran": True, "care_effective": care_effective,
+                "cat_status_ok": cat_status_ok, "skipped_cooldown": False}
     except Exception as e:
         print(f"❌ [宠物照料] 出错: {e}")
+        return {"ran": False, "care_effective": False, "cat_status_ok": False,
+                "skipped_cooldown": False}
+
+
+async def _free_activity_check_cat(now_bj):
+    """自由活动唤醒时按 3 轮规则检查猫状态。
+
+    在 async_free_activity 成功进入一次唤醒流程后调用。
+    - 首轮（last_check_ts==0）必须检查；
+    - care_pending=True 必须检查（上次照料未生效，需重试）；
+    - rounds_since_check>=3 必须检查；
+    - 否则累加计数、本轮不检查。
+
+    检查时调用 cat_status，正确解析 pet 子对象。cat_status 失败不重置计数。
+    发现低指标（hunger/happiness/cleanliness<30）→ 调 _try_pet_care 触发现有照料循环。
+    """
+    import time
+    global _cat_status_last_ok_ts
+
+    # 协调：若宠物 tick 照料侧自上次自由活动检查后成功 cat_status 过，重置计数。
+    # 避免自由活动与 tick 紧接着重复检查/照料。
+    if _cat_status_last_ok_ts > _free_activity_cat_check["last_check_ts"]:
+        _free_activity_cat_check["rounds_since_check"] = 0
+        _free_activity_cat_check["last_check_ts"] = _cat_status_last_ok_ts
+        _free_activity_cat_check["care_pending"] = False
+        print(f"🐱 [自由活动·猫检查] 检测到 tick 侧已检查猫状态，重置计数")
+
+    need_check = (
+        _free_activity_cat_check["last_check_ts"] == 0.0   # 进程首轮
+        or _free_activity_cat_check["care_pending"]         # 上次照料未生效
+        or _free_activity_cat_check["rounds_since_check"] >= 2
+    )
+    if not need_check:
+        _free_activity_cat_check["rounds_since_check"] += 1
+        return
+
+    # 调用 cat_status（直接走 home_system，拿到原始 pet 结构）
+    try:
+        import home_system as _hs
+        status = await asyncio.to_thread(_hs.cat_status, "user_finn")
+    except Exception as e:
+        print(f"🐱 [自由活动·猫检查] cat_status 异常，本轮不重置计数: {e}")
+        _free_activity_cat_check["rounds_since_check"] += 1
+        return
+
+    if not (isinstance(status, dict) and status.get("ok")):
+        msg = status.get("message", "未知") if isinstance(status, dict) else "非字典返回"
+        print(f"🐱 [自由活动·猫检查] cat_status 失败（{msg}），本轮不重置计数，下一轮重试")
+        _free_activity_cat_check["rounds_since_check"] += 1
+        return
+
+    pet = status.get("pet")
+    if not isinstance(pet, dict):
+        print(f"🐱 [自由活动·猫检查] cat_status 返回结构异常（缺 pet），本轮不重置计数")
+        _free_activity_cat_check["rounds_since_check"] += 1
+        return
+
+    # 检查成功：重置计数
+    now_ts = time.time()
+    _cat_status_last_ok_ts = now_ts
+    _free_activity_cat_check["last_check_ts"] = now_ts
+    _free_activity_cat_check["rounds_since_check"] = 0
+
+    hunger = pet.get("hunger")
+    happiness = pet.get("happiness")
+    cleanliness = pet.get("cleanliness")
+    print(f"🐱 [自由活动·猫检查] 饱食度={hunger} 快乐={happiness} 清洁={cleanliness}")
+
+    # 找低指标（按优先级 hunger > happiness > cleanliness）
+    low_event = None
+    for stat_key, evt in _LOW_STAT_EVENT_MAP:
+        v = pet.get(stat_key)
+        if isinstance(v, (int, float)) and v < _PET_LOW_THRESHOLD:
+            low_event = evt
+            break
+
+    if not low_event:
+        # 无低指标：清除待重试标记
+        _free_activity_cat_check["care_pending"] = False
+        return
+
+    # 发现低指标 → 进入现有宠物照料 LLM 工具循环
+    print(f"⚠️ [自由活动·猫检查] 发现低指标({low_event})，触发照料循环")
+    care_ret = await _try_pet_care(low_event, now_bj)
+    if not isinstance(care_ret, dict):
+        _free_activity_cat_check["care_pending"] = True
+        return
+    if care_ret.get("skipped_cooldown"):
+        # 冷却期内（最近已被 tick 处理过）→ 视为已处理，清除待重试
+        _free_activity_cat_check["care_pending"] = False
+    elif care_ret.get("ran") and care_ret.get("care_effective"):
+        # 照料生效 → 清除待重试
+        _free_activity_cat_check["care_pending"] = False
+    else:
+        # 照料未生效（空 tool_calls / 只 cat_status / 工具全失败 / 无LLM）→ 保留待重试
+        _free_activity_cat_check["care_pending"] = True
+        print(f"🐱 [自由活动·猫检查] 照料未生效（ran={care_ret.get('ran')}, "
+              f"care_effective={care_ret.get('care_effective')}），保留待重试标记")
 
 
 async def async_pet_house_tick():
