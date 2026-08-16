@@ -339,13 +339,17 @@ def enqueue_event(etype: str, payload: Optional[Dict[str, Any]] = None,
     _save_fact(EVENTS_QUEUE_KEY, q)
 
 
-async def record_user_message(text: str, message_id: Optional[str] = None) -> None:
+async def record_user_message(text: str, message_id: Optional[str] = None,
+                             channel: Optional[str] = None) -> None:
     """
     收到用户消息时调用（异步，供消息处理路径 await）：
       分类（LLM，跑在线程池里不阻塞事件循环）→ enqueue 一个 msg_user 事件（带分类结果）。
     任何失败都吞掉、只打日志——分类挂了绝不能影响正常回复。
+
+    channel：可选渠道标识（"Web"/"TG"/"QQ"），仅用于日志可观测性，不写入事件本身。
     """
     import asyncio as _asyncio
+    _ch = channel or "?"
     try:
         classified = await _asyncio.to_thread(classify_message_sync, text)
         await _asyncio.to_thread(
@@ -353,10 +357,10 @@ async def record_user_message(text: str, message_id: Optional[str] = None) -> No
             {"message_id": message_id, "text_len": len((text or ""))},
             classified,
         )
-        print(f"💗 [欲望驱动] 用户消息已分类入队 label={classified['label']} "
+        print(f"💗 [欲望驱动] [{_ch}] 用户消息已分类入队 label={classified['label']} "
               f"conf={classified['confidence']:.2f}")
     except Exception as e:
-        print(f"💗 [欲望驱动] record_user_message 跳过：{e}")
+        print(f"💗 [欲望驱动] [{_ch}] record_user_message 跳过：{e}")
 
 
 async def record_assistant_message(message_id: Optional[str] = None) -> None:

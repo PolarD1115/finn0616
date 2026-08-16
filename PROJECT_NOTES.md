@@ -66,6 +66,40 @@
 
 **与 v3.7-v3.9 的关系**：v3.7 做了 prompt 注入位置重排（两段式 stable/volatile），v3.8 把 desire 状态迁出 user_facts，v3.9 修画像注入排序/截断。本次是同一条线的延续——前缀位置和内容来源已稳定，但"每轮都查 DB 导致前缀字节变化"这一根因此前未解决。
 
+### v5.3 — 情绪/欲望状态长期不变化修复（网页聊天接入事件链 + 前端字段对齐 + 渠道可观测性）
+**问题现象**：控制台「情绪维度」进度条多日不变化，`_recent_labels` 停在 `["neutral","playful","playful"]`、`last_interaction_at` 停在旧时间，尽管数据库仍有 `Web_Chat` 聊天记录。`attachment` 长期 0.45、`duty` 长期 0.05。
+
+**已确认根因**（三条，均已验证）：
+1. **网页聊天未接入情绪事件链路**（根因 A）：`gateway.py` 的两条网页路径——普通流式 `_handle_chat` 与工具循环 `_handle_chat_with_tool_loop`——都没有调用 `desire_bridge.record_user_message()` / `record_assistant_message()`。仅 `heartbeat.py`（TG）和 `napcat.py`（QQ）调用了。后果：网页聊天从不产生 `msg_user`/`msg_assistant` 事件 → 分类器从未被触发 → `_recent_labels` 与 `last_interaction_at` 不随网页对话更新（只有 TG/QQ 消息更新它）。
+2. **前端情绪字段与后端真实字段不一致**（根因 B）：后端 `emotion_engine.build_display()` 产出 15 个 DIMS 键 + `fatigue`（`vitality/longing/intimacy/possessiveness/lust/jealousy/anxiety/protectiveness/contentment/elation/seeking/play/dejection/irritability/fear/fatigue`）；前端 `console.html` 与 `miniapp.html` 用的 `emoKeys` 却是旧字段（`joy/calm/sadness/anger/...`），二者仅 `anxiety/longing/fear/fatigue` 4 个重合，其余 12 维前端查不到值永远显示"—"。这是进度条不变化的直接原因。驱动条 `dKeys`（attachment/curiosity/reflection/duty/social/libido/stress/fatigue）字段正确，未改。
+3. **attachment=0.45 / duty=0.05 是固定基线设计**（根因 C，非 bug）：`attachment=0.45` = `desire_engine.BASELINE_CAP`（attachment 地板漂移的硬上限，`drift_baseline()` clamp 到 `[0.30,0.45]`）；`duty=0.05` = `BASELINE["duty"]`（`map_from_emotions()` 在 `has_pending_task=False` 时无条件强制置此基线，且 `pick_intent` 把 duty 排除出候选）。二者是业务规则，本次不动。
+
+**改动**（7 个文件；无新增环境变量、不改 DB schema、不删数据）：
+
+- **`desire_bridge.py`**：`record_user_message()` 新增可选参数 `channel: Optional[str] = None`（取值 "Web"/"TG"/"QQ"），仅用于日志可观测性，不写入事件本身。日志改为 `💗 [欲望驱动] [{渠道}] 用户消息已分类入队 label=... conf=...`。`record_assistant_message()` 签名不变（渠道已在 user 日志体现）。
+- **`gateway.py`**：新增私有辅助方法 `_record_desire_events(self, user_msg, channel="Web")`，内部按序调用 `record_user_message`（含分类+msg_user）→ `record_assistant_message`（msg_assistant），保证事件队列里 msg_user 在 msg_assistant 之前（与 TG/QQ 一致），全程吞异常。两条网页路径在异步双写 `_save_conversation` 之后接入：
+  - 普通流式 `_handle_chat`（流式响应 1543 行结束后）：`if user_msg and (collected_content or tool_calls_dict) and _emotion_enabled()` 时 `asyncio.create_task(self._record_desire_events(user_msg, channel="Web"))`。不阻塞首字（流式已结束），上游全错时不入队（与 TG reply 为空 return 一致），`_emotion_enabled()` 门控（同 TG/QQ）。
+  - 工具循环 `_handle_chat_with_tool_loop`（正常结束、有最终文本或工具调用时）：同样条件接入。该路径的 3 个提前 `return`（连接错误/HTTP 错/非 JSON）不入队——无成功回复。
+- **`heartbeat.py`**：TG 调用 `record_user_message(text)` → `record_user_message(text, channel="TG")`。
+- **`napcat.py`**：QQ 调用 `record_user_message(text)` → `record_user_message(text, channel="QQ")`。
+- **`console.html`**：`_E` 与 `emoKeys` 从旧字段替换为后端真实字段（`vitality:"活力"` ... `fatigue:"疲惫"` 共 16 项），`_D`/`dKeys` 驱动条不变。布局/样式不变。
+- **`miniapp.html`**：与 console.html 完全相同的字段替换，保证两端一致。
+
+**是否修改数据库**：否。全程只读查询（排查阶段）、零 DDL、零 DML 写入。
+
+**验证结果**：
+- `python -m py_compile gateway.py desire_bridge.py emotion_engine.py heartbeat.py napcat.py server.py` ✅ 全绿。
+- `python -m unittest test_console -v` ✅ 31 passed（2 skipped，为需测试壳的 live route 测试，与本次改动无关）。关键回归点：`test_all_py_compile`（全 py 编译）、`test_inline_js_node_check`（console.html 内联 JS 语法）、`test_desire_bridge_gates_db_aware`（门控）、`test_emotion_enabled_toggle`（情感开关）、`test_gate_covers_all_channels`（三渠道覆盖）均通过。
+- 静态一致性：后端 `ee.DIMS.keys()` 15 项 + fatigue = 前端 emoKeys 16 项，完全对齐。
+- 日志验证点：网页聊天后应出现 `💗 [欲望驱动] [Web] 用户消息已分类入队 label=... conf=...`；TG/QQ 日志渠道标识分别为 `[TG]`/`[QQ]`。
+
+**已知限制 / 风险**：
+- 重复入队：每次 `/v1/chat/completions` 独立请求，`_record_desire_events` 每次只调一次，`enqueue_event` 用时间戳+随机数生成唯一 event_id，天然不重复。
+- 流式结束路径：普通流式（1543）+ 工具循环（1929）两条正常结束路径已覆盖；工具循环 3 个失败 return 不入队（正确）。
+- 分类器延迟：`record_user_message` 内部 `asyncio.to_thread` 调 LLM 分类，不阻塞事件循环，且在流式结束后触发，不影响首字；分类失败降级 neutral，不影响聊天。
+- 数据库并发：事件队列入队是 read-modify-write，理论有竞态，但网页/TG/QQ 均低频消息、心跳周期消费，实际无冲突风险（与 TG/QQ 既有行为一致）。
+- `attachment`/`duty` 基线值不变化属设计规则，非本次修复目标；若需让它们动起来需另改业务规则（不在本次范围）。
+
 ### v5.1 — 天气工具缝合（wttr.in 真实天气：后台活动 / 聊天关键词注入 / MCP 工具）
 **需求**：把基于 wttr.in 的天气工具完整缝进网关——后台"查天气"活动调真实天气、聊天命中天气关键词时自动拉天气注入 prompt（保流式）、注册为 MCP 工具供客户端调用。
 

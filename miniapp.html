@@ -876,12 +876,12 @@ async function loadEmotion(force){
       toggleRow("emotion_enabled","情感/欲望引擎总开关",cfg.emotion_enabled,"关闭后停止 tick 计算 + 停止事件入队（停止消费事件）。引擎冻结，再次开启后恢复。",cfg.emotion_enabled,cfg.emotion_source)
       +toggleRow("desire_driven","DESIRE_DRIVEN 行为覆盖",cfg.desire_driven,"开：把「此刻最想做的事」注入自由活动 prompt 覆盖行为；关（默认）：只算只存快照供观测。",cfg.desire_driven,cfg.desire_driven_source);
     // 维度中文映射
-    const _E={joy:"喜悦",calm:"平静",anxiety:"焦虑",sadness:"悲伤",anger:"愤怒",tenderness:"温柔",excitement:"兴奋",longing:"想念",guilt:"愧疚",pride:"骄傲",shame:"羞耻",envy:"嫉妒",hope:"希望",fear:"恐惧",disgust:"厌恶",surprise:"惊讶",fatigue:"疲惫"};
+    const _E={vitality:"活力",longing:"想念",intimacy:"亲密",possessiveness:"占有",lust:"情欲",jealousy:"嫉妒",anxiety:"焦虑",protectiveness:"保护",contentment:"满足",elation:"愉悦",seeking:"探索",play:"玩闹",dejection:"低落",irritability:"烦躁",fear:"恐惧",fatigue:"疲惫"};
     const _D={attachment:"依恋",curiosity:"好奇",reflection:"反思",duty:"责任",social:"社交",libido:"欲望",stress:"压力",fatigue:"疲惫"};
     // 情绪维度
     const drv=d.derived||{};
     const disp=drv.display||{};
-    const emoKeys=["joy","calm","anxiety","sadness","anger","tenderness","excitement","longing","guilt","pride","shame","envy","hope","fear","disgust","surprise","fatigue"];
+    const emoKeys=["vitality","longing","intimacy","possessiveness","lust","jealousy","anxiety","protectiveness","contentment","elation","seeking","play","dejection","irritability","fear","fatigue"];
     let eh="";
     emoKeys.forEach(k=>{
       let v=disp[k];if(v==null&&k==="fatigue")v=disp["fatigue"];

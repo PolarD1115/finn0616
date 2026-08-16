@@ -722,7 +722,7 @@ async def async_telegram_polling():
         if _emo_on:
             try:
                 import desire_bridge
-                await desire_bridge.record_user_message(text)
+                await desire_bridge.record_user_message(text, channel="TG")
                 await desire_bridge.record_assistant_message()
             except Exception as _dee:
                 _tg_log(f"欲望驱动事件入队跳过: {_dee}")

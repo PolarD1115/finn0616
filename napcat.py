@@ -375,7 +375,7 @@ def _get_qq_aggregator(send):
         if _emo_on:
             try:
                 import desire_bridge
-                await desire_bridge.record_user_message(text)
+                await desire_bridge.record_user_message(text, channel="QQ")
                 await desire_bridge.record_assistant_message()
             except Exception as _dee:
                 print(f"💗 [欲望驱动] QQ 事件入队跳过：{_dee}")

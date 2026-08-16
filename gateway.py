@@ -1553,6 +1553,11 @@ class HostFixMiddleware:
         if sb and user_msg and (collected_content or tool_calls_dict):
             asyncio.create_task(self._save_conversation(sb, user_msg, collected_content, collected_reasoning, tool_calls_dict))
 
+        # 💗 欲望驱动：网页用户消息分类 + AI 回复事件入队（同 TG/QQ，吞异常）。
+        #    放在流式响应结束后、不阻塞首字；仅在情感引擎总开关开启且有实际回复时入队。
+        if user_msg and (collected_content or tool_calls_dict) and _emotion_enabled():
+            asyncio.create_task(self._record_desire_events(user_msg, channel="Web"))
+
     async def _inject_context(self, req_data, sb, current_query):
         """
         智能体上下文注入（全部变量化，无硬编码）：
@@ -1935,6 +1940,12 @@ class HostFixMiddleware:
                 self._save_conversation(sb, user_msg, collected_content, collected_reasoning, tool_calls_dict)
             )
 
+        # 💗 欲望驱动：网页用户消息分类 + AI 回复事件入队（同普通流式路径，吞异常）。
+        #    仅在正常结束（有最终文本或工具调用）且情感引擎开启时入队；
+        #    上游失败的 3 个 return 分支不入队（无成功回复）。
+        if user_msg and (collected_content or tool_calls_dict) and _emotion_enabled():
+            asyncio.create_task(self._record_desire_events(user_msg, channel="Web"))
+
     async def _sse_final_text(self, send, req_data, text: str):
         """把最终文本包装成 OpenAI SSE，兼容现有流式客户端。"""
         model = req_data.get("model", "unknown")
@@ -1974,6 +1985,21 @@ class HostFixMiddleware:
 
     async def _sse_plain_error(self, send, req_data, err: str):
         await self._sse_final_text(send, req_data, f"\n\n{err}")
+
+    async def _record_desire_events(self, user_msg, channel: str = "Web"):
+        """网页聊天：用户消息分类 + AI 回复事件入队（同 TG/QQ，吞异常不影响聊天）。
+
+        顺序：先 record_user_message（含 LLM 分类 + msg_user 事件），
+        再 record_assistant_message（msg_assistant 事件），保证事件队列里
+        msg_user 在 msg_assistant 之前——与 heartbeat(TG)/napcat(QQ) 完全一致。
+        任何异常吞掉、只打日志，绝不影响已发出的聊天响应。
+        """
+        try:
+            import desire_bridge
+            await desire_bridge.record_user_message(user_msg, channel=channel)
+            await desire_bridge.record_assistant_message()
+        except Exception as e:
+            _log(f"💗 [欲望驱动] [{channel}] Web 事件入队跳过：{e}")
 
     async def _save_conversation(self, sb, user_msg, ai_msg, reasoning, tool_calls):
         """异步把本轮对话存到 Supabase memories 表 + Pinecone"""
