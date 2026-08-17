@@ -1352,3 +1352,101 @@ python -m unittest test_tool_loop test_wallet test_cat test_cat_tick test_consol
 
 项目目录非 Git 仓库（环境已确认 `Is a git repository: no`），未执行任何 `git` 操作，未提交。如需提交，建议：`feat(gateway): add taobao and web browsing free activities`。
 
+---
+
+## 2026-08-17 · 移除「逛淘宝」的高情欲抑制条件
+
+### 调整目标
+
+移除自由活动「逛淘宝」候选门控中由高情欲（`display.lust`）触发的抑制条件。调整后，无论 `display.lust` 有多高，都不能再因为这个字段禁止「逛淘宝」进入候选。高情欲本身既不抑制淘宝，也不额外促进淘宝。
+
+### 实际修改位置
+
+仅修改与"移除淘宝的高情欲抑制条件"直接相关的内容，未顺手调整任何无关规则。
+
+| 文件 | 位置 | 改动 |
+|------|------|------|
+| `tool_loop.py` | `_gate_taobao` 抑制红线块（原第 790-791 行） | 删除 `if display.get("lust", 0.0) > 0.85: sup.append("lust")` 两行 |
+| `tool_loop.py` | 门控原则注释（原第 702 行） | `lust>0.85 只抑制"逛淘宝"，不抑制"网上冲浪"` → `淘宝与冲浪均不受 lust 抑制（高情欲既不抑制也不强制触发）` |
+| `tool_loop.py` | `_gate_surf` docstring（原第 826 行） | 删除"与淘宝差异"中过时的 `lust>0.85 不抑制冲浪` 表述（该差异已不存在） |
+| `test_tool_loop.py` | `test_10_lust_suppress` → `test_10_high_lust_does_not_block_taobao` | 旧测试断言 `lust=0.86` 抑制淘宝（`assertFalse`）；改为验证新行为：`lust=0.91`（明显高于旧红线 0.85）且好奇橱窗正向模式命中、其他抑制条件未触发时，淘宝仍可进入候选（`assertTrue` 且断言命中"好奇橱窗"方向） |
+| `test_tool_loop.py` | `test_11_lust_does_not_suppress_surf` 注释 | `# lust>0.85 抑制淘宝但不抑制网上冲浪` → `# 高情欲既不抑制淘宝也不抑制冲浪（本例验证冲浪不被 lust 抑制）` |
+
+### 当前保留的淘宝抑制条件
+
+`_gate_taobao` 的抑制红线现在只保留三项，字段、阈值、比较符均未改动：
+
+- `display.anxiety > 0.50`
+- `display.dejection > 0.40`
+- `display.fatigue > 0.60`
+
+### 高情欲调整后的准确行为
+
+- 高情欲（`display.lust` 任意值，包括 >0.85）**不再抑制**「逛淘宝」进入候选。
+- 高情欲**也不强制触发**淘宝：淘宝是否进入候选仍由原有正向触发模式（好奇橱窗/整活橱窗/送礼橱窗/守护橱窗，阈值与比较符未变）、上述三个抑制条件、`TAOBAO_MCP_URL` 配置、`FREE_ACTIVITY_TOOL_LOOP` 开关、冷却（180 分钟）和每日上限（4 次）共同决定。
+- 「网上冲浪」门控（`_gate_surf`）本身从未受 lust 抑制，本次未改其任何逻辑，仅更新了一处过时注释。
+
+### 更新的测试
+
+- `test_10_high_lust_does_not_block_taobao`（由 `test_10_lust_suppress` 改名重写）：验证 `display["lust"]=0.91` + `curiosity=0.60` + `seeking=0.40` 时淘宝仍 `allowed=True` 且命中"好奇橱窗"方向。该测试验证候选结果，而非仅搜索源码字符串。
+- `test_11_lust_does_not_suppress_surf`：保留冲浪不被 lust 抑制的断言，更新注释表述。
+- `test_7_anxiety_suppress`（`anxiety=0.51`）、`test_8_dejection_suppress`（`dejection=0.41`）、`test_9_fatigue_suppress`（`fatigue=0.61`）：未改动，继续验证三个抑制条件仍然生效。
+- 「网上冲浪」及其他活动相关测试保持原样。
+
+### 实际验证命令和结果
+
+```
+# 1. Python 语法检查
+python -m py_compile tool_loop.py test_tool_loop.py
+→ 两者 exit 0，PY_COMPILE_OK
+
+# 2. 淘宝门控测试类（含新 test_10）
+python -m unittest test_tool_loop.TestGatingTaobao -v
+→ Ran 13 tests, OK（test_10_high_lust_does_not_block_taobao ok）
+
+# 3. 淘宝+冲浪门控测试类
+python -m unittest test_tool_loop.TestGatingTaobao test_tool_loop.TestGatingSurf
+→ Ran 25 tests, OK
+
+# 4. 与本次改动相关的全部测试类（门控/冷却/白名单/日志/一致性）
+python -m unittest test_tool_loop.TestGatingTaobao test_tool_loop.TestGatingSurf test_tool_loop.TestCooldownAndFrequency test_tool_loop.TestWhitelist test_tool_loop.TestPromptAndLog test_tool_loop.TestActivityConsistency
+→ Ran 42 tests, OK
+
+# 5. 完整 test_tool_loop 套件
+python -m unittest test_tool_loop
+→ Ran 108 tests, 6 failures
+```
+
+**6 项失败的归属确认**（通过还原改动前后对照验证）：
+- 5 项为**预先存在**的失败，与本次改动无关：`test_build_tool_schema_block_empty_activity`（查天气映射本就有 3 个工具，与断言"返回空"矛盾）、`test_avout_hint_passed_to_stage1`、`test_disabled_degrades_single_call`、`test_empty_draft_no_tools_returns_none`、`test_enabled_no_tools_activity_single_call`（后 4 项用"查天气"作测试活动，但查天气专用 finalize 路径会多调一次 LLM / 返回非 None，与"单次调用/返回 None"期望矛盾）。
+- 1 项 `test_invalid_activity_fallback_random` 为**预先存在的随机性偶发失败**：还原到本次改动前的原始代码连续跑 4 次，run 1 失败、run 2-4 通过，根因是 `random.choice` 兜底选中"查天气"时走 finalize 多调 LLM。与 lust 改动无关。
+- 还原对照后原始状态为 108 项 5 failures（上述前 5 项），修改后为 108 项 6 failures（前 5 项 + 随机偶发项），证明本次改动**未引入任何新的确定性失败**，且相关门控测试全部通过。
+
+### 残留规则检查
+
+在所有 `.py` 文件中搜索 `lust` 与 `0.85`：
+- 执行代码中**无任何**"`lust > 0.85` 抑制淘宝"的有效规则残留。`tool_loop.py` 中仅剩第 702 行注释提及 lust（说明两者都不受抑制）。
+- `0.85` 在 `.py` 中仅出现在 LLM `temperature=0.85`（heartbeat/tool_loop 的 ask_llm 调用）与新测试注释里的"旧红线 0.85"说明，均非抑制规则。
+- `desire_engine.py`/`emotion_engine.py` 中的 `lust` 引用是情欲引擎本身的字段定义与情绪计算，与淘宝门控无关，未改动。
+- `PROJECT_NOTES.md` 2026-08-17 上一任务的历史日志中仍保留 `lust>0.85 只抑制淘宝不抑制冲浪` 的表述——这是历史事实记录，按需求要求未篡改。
+
+### 未修改的内容
+
+- 未调整焦虑、低落、疲惫阈值（仍为 0.50 / 0.40 / 0.60，比较符仍为 `>`）。
+- 未调整淘宝其他触发模式（好奇/整活/送礼/守护橱窗的阈值与比较符不变）。
+- 未调整「网上冲浪」的任何门控（仅更新一处过时注释）。
+- 未调整冷却时间（淘宝 180min / 冲浪 90min）或每日次数（淘宝 4 / 冲浪 6）。
+- 未修改淘宝 MCP 调用方式。
+- 未增加"清水白名单"，未增加新的情欲分支。
+- 未修改其他自由活动，未重构无关代码，未统一无关格式。
+- 未修改 Supabase 表结构或数据。
+- 未新增环境变量，`VARIABLES.md` 无需修改（其中仅有 `TAOBAO_MCP_URL` 说明，无"情欲超过 0.85 禁止淘宝"的当前配置说明）。
+
+### Supabase 操作声明
+
+**明确声明本次未执行任何 Supabase 删除操作**：无 `DELETE` / `DROP` / `TRUNCATE`，无删除 memories、表、字段、函数、RPC、策略或历史数据。本次任务不需要任何数据库写入、迁移或删除。门控仅对 `memories` 做只读 `select`（沿用上一任务已有的 `_get_activity_stats`），未新增任何数据库访问。
+
+### Git commit 状态
+
+项目目录非 Git 仓库（环境已确认 `Is a git repository: no`），未执行任何 `git` 操作，未提交。如需提交，建议：`fix(gateway): remove lust inhibitor from taobao activity`。
+

@@ -699,7 +699,7 @@ def _build_tool_schema_block(activity: str) -> str:
 # 门控原则：先根据情绪和配置裁剪候选活动，模型只能从裁剪后的活动中选择。
 #   - 最低阈值统一用 >=（刚好等于阈值可触发）
 #   - 抑制红线统一用 >（严格大于才抑制）
-#   - lust>0.85 只抑制“逛淘宝”，不抑制“网上冲浪”
+#   - 淘宝与冲浪均不受 lust 抑制（高情欲既不抑制也不强制触发）
 #   - TAOBAO_MCP_URL 空 → 逛淘宝不候选；FREE_ACTIVITY_TOOL_LOOP 关 → 两者都不候选
 #   - Supabase 查询失败 → 只关闭这两个新增候选，不影响其他自由活动（不得变成无限制）
 def _get_supabase_safe():
@@ -787,8 +787,6 @@ def _gate_taobao(drive: dict, display: dict, stats: dict, now_epoch: float) -> d
         sup.append("dejection")
     if display.get("fatigue", 0.0) > 0.60:
         sup.append("fatigue")
-    if display.get("lust", 0.0) > 0.85:
-        sup.append("lust")
     if sup:
         return {"allowed": False, "directions": [], "reason": f"抑制红线: {','.join(sup)}"}
 
@@ -823,7 +821,7 @@ def _gate_taobao(drive: dict, display: dict, stats: dict, now_epoch: float) -> d
 def _gate_surf(drive: dict, display: dict, stats: dict, now_epoch: float, now_bj) -> dict:
     """网上冲浪门控。返回 {allowed, directions, reason}。
 
-    与淘宝差异：不要求 TAOBAO_MCP_URL；lust>0.85 不抑制冲浪；
+    与淘宝差异：不要求 TAOBAO_MCP_URL；
     抑制红线为 anxiety>0.70 / dejection>0.60 / fatigue>0.70。
     """
     if not TOOL_LOOP_ENABLED:
