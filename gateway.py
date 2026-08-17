@@ -765,11 +765,12 @@ MEM_CATEGORY_TAGS = {
     "qq": ["QQ_MSG", "QQ_Chat", "QQ_Group"],
     "tg": ["TG_MSG"],
     "free": ["Free_Activity"],
+    "secret_diary": ["Secret_Diary"],
 }
 
 
 def _memory_category(tags: str, content: str = "") -> str:
-    """把一条 memory 的 tags 映射到 6 个页签之一：core/web/qq/tg/free/other。
+    """把一条 memory 的 tags 映射到页签之一：core/web/qq/tg/free/secret_diary/other。
 
     规则（与控制台前端、记忆库页完全一致，单一真相源）：
       - 核心认知：tags ∈ Core_Cognition 系列
@@ -777,6 +778,7 @@ def _memory_category(tags: str, content: str = "") -> str:
       - QQ 对话：tags ∈ QQ_MSG/QQ_Chat/QQ_Group
       - TG 对话：tags == TG_MSG
       - 自由活动：tags == Free_Activity
+      - 秘密日记：tags == Secret_Diary（仅「写秘密日记」活动产生，独立面板展示）
       - 其他/历史：Archived_Chat、Desire_Trace、Heartbeat、逗号分隔的旧多词标签、
                    空标签、created_at 为空的历史数据 —— 统一归入 other
     """
@@ -791,6 +793,8 @@ def _memory_category(tags: str, content: str = "") -> str:
         return "tg"
     if t == "Free_Activity":
         return "free"
+    if t == "Secret_Diary":
+        return "secret_diary"
     return "other"
 
 

@@ -1176,3 +1176,73 @@ python -m unittest test_tool_loop test_wallet test_cat test_cat_tick test_consol
 4. **`unhappy_cat` 事件不走 SQL 阈值**：`rpc_cat_tick` 不会主动产生 `unhappy_cat` 事件（SQL 无 happiness 阈值块），该事件仅由自由活动猫检查在 happiness<30 时触发。这是设计选择：不修改 SQL 阈值（需求约束），由 Python 侧补充 happiness 检查。
 5. **5 个预先存在的测试失败**：`test_tool_loop` 中 5 项与"查天气"确定性路径相关的失败在本次改动前已存在，与本次两个目标无关，未修复（不在需求范围内）。
 
+---
+
+## 2026-08-17 · 自由活动数据分类拆分与秘密日记独立面板
+
+### 需求背景
+
+调整"自由活动"的数据分类与秘密日记功能，使内向活动日志和秘密日记分开保存：只有"写秘密日记"活动产生 `Secret_Diary` 记录（不发 Telegram、独立面板展示），其余内向活动继续用 `Free_Activity`；外向活动不增加独立冷却，不改触发频率；Console 和 Miniapp 增加独立"秘密日记"面板；秘密日记 Prompt 改为平实直接风格。
+
+### 已修改文件
+
+- `tool_loop.py` — `ACTIVITY_TOOL_MAP["写秘密日记"]` 由 `["save_memory"]` 改为 `[]`；新增 `_finalize_secret_diary()` 专用确定性路径（平实 prompt，不调任何工具）；主循环 `run_free_activity_tool_loop` 在查天气分支后新增"写秘密日记"分支。
+- `heartbeat.py` — 主流程保存按 activity 区分：写秘密日记保存为 `tags=Secret_Diary / category=日记`（标题 `🔒 秘密日记·写秘密日记`），其余活动仍保存为 `tags=Free_Activity`；`_recent_activity_keys` 查询改为 `.in_("tags", ["Free_Activity","Secret_Diary"])` 覆盖两标签防连续重复。
+- `gateway.py` — `MEM_CATEGORY_TAGS` 新增 `"secret_diary": ["Secret_Diary"]`；`_memory_category()` 新增 `Secret_Diary → "secret_diary"` 分支；`/api/memories?category=secret_diary` 自动走 `in_("tags",["Secret_Diary"])` 精确查询。
+- `console.html` — 新增导航项"秘密日记"、`p-diary` 页面容器、`PAGE_TITLES.diary`、`loaders.diary`、以及 `loadDiary/openDiaryModal/saveDiary/delDiary` 四个 JS 函数（均复用 `/api/memories?category=secret_diary` 与 `PATCH /api/memories/:id`）。
+- `miniapp.html` — 与 console.html 同构的五处改动，两端面板功能完全一致。
+
+### 普通内向活动与秘密日记的分类区别
+
+| 活动类型 | tags | category | 标题前缀 | Telegram | 面板 |
+|---|---|---|---|---|---|
+| 写秘密日记 | `Secret_Diary` | `日记` | `🔒 秘密日记·写秘密日记` | 不发 | 秘密日记面板 |
+| 逛虚拟小屋/查天气/抽张塔罗/翻旧回忆/发呆放空/记点小账 | `Free_Activity` | `记事` | `🎈 自由活动·{activity}` | 不发 | 自由活动页签 |
+| 想对方了/分享发现/偷偷关心（外向） | `Free_Activity` | `记事` | `🎈 自由活动·{activity}` | 发送（`_push_wechat` 现有逻辑不变） | 自由活动页签 |
+
+外向活动：未新增 `FREE_ACTIVITY_OUTGOING_INTERVAL`、未新增独立调度器、未新增 `Outgoing_Activity` 冷却记录、未改 `FREE_ACTIVITY_INTERVAL`（默认仍 5400 秒）。
+
+### 如何避免"写秘密日记"重复写入
+
+重复写入的根因有两处，均已封堵：
+
+1. **工具循环侧（`tool_loop.py`）**：原 `ACTIVITY_TOOL_MAP["写秘密日记"]=["save_memory"]` 会在 `FREE_ACTIVITY_TOOL_LOOP=true` 时让阶段2 调用 `save_memory` 工具写一条记忆，随后主流程又写一条 → 两条。改为 `[]` 后，"写秘密日记"不再进入阶段2/3 工具循环，而是走新增的 `_finalize_secret_diary()` 专用路径（与查天气专用路径同构：阶段1 草稿兜底 + 专用 prompt 重新生成正文，全程不调任何工具）。
+2. **主流程侧（`heartbeat.py`）**：`async_free_activity` 主流程的 `_save_memory_to_db` 调用按 `activity` 分支，写秘密日记用 `Secret_Diary` 标签保存一次，其余用 `Free_Activity`。
+
+最终：一次"写秘密日记"只产生一条 `Secret_Diary` 记录。该改动只影响"写秘密日记"活动，其余活动（含查天气、记点小账、逛虚拟小屋等有工具的活动）的工具调用逻辑完全不变。
+
+### 秘密日记 Prompt（平实直接风格）
+
+`_finalize_secret_diary()` 的 prompt 全文遵循需求要求的平实风格：第一人称、80-160 字、直接说事情/想法/情绪、禁用比喻与华丽形容词、禁用"岁月静好/阳光洒进来/微风拂过"等套话、不提系统/任务/Prompt/模型/工具调用、只输出正文。查天气的专用 prompt（`_finalize_weather_activity`）未改动，且查天气仍走 `Free_Activity`，不会误存为 `Secret_Diary`。每日日记生成器的 `Core_Cognition` 日记分类逻辑未改动。
+
+### Console 和 Miniapp 的新增内容
+
+两端一致新增独立的"秘密日记"面板：
+- 导航入口 `<a data-p="diary">`（图标 `book-lock`），位于"记忆库"与"用户画像"之间。
+- `p-diary` 页面容器，含总数显示、刷新按钮、说明 hint、搜索框、列表、分页器。
+- JS 函数：`loadDiary`（查询 `category=secret_diary`，按 `created_at` 倒序，支持关键词搜索 `q` 与分页 `page/size`）、`openDiaryModal`（编辑模态框，复用现有 modal 样式）、`saveDiary`（`PATCH /api/memories/:id`）、`delDiary`（`DELETE /api/memories/:id`，带 confirm）。
+- 两端均复用现有 `api()`、`esc()`、`fmtCN8()`、`toast()`、`closeModal()`、`refreshIcons()` 与卡片/分页/模态框样式，未新增数据库访问机制，未新增 API 路由。
+
+### 验证命令与结果
+
+1. **Python 语法检查**：`python -m py_compile heartbeat.py tool_loop.py gateway.py server.py` → `PY_COMPILE_OK`。
+2. **HTML 内联 JS 语法检查**（node vm.Script 编译，不执行）：console.html 1 个 script 块通过、miniapp.html 1 个 script 块通过。
+3. **`test_console.py`**：31 项全部通过（含 `test_category_mapping`、`test_all_py_compile`、`test_inline_js_node_check`、`test_pagination_params_parsing`），2 项因测试壳未运行而 skip。
+4. **`test_tool_loop.py`**：56 项中 51 项通过；5 项失败均为预先存在的"查天气"确定性路径相关失败（`test_build_tool_schema_block_empty_activity` 用"查天气"断言返回空但查天气映射本就有3个工具；其余4项用"查天气"作测试活动但专用路径会多调一次 LLM，与"单次调用"期望矛盾）。test_tool_loop.py 中"写秘密日记"出现 0 次、`save_memory` 仅作为 `call_tool` 直调测试（不经 ACTIVITY_TOOL_MAP，均通过）→ 本次改动未引入任何新失败。
+5. **静态检查脚本（10 项）**：全部通过 — `Secret_Diary` 仅用于写秘密日记、`ACTIVITY_TOOL_MAP["写秘密日记"]==[]`、无 `FREE_ACTIVITY_OUTGOING_INTERVAL`/`Outgoing_Activity`、`_finalize_secret_diary` 无删除操作、两端 diary 面板要素齐全、gateway 分类映射登记、heartbeat 保存区分+防重复覆盖两标签、外向推送逻辑保留、秘密日记 prompt 含完整平实要求、`FREE_ACTIVITY_INTERVAL` 默认仍 5400。
+6. **gateway 分类映射运行时验证**：`_memory_category("Secret_Diary")=="secret_diary"`、`_category_tag_filter("secret_diary")==["Secret_Diary"]`、`Free_Activity` 仍映射 `free` 不受影响。
+
+### 未验证内容或已知限制
+
+- **前端实际渲染**：未启动网关用浏览器访问 `/console`、`/miniapp` 实际点击"秘密日记"导航验证交互；仅做了内联 JS 语法编译检查与要素存在性静态检查。建议上线后在浏览器中手动验证导航切换、搜索、分页、编辑、删除。
+- **秘密日记真实生成**：未在真实后台运行中触发一次"写秘密日记"活动验证 prompt 输出风格与单条落库；仅静态确认 prompt 文本与保存分支。LLM 实际输出风格取决于模型遵循 prompt 的程度。
+- **`_recent_activity_keys` 行为变化**：防连续重复查询从单标签 `eq("tags","Free_Activity")` 改为双标签 `in_("tags",["Free_Activity","Secret_Diary"])`，现在秘密日记也会计入"最近活动"参与防重复判断。这是预期行为（避免连续两轮都写秘密日记），但会使防重复判定池略微扩大。
+- **5 个预先存在的测试失败**：与本次需求无关（查天气路径），未修复。
+
+### 明确声明
+
+- **未删除或迁移任何 Supabase 数据**：本次无任何 `DELETE`/`DROP`/`TRUNCATE`，无数据库迁移、无新表、无新字段。历史 `Free_Activity` 数据保持不变，继续显示在自由活动页签。
+- **未新增环境变量**：`VARIABLES.md` 无需更新。
+- **未改变**：外向活动推送逻辑、`FREE_ACTIVITY_INTERVAL`、查天气专用路径、每日日记生成器 `Core_Cognition` 分类、其余记忆分类映射、其他运行时开关行为。
+- **临时脚本已清理**：本次调查用的 `_search_keywords.py`/`_search2.py`/`_static_check.py`/`_check_html_js.mjs`/`_extract_js.py` 已全部删除，未提交。
+

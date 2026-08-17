@@ -413,6 +413,8 @@ async def async_free_activity():
         return
 
     _TAG = "Free_Activity"
+    # 防连续重复要同时覆盖普通自由活动与秘密日记（两者标题都按 "·" 提取活动名）
+    _ACTIVITY_TAGS = ["Free_Activity", "Secret_Diary"]
 
     def _recent_activity_keys(limit=2):
         """读最近 N 条行动日志的活动名，用于判断是否连续重复。"""
@@ -420,7 +422,7 @@ async def async_free_activity():
             return []
         try:
             r = (supabase.table("memories").select("title")
-                 .eq("tags", _TAG).order("created_at", desc=True).limit(limit).execute())
+                 .in_("tags", _ACTIVITY_TAGS).order("created_at", desc=True).limit(limit).execute())
             # title 形如 "🎈 自由活动·写秘密日记"
             keys = []
             for row in (r.data or []):
@@ -541,10 +543,18 @@ async def async_free_activity():
                 continue
             activity, log_text = _fa_result
 
-            await asyncio.to_thread(
-                _save_memory_to_db,
-                f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
-            )
+            # 🔒 写秘密日记单独保存为 Secret_Diary（不进 Free_Activity，不发 Telegram）；
+            # 其余活动（含外向）继续保存为普通自由活动日志。
+            if activity == "写秘密日记":
+                await asyncio.to_thread(
+                    _save_memory_to_db,
+                    "🔒 秘密日记·写秘密日记", log_text, "日记", "平静", "Secret_Diary"
+                )
+            else:
+                await asyncio.to_thread(
+                    _save_memory_to_db,
+                    f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
+                )
 
             # 欲望驱动：做完活动后对相关驱动条做针对性回落 + 进入不应期。
             # 规则（对齐 gating）：

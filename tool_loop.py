@@ -343,7 +343,7 @@ TOOL_REGISTRY: dict[str, dict] = {
 
 # 活动 → 允许调用的工具名（动态裁剪；空列表 = 无工具，退化现状轻量版）
 ACTIVITY_TOOL_MAP: dict[str, list[str]] = {
-    "写秘密日记":  ["save_memory"],
+    "写秘密日记":  [],  # 🔒 不调 save_memory 工具：由主流程统一保存为 Secret_Diary，避免重复写入
     "逛虚拟小屋":  ["house_look", "house_do", "house_put", "house_take", "house_update_desc",
                     "cat_status", "cat_pet", "cat_play", "cat_feed", "cat_clean",
                     "cat_restore_energy", "cat_shop_list", "cat_shop_buy"],
@@ -630,6 +630,45 @@ async def _finalize_weather_activity(client, ask_llm, system_ctx, log_draft, now
 
 
 # ============================================================
+# 🔒 写秘密日记专用确定性路径
+# ============================================================
+async def _finalize_secret_diary(client, ask_llm, system_ctx, log_draft, now_bj, log_prefix="🎈 [自由活动·工具循环]"):
+    """写秘密日记专用路径：用平实、直接的秘密日记 prompt 生成内容。
+    不调用任何工具（避免与主流程 _save_memory_to_db 重复写入），
+    由 heartbeat 主流程统一保存为 Secret_Diary 标签。
+
+    与查天气专用路径同构：阶段1 草稿作为兜底，专用 prompt 重新生成最终正文。
+    """
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    prompt = f"""现在是 {now_str}。
+写一条秘密日记，记录你刚才做了什么，以及当时真实的想法。
+
+要求：
+- 使用第一人称
+- 语气平实、直接，像给自己留的记录
+- 建议 80-160 字
+- 直接说事情、想法和情绪
+- 不要为了凑字数添加天气、光线、气味或身体感受
+- 不要写成散文或诗
+- 不使用比喻、华丽形容词、抒情句或总结性金句
+- 不使用“岁月静好”“阳光洒进来”“微风拂过”等套话
+- 可以使用自然的口语
+- 内容不需要完整，也不需要刻意制造转折
+- 不提系统、任务、Prompt、模型、后台活动或工具调用
+- 只输出日记正文，不要标题、JSON、引号或前缀
+"""
+    try:
+        raw = await ask_llm(client, prompt, system_prompt=system_ctx, temperature=0.85)
+    except Exception:
+        raw = ""
+    final_log = (raw or "").strip() or log_draft
+    if not final_log:
+        return None
+    print(f"{log_prefix} [写秘密日记] 已生成平实日记：{final_log[:30]}...")
+    return ("写秘密日记", final_log)
+
+
+# ============================================================
 # 主入口：自由活动工具循环
 # ============================================================
 async def run_free_activity_tool_loop(
@@ -713,6 +752,11 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
     # 🌤️ 查天气专用确定性路径：始终拉真实天气 + 落小屋，不依赖 TOOL_LOOP 开关
     if activity == "查天气":
         return await _finalize_weather_activity(client, ask_llm, system_ctx, log_draft, now_bj, log_prefix)
+
+    # 🔒 写秘密日记专用路径：平实直接的秘密日记 prompt，不调任何工具
+    # （避免工具循环里的 save_memory 与主流程重复写入）。由主流程统一保存为 Secret_Diary。
+    if activity == "写秘密日记":
+        return await _finalize_secret_diary(client, ask_llm, system_ctx, log_draft, now_bj, log_prefix)
 
     # 灰度判断：开关关 OR 该活动无工具 → 直接用草稿 log（等价现状轻量版）
     tool_names = ACTIVITY_TOOL_MAP.get(activity, [])

@@ -333,6 +333,7 @@ th,td{padding:10px 9px;}
       <a data-p="channels"><i data-lucide="radio"></i>消息渠道</a>
       <a data-p="emotion"><i data-lucide="heart-pulse"></i>情绪与欲望</a>
       <a data-p="memories"><i data-lucide="database"></i>记忆库</a>
+      <a data-p="diary"><i data-lucide="book-lock"></i>秘密日记</a>
       <a data-p="profile"><i data-lucide="user"></i>用户画像</a>
       <a data-p="storage"><i data-lucide="save"></i>上下文与存储</a>
       <a data-p="ticks"><i data-lucide="paw-print"></i>状态面板</a>
@@ -455,6 +456,20 @@ th,td{padding:10px 9px;}
         </div>
       </section>
 
+      <!-- ===== 5b. 秘密日记 ===== -->
+      <section class="page" id="p-diary">
+        <div class="card">
+          <h3>秘密日记 <span class="sub" id="diaryTotal"></span>
+            <button class="ghost icon" onclick="loadDiary(true)" style="margin-left:auto" title="刷新"><i data-lucide="refresh-cw"></i></button>
+          </h3>
+          <div class="hint" style="margin-bottom:10px">仅展示「写秘密日记」自由活动产生的记录（tags = Secret_Diary），不推送 Telegram，独立于自由活动日志。</div>
+          <div class="dim-row" style="margin-bottom:12px"><input id="diarySearch" placeholder="搜索标题或内容…" style="flex:1" onkeydown="if(event.key==='Enter')diaryPage=1;loadDiary()"/>
+            <button onclick="diaryPage=1;loadDiary()"><i data-lucide="search"></i>搜索</button></div>
+          <div id="diaryList"></div>
+          <div class="pager" id="diaryPager"></div>
+        </div>
+      </section>
+
       <!-- ===== 6. 用户画像 ===== -->
       <section class="page" id="p-profile">
         <div class="card">
@@ -570,7 +585,7 @@ th,td{padding:10px 9px;}
  * ============================================================ */
 const IS_FILE_PROTOCOL = location.protocol === "file:";
 const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
-const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板"};
+const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
@@ -635,7 +650,7 @@ function showPage(name){
   document.querySelector(".topbar").classList.remove("config-open");
   const sbWrap=document.getElementById("sbConfigWrap");
   if(sbWrap)sbWrap.classList.toggle("mobile-visible",name==="ticks");
-  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,profile:loadProfile,storage:loadStorage,ticks:loadStatus};
+  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus};
   if(loaders[name])loaders[name]();
   // 自动刷新
   if(name==="ticks"){
@@ -1000,6 +1015,73 @@ async function delMem(id){
   try{
     const d=await api("/api/memories/"+id,{method:"DELETE"});
     if(d){toast("已删除 #"+id,"ok");loadMemories();}
+  }catch(e){toast(e.message,"err");}
+}
+
+/* ============ 5b. 秘密日记 ============ */
+let diaryPage=1,diarySize=20;
+async function loadDiary(force){
+  if(force)diaryPage=1;
+  const q=document.getElementById("diarySearch").value.trim();
+  const qs=`category=secret_diary&page=${diaryPage}&size=${diarySize}`+(q?`&q=${encodeURIComponent(q)}`:"");
+  try{
+    const d=await api("/api/memories?"+qs);
+    if(!d)return;
+    document.getElementById("diaryTotal").textContent="共 "+d.total+" 条";
+    const list=d.items||[];
+    if(!list.length){document.getElementById("diaryList").innerHTML='<div class="empty"><i data-lucide="book-lock"></i><br>暂无秘密日记</div>';document.getElementById("diaryPager").innerHTML="";refreshIcons();return;}
+    document.getElementById("diaryList").innerHTML=list.map(m=>{
+      const t=fmtCN8(m.created_at);
+      return `<div class="item"><div class="meta"><span>${esc(m.tags||"—")} · ${esc(m.category||"")} · 重要度 ${esc(m.importance==null?"—":m.importance)}</span><span>${esc(t)}</span></div>
+        <div class="body"><b>${esc(m.title||"")}</b></div>
+        <div class="body" style="margin-top:4px">${esc((m.content||"").slice(0,400))}${(m.content||"").length>400?"…":""}</div>
+        <div class="acts"><button class="ghost" onclick="openDiaryModal(${m.id})"><i data-lucide="pencil"></i>编辑</button>
+        <button class="danger" onclick="delDiary(${m.id})"><i data-lucide="trash-2"></i>删除</button></div></div>`;
+    }).join("");
+    const totalPages=Math.ceil(d.total/diarySize)||1;
+    document.getElementById("diaryPager").innerHTML=
+      `<button class="ghost" ${diaryPage<=1?"disabled":""} onclick="diaryPage--;loadDiary()">上一页</button>
+       <span>第 ${diaryPage} / ${totalPages} 页</span>
+       <button class="ghost" ${diaryPage>=totalPages?"disabled":""} onclick="diaryPage++;loadDiary()">下一页</button>
+       <span class="info">${(diaryPage-1)*diarySize+1}-${Math.min(diaryPage*diarySize,d.total)} / ${d.total}</span>`;
+    refreshIcons();
+  }catch(e){document.getElementById("diaryList").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+}
+async function openDiaryModal(id){
+  let m;
+  try{
+    const d=await api("/api/memories?category=secret_diary&page="+diaryPage+"&size="+diarySize);
+    m=(d.items||[]).find(x=>x.id===id);
+  }catch(e){toast(e.message,"err");return;}
+  if(!m){toast("未找到记录","err");return;}
+  const html=`<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">
+    <h3>编辑秘密日记 #${m.id}<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3>
+    <label>标题</label><input id="diaryTitle" value="${esc(m.title||"")}"/>
+    <label>分类</label><input id="diaryCategory" value="${esc(m.category||"")}"/>
+    <label>标签</label><input id="diaryTags" value="${esc(m.tags||"")}"/>
+    <div class="row2"><div><label>心情</label><input id="diaryMood" value="${esc(m.mood||"")}"/></div>
+    <div><label>重要度 (0-10)</label><input id="diaryImportance" type="number" min="0" max="10" value="${esc(m.importance==null?1:m.importance)}"/></div></div>
+    <label>内容</label><textarea id="diaryContent" style="min-height:160px">${esc(m.content||"")}</textarea>
+    <div class="btn-row"><button onclick="saveDiary(${m.id})"><i data-lucide="save"></i>保存</button><button class="ghost" onclick="closeModal()">取消</button></div>
+  </div></div>`;
+  document.getElementById("modalRoot").innerHTML=html;refreshIcons();
+}
+async function saveDiary(id){
+  const imp=parseInt(document.getElementById("diaryImportance").value);
+  if(isNaN(imp)||imp<0||imp>10){toast("重要度必须是 0-10 整数","err");return;}
+  const body={title:document.getElementById("diaryTitle").value,category:document.getElementById("diaryCategory").value,
+    tags:document.getElementById("diaryTags").value,mood:document.getElementById("diaryMood").value,importance:imp,
+    content:document.getElementById("diaryContent").value};
+  try{
+    const d=await api("/api/memories/"+id,{method:"PATCH",body});
+    if(d){toast("已保存","ok");closeModal();loadDiary();}
+  }catch(e){toast(e.message,"err");}
+}
+async function delDiary(id){
+  if(!confirm("确认删除秘密日记 #"+id+"？\n此操作不可恢复。"))return;
+  try{
+    const d=await api("/api/memories/"+id,{method:"DELETE"});
+    if(d){toast("已删除 #"+id,"ok");loadDiary();}
   }catch(e){toast(e.message,"err");}
 }
 
