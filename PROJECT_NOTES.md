@@ -1246,3 +1246,109 @@ python -m unittest test_tool_loop test_wallet test_cat test_cat_tick test_consol
 - **未改变**：外向活动推送逻辑、`FREE_ACTIVITY_INTERVAL`、查天气专用路径、每日日记生成器 `Core_Cognition` 分类、其余记忆分类映射、其他运行时开关行为。
 - **临时脚本已清理**：本次调查用的 `_search_keywords.py`/`_search2.py`/`_static_check.py`/`_check_html_js.mjs`/`_extract_js.py` 已全部删除，未提交。
 
+---
+
+## 2026-08-17 · 自由活动新增「逛淘宝」与「网上冲浪」（真实工具活动）
+
+### 任务目标
+
+在网关现有“自由活动”系统中新增两个**真实可执行**的活动类型：逛淘宝、网上冲浪。两者必须根据情绪/欲望状态做候选门控，并调用真实工具获取结果（淘宝 MCP `search_taobao_products`、网关既有 `web_search`），不允许模型凭空描述浏览过淘宝/网页。逛淘宝严格只逛不买。
+
+### 已确认的真实调用链
+
+- `heartbeat.async_free_activity` → `desire_bridge.tick()` 取得 `DesireSnapshot`（含 `drive` 8 维 / `display` 16 维 / `intent`）→ 注入 system 上下文 → 调 `tool_loop.run_free_activity_tool_loop(...)`。
+- `tool_loop` 维护 `_FREE_ACTIVITIES`、`TOOL_REGISTRY`、`ACTIVITY_TOOL_MAP`；`call_tool(name,args)` 做白名单+参数校验+固定身份注入+错误隔离；`_resolve_callable` 对 `callable=None + _server_name` 的工具延迟从 `server` 取（`@mcp.tool()` 装饰后仍是 async 函数，已用 `_probe_mcp.py` 验证）。
+- `server.web_search`（`@mcp.tool()` + `@mcp_error_handler` + `async def`）与 `search_memory` 装饰器模式完全一致 → `web_search` 走与 `search_memory` 相同的延迟注册路径。
+- MCP Python SDK 为 1.x（`mcp>=1.10,<2.0`）：`streamablehttp_client(url, timeout=...)` 异步上下文产出 `(read, write, get_session_id)`；`ClientSession(read, write, read_timeout_seconds=...)`；`initialize()` / `list_tools()` / `call_tool(name, arguments, ...)`；`CallToolResult` 含 `.content`（文本块列表）与 `.isError`。
+- 情绪字段真实来源：`snap.drive`（attachment/curiosity/reflection/duty/social/fatigue/libido/stress）、`snap.display`（vitality/longing/intimacy/possessiveness/lust/jealousy/anxiety/protectiveness/contentment/elation/seeking/play/dejection/irritability/fear/fatigue）。`_get_now_bj()` 返回**朴素北京时间**（utcnow+8h，无 tzinfo）。
+
+### 参考方案中被修正的错误前提
+
+1. 方案伪代码把 `streamablehttp_client` 与 `ClientSession` 当成可裸调函数，实际两者都是**异步上下文管理器**（`async with`），签名见上。已按 inspect.signature 的真实 API 实现。
+2. 方案要求 `web_search` “延迟注册到 TOOL_REGISTRY，不要复制实现”——已确认 `@mcp.tool()` 在本 SDK 版本返回原 async 函数本身（probe 验证 `iscoroutinefunction=True`），故可走 `callable=None + _server_name="web_search"`，与 `search_memory` 完全同构，无需复制。
+3. 方案情绪字段映射表中“好奇=drive.curiosity / 探索=display.seeking / 疲惫=display.fatigue …”已逐一与 `emotion_engine.DIMS` / `desire_engine.DRIVE_KEYS` 核对，全部存在，未另建重复情绪系统。
+4. 方案“门控在每轮候选裁剪前只读查询当天记录”——`_get_now_bj` 是朴素北京时间，Supabase `created_at` 是 timestamptz；冷却比较统一换算到 epoch（now_bj 附加 +08:00 tz 后 `.timestamp()`，`created_at` 解析为 aware 后 `.timestamp()`），查询字符串带 `+08:00` 时区，避免被按 UTC 解释错 8 小时。
+5. 方案“heartbeat 已 tick 一次取得的快照直接传给工具循环”——已实现：`heartbeat` 不再为门控二次 tick，把同一份 `snap` 经新参数 `desire_snapshot` 传入；`_gate_activities` 只读 `snap.drive`/`snap.display`。
+
+### 修改文件及每个文件的用途
+
+- `tool_loop.py`
+  - `_FREE_ACTIVITIES` 新增「逛淘宝」「网上冲浪」（与 heartbeat 同步）。
+  - 新增常量：`TAOBAO_MCP_URL`、`TAOBAO_MCP_TIMEOUT_SEC=55`、`TAOBAO_COUNT_DEFAULT=8`/`MIN=1`/`MAX=10`、冷却与每日上限（淘宝 180min/4 次、冲浪 90min/6 次）、两个活动标题。
+  - 新增 `_call_taobao_search(keyword, count)`：用官方 MCP SDK（v1.x）经 `streamablehttp_client` 建立会话 → `initialize` → `list_tools` 确认 `search_taobao_products` 存在 → `call_tool` → 提取文本块；count 归一 1~10；整体 `asyncio.wait_for(timeout=55)`；失败返回明确失败结果（不伪装成功）；异常日志只记 keyword/count/类型/堆栈，不记 URL 中可能的认证信息。
+  - `TOOL_REGISTRY` 注册 `search_taobao_products`（callable=`_call_taobao_search`）与 `web_search`（`callable=None, _server_name="web_search"`，延迟从 server 取）。**未注册** `convert_taobao_link`、未把 `wallet_*` 映射给逛淘宝。
+  - `ACTIVITY_TOOL_MAP` 新增「逛淘宝」→`["search_taobao_products"]`、「网上冲浪」→`["web_search"]`（双重白名单：须在 REGISTRY 且在该活动映射内）。
+  - 新增活动专用 Prompt 规则：`_TAOBAO_NO_BUY_RULES`（只逛不买）、`_TAOBAO_LOG_RULES`（日志可写/不可写）、`_SURF_DATE_RULES`（热点含日期、健康仅一般科普）。
+  - 新增门控函数 `_get_supabase_safe`/`_iso_to_epoch`/`_bj_epoch`/`_get_activity_stats`（只读查询当天指定标题的 `Free_Activity` 记录，用于冷却/每日上限）/`_gate_taobao`/`_gate_surf`/`_gate_activities`。门控原则：最低阈值 `>=`、抑制红线 `>`；lust>0.85 只抑制淘宝不抑制冲浪；TAOBAO_MCP_URL 空 / FREE_ACTIVITY_TOOL_LOOP 关 → 淘宝/冲浪不候选；Supabase 查询失败只关这两个新增候选，其他自由活动不受影响（保守不放开）。
+  - `run_free_activity_tool_loop` 新增参数 `desire_snapshot`、`desire_suggested_activity`：阶段1前调 `_gate_activities` 裁剪候选；仅从门控通过的活动构造 options；建议活动本轮不在候选 → 丢弃 `desire_hint`（倾向不绕过门控）；模型若选了被裁掉的活动则从门控候选兜底随机；stage2/stage3 注入活动专用规则与方向提示；工具全部失败时 stage3 注入“不得伪装成功浏览”约束。
+- `heartbeat.py`
+  - `_FREE_ACTIVITIES` 同步新增两个活动。
+  - `async_free_activity`：在 desire 块前初始化 `snap=None`/`suggested=None`；把 `desire_snapshot=snap`、`desire_suggested_activity=suggested` 传给 `run_free_activity_tool_loop`。情感引擎关/异常 → snap=None → 两个新活动不候选（无门控数据），其余活动行为不变。
+- `desire_bridge.py`
+  - `ACTION_TO_FREE_ACTIVITY`：`explore` → `["网上冲浪","逛淘宝","分享发现","查天气"]`；`socialize` → `["网上冲浪","分享发现"]`（优先冲浪）。`suggest_free_activity` 仍返回首项；desire_hint 只表达倾向，不绕过门控。
+- `test_tool_loop.py`：新增 7 个测试类共 52 项（活动一致性、淘宝门控 §3-§13、网上冲浪门控 §14-§20、工具白名单 §21-§25、淘宝 MCP 客户端 §26-§33 全 mock、冷却与频次 §34-§40、Prompt 与日志 §41-§43）。
+
+### 情绪字段映射
+
+| 中文概念 | 数据来源 | 真实字段 |
+|---|---|---|
+| 好奇 | 欲望驱动 | `drive.curiosity` |
+| 探索 | 情绪展示 | `display.seeking` |
+| 玩闹 | 情绪展示 | `display.play` |
+| 活力 | 情绪展示 | `display.vitality` |
+| 依恋 | 欲望驱动 | `drive.attachment` |
+| 亲密 | 情绪展示 | `display.intimacy` |
+| 占有 | 情绪展示 | `display.possessiveness` |
+| 保护 | 情绪展示 | `display.protectiveness` |
+| 情欲 | 情绪展示 | `display.lust` |
+| 焦虑 | 情绪展示 | `display.anxiety` |
+| 低落 | 情绪展示 | `display.dejection` |
+| 疲惫 | 情绪展示 | `display.fatigue` |
+| 反思 | 欲望驱动 | `drive.reflection` |
+| 社交 | 欲望驱动 | `drive.social` |
+
+### 淘宝只逛不买的白名单设计
+
+三层一致：工具暴露层（`ACTIVITY_TOOL_MAP["逛淘宝"]=["search_taobao_products"]`，不含 `convert_taobao_link`/`wallet_spend`/`wallet_earn`）+ 活动 Prompt（`_TAOBAO_NO_BUY_RULES`：不购买/不下单/不支付/不加入购物车/不转换返利链接/不得声称已买到或已拥有）+ 最终日志 Prompt（`_TAOBAO_LOG_RULES`：可写搜了什么/看到什么/哪个有趣/为何想到/礼物灵感；不可写我买了/下单了/付款了/加入购物车了/已经到手）。淘宝 MCP 本身无购买/下单工具，未虚构这些接口。
+
+### 冷却和每日上限实现
+
+- 复用现有 `memories` 写入（`tags=Free_Activity`，标题 `🎈 自由活动·逛淘宝` / `🎈 自由活动·网上冲浪`，由 `heartbeat` 主流程保存）。**未新建表、未改 schema**。
+- 候选裁剪前 `_get_activity_stats(title, now_bj)` 只读查询当天（北京时间 0 点起，`created_at >= today_start+08:00`）指定标题记录，得 `count` 与 `last_success_epoch`。
+- 淘宝：180 分钟冷却、每日 4 次；冲浪：90 分钟冷却、每日 6 次。命中冷却或达上限 → 不候选。
+- 只有成功完成真实工具调用并最终保存了自由活动日志才计入（计数源自已保存的 memories 行）；工具失败本轮跳过不保存 → 不计数（运行时保证，由 `heartbeat` 仅在 loop 返回结果后保存）。
+- Supabase 不可用 / 查询异常 → 该活动 `stats.error` 非 None → 保守关闭该新活动候选（**不**变成无限制），其他自由活动不受影响。
+
+### 新增环境变量
+
+`TAOBAO_MCP_URL`（可选，默认空）。淘宝 MCP 完整 Streamable HTTP 端点（含 `/mcp` 路径）。留空 → 逛淘宝不候选。不要默认 localhost（容器内 localhost 指向网关自身）。只调用 `search_taobao_products`，不涉及购买/转链。已写入 `VARIABLES.md` §12.2。文档示例只用假地址 `http://taobao-mcp:8080/mcp`，未记录真实生产地址或凭据。
+
+### 验证命令与实际结果
+
+1. Python 语法检查：`python -m py_compile tool_loop.py heartbeat.py desire_bridge.py server.py test_tool_loop.py` → 全部 `PY_COMPILE_OK`。
+2. MCP SDK 接口确认：`inspect.signature` 打印 `streamablehttp_client` / `ClientSession.__init__` / `initialize` / `list_tools` / `call_tool` 签名，按真实 API 实现。
+3. `@mcp.tool()` 行为确认：临时 `_probe_mcp.py` 验证装饰后返回原 async 函数（`iscoroutinefunction=True`，签名保留），确认 `web_search` 可走延迟注册（与 `search_memory` 同路径）；脚本已删除。
+4. 一致性检查脚本：`search_taobao_products`/`web_search` 在 REGISTRY、`convert_taobao_link` 不在 REGISTRY、`ACTIVITY_TOOL_MAP["逛淘宝"]` 仅 `search_taobao_products`、`["网上冲浪"]` 仅 `web_search`、两活动在 `_FREE_ACTIVITIES`、`_TAOBAO_TITLE` 正确 → `CONSISTENCY_OK`。
+5. 单元测试 `python -m unittest test_tool_loop`：108 项，103 通过 / 5 失败。**5 项失败均为预先存在的“查天气确定性路径”失败**（`test_build_tool_schema_block_empty_activity` 用“查天气”断言返回空但查天气映射有 3 个工具；`test_avout_hint_passed_to_stage1`/`test_disabled_degrades_single_call`/`test_empty_draft_no_tools_returns_none`/`test_enabled_no_tools_activity_single_call` 用“查天气”作测试活动但专用路径会多调一次 LLM / 返回非 None，与“单次调用/返回 None”期望矛盾）——与本次需求无关，上一次工作日志已记录，未修改。本次新增 52 项测试全部通过，未破坏任何既有通过测试。
+
+### 未验证内容
+
+- **真实淘宝 MCP 网络连通性**：未连接真实淘宝 MCP 生产服务（未使用真实凭据）。MCP 客户端协议、工具调用、超时与错误路径均用 mock（`_FakeStreamable`/`_FakeSession`/`_McpCfg`）完成测试，覆盖 initialize / list_tools / 工具不存在 / keyword+count 限制 / 文本提取 / isError / 连接错误 / 超时 / 空关键词 / URL 空。
+- **端到端后台运行**：未在真实后台触发一次逛淘宝/网上冲浪验证 LLM 实际输出与落库；仅静态确认 Prompt 文本、门控阈值与保存分支（沿用现有 `Free_Activity` 保存路径）。
+- **真实情绪快照驱动的门控**：门控阈值用边界值单测覆盖，但未在真实情感引擎一拍数据下验证组合命中。
+
+### 已知风险或副作用
+
+- 两个新活动依赖外部工具（淘宝 MCP / 网页搜索），若上游不可用会返回失败结果 → 本轮该活动跳过，不伪装成功（stage3 有 fail_guard 约束）。
+- 门控查询每轮对 `memories` 做两次只读 `select`（淘宝 + 冲浪当日计数）；异步并行执行，失败隔离，开销很小。
+- `desire_hint` 现在与门控联动：建议活动本轮不在候选时 hint 被丢弃，模型从剩余候选选——若 DESIRE_DRIVEN 开启且建议活动频繁被门控裁掉，模型会更多走随机/其他候选（预期行为，符合“倾向不绕过门控”）。
+- 淘宝 MCP 调用总超时 55s：若淘宝服务偶发慢，自由活动这一轮会多等最多约 55s 才进入下一步（后台异步，不阻塞前台）。
+
+### Supabase 操作声明
+
+**明确声明本次未执行任何 Supabase 删除操作**：无 `DELETE` / `DROP` / `TRUNCATE`，无删除历史 memories、表、字段、函数或策略。无数据库迁移、无新表、无 schema 变更。新增门控只对 `memories` 做只读 `select`（`eq("tags","Free_Activity").eq("title",...).gte("created_at",...)`），不写不删。活动日志仍由 `heartbeat` 沿用现有 `Free_Activity` 保存路径写入。`_probe_mcp.py`/`_smoke_check.py` 等临时脚本已删除，未提交。
+
+### Git commit 状态
+
+项目目录非 Git 仓库（环境已确认 `Is a git repository: no`），未执行任何 `git` 操作，未提交。如需提交，建议：`feat(gateway): add taobao and web browsing free activities`。
+

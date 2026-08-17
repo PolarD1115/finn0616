@@ -797,12 +797,14 @@ def seconds_until_next_heartbeat(now_ms: Optional[float] = None) -> Optional[int
 # =============================================================================
 
 # desire_engine 的 want_action → heartbeat._FREE_ACTIVITIES 里的活动名
+# ⚠️ desire_hint 只表达倾向，不能绕过情绪抑制/配置缺失/冷却/每日上限。
+#    若建议活动本轮不在门控候选内，工具循环会丢弃 hint，模型从剩余候选选。
 ACTION_TO_FREE_ACTIVITY: Dict[str, List[str]] = {
     "murmur":      ["想对方了", "偷偷关心"],   # attachment：想念主人 → 冒句话
-    "explore":     ["分享发现", "查天气"],     # curiosity：好奇外面
+    "explore":     ["网上冲浪", "逛淘宝", "分享发现", "查天气"],  # curiosity：优先冲浪，其次淘宝
     "reflect":     ["翻旧回忆", "写秘密日记"], # reflection：想沉淀
     "duty_murmur": ["写秘密日记"],             # duty：记挂没做完的事
-    "socialize":   ["分享发现"],               # social：想看人群（当前无社交源，退化为分享）
+    "socialize":   ["网上冲浪", "分享发现"],   # social：优先冲浪，保留分享
     "intimacy":    ["想对方了"],               # libido：凑过去
     "vent":        ["发呆放空", "写秘密日记"], # stress：吐槽/break
     "rest":        ["发呆放空"],               # fatigue 闸：歇着

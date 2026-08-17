@@ -387,6 +387,9 @@ _FREE_ACTIVITIES = [
     ("想对方了", "突然想她了，给她发一条短短的话——可以是撒娇/担心/分享/想念"),
     ("分享发现", "看到/想到一个有趣的东西想跟她分享"),
     ("偷偷关心", "惦记她最近的状态，发一条不经意的关心"),
+    # ↓↓↓ 真实工具活动：依赖外部工具结果，工具循环关闭(TAOBAO_MCP_URL空/FREE_ACTIVITY_TOOL_LOOP=false)时不进入候选 ↓↓↓
+    ("逛淘宝", "逛逛淘宝看看新奇东西或挑礼物灵感（只逛不买）"),
+    ("网上冲浪", "搜搜网页看看新知识、热点或有趣话题"),
 ]
 
 # 外向型活动：这些做完后除了写日志，还会通过 _push_wechat 真的推送给对方
@@ -486,6 +489,10 @@ async def async_free_activity():
             desire_hint = ""
             desire_intent = None
             desire_driven = False
+            # 复用一拍快照给工具循环做情绪门控（逛淘宝/网上冲浪），不再为门控二次 tick。
+            # snap=None（情感引擎关/异常）时，两个新活动不候选（无门控数据）。
+            snap = None
+            suggested = None
             try:
                 import gateway as _gw
                 _emo_on = _gw._emotion_enabled()
@@ -537,6 +544,8 @@ async def async_free_activity():
                 now_bj=now_bj,
                 avoid=avoid,
                 desire_hint=desire_hint,
+                desire_snapshot=snap,
+                desire_suggested_activity=suggested,
             )
             if _fa_result is None:
                 # 循环内部已打印跳过原因

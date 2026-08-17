@@ -48,6 +48,28 @@ TOOL_LOOP_ENABLED = os.environ.get("FREE_ACTIVITY_TOOL_LOOP", "true").strip().lo
 MAX_TOOL_CALLS = int(os.environ.get("FREE_ACTIVITY_TOOL_MAX_CALLS", "5"))
 
 # ============================================================
+# 逛淘宝 / 网上冲浪 — 候选门控常量（§六 门控规则）
+# ============================================================
+# 淘宝 MCP 端点（Streamable HTTP，含 /mcp 路径）。留空 → 逛淘宝不进入候选。
+TAOBAO_MCP_URL = os.environ.get("TAOBAO_MCP_URL", "").strip()
+# MCP 总读取超时（秒）。淘宝服务内部调用超时约 45s，留 55s 余量。
+TAOBAO_MCP_TIMEOUT_SEC = 55
+# 淘宝商品返回条数默认值与上下限
+TAOBAO_COUNT_DEFAULT = 8
+TAOBAO_COUNT_MIN = 1
+TAOBAO_COUNT_MAX = 10
+
+# 冷却（分钟）与每日上限
+_TAOBAO_COOLDOWN_MIN = 180
+_TAOBAO_DAILY_CAP = 4
+_SURF_COOLDOWN_MIN = 90
+_SURF_DAILY_CAP = 6
+
+# 两个新活动的 memories 标题（与 heartbeat 保存格式一致，用于冷却/频次只读查询）
+_TAOBAO_TITLE = "🎈 自由活动·逛淘宝"
+_SURF_TITLE = "🎈 自由活动·网上冲浪"
+
+# ============================================================
 # 活动清单（与 heartbeat.py::_FREE_ACTIVITIES 保持一致）
 # ⚠️ 修改任一处时请同步另一处。重复定义是为了避免 tool_loop ↔ heartbeat 循环 import。
 # ============================================================
@@ -62,10 +84,94 @@ _FREE_ACTIVITIES = [
     ("想对方了", "突然想她了，给她发一条短短的话——可以是撒娇/担心/分享/想念"),
     ("分享发现", "看到/想到一个有趣的东西想跟她分享"),
     ("偷偷关心", "惦记她最近的状态，发一条不经意的关心"),
+    # ↓↓↓ 真实工具活动：依赖外部工具结果，工具循环关闭(TAOBAO_MCP_URL空/FREE_ACTIVITY_TOOL_LOOP=false)时不进入候选 ↓↓↓
+    ("逛淘宝", "逛逛淘宝看看新奇东西或挑礼物灵感（只逛不买）"),
+    ("网上冲浪", "搜搜网页看看新知识、热点或有趣话题"),
 ]
 _OUTGOING_ACTIVITIES = {"想对方了", "分享发现", "偷偷关心"}
 _VALID_ACTIVITY_NAMES = {name for name, _ in _FREE_ACTIVITIES}
 _OUT_NAMES = "、".join(_OUTGOING_ACTIVITIES)
+
+
+# ============================================================
+# 逛淘宝：淘宝 MCP (Streamable HTTP) 客户端
+# ============================================================
+# 只暴露 search_taobao_products（只逛不买）。不暴露 convert_taobao_link / 购买 / 支付。
+# 用项目已安装的官方 MCP Python SDK (v1.x)，不手写 JSON-RPC。
+async def _call_taobao_search(keyword: str, count: int | None = None) -> dict:
+    """连接淘宝 MCP，调用 search_taobao_products，返回 {ok, text}。
+
+    - 每次建立会话后 initialize。
+    - list_tools 确认 search_taobao_products 确实存在。
+    - count 默认 8，限制在 1~10。
+    - 总读取超时 ~55s（淘宝服务内部调用超时约 45s）。
+    - 失败时返回明确失败结果，不伪装成功。
+    - 异常日志只记 keyword/count 与堆栈，不记 TAOBAO_MCP_URL 中可能的认证信息。
+    """
+    url = TAOBAO_MCP_URL
+    if not url:
+        return {"ok": False, "text": "❌ TAOBAO_MCP_URL 未配置，逛淘宝不可用"}
+
+    # count 归一化
+    try:
+        c = int(count) if count is not None else TAOBAO_COUNT_DEFAULT
+    except (TypeError, ValueError):
+        c = TAOBAO_COUNT_DEFAULT
+    c = max(TAOBAO_COUNT_MIN, min(TAOBAO_COUNT_MAX, c))
+
+    kw = (keyword or "").strip()
+    if not kw:
+        return {"ok": False, "text": "❌ keyword 不能为空"}
+
+    import datetime as _dt
+    import traceback as _tb
+
+    async def _session_flow() -> dict:
+        # 延迟导入，避免顶层依赖 mcp 失败影响网关启动
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        read_timeout = _dt.timedelta(seconds=TAOBAO_MCP_TIMEOUT_SEC)
+        async with streamablehttp_client(url, timeout=float(TAOBAO_MCP_TIMEOUT_SEC)) as (read_stream, write_stream, _get_sid):
+            async with ClientSession(read_stream, write_stream, read_timeout_seconds=read_timeout) as session:
+                await session.initialize()
+                tools_result = await session.list_tools()
+                names = set()
+                for t in (getattr(tools_result, "tools", None) or []):
+                    n = getattr(t, "name", None)
+                    if n:
+                        names.add(n)
+                if "search_taobao_products" not in names:
+                    return {"ok": False,
+                            "text": "❌ 淘宝 MCP 未暴露 search_taobao_products 工具"}
+                result = await session.call_tool(
+                    "search_taobao_products",
+                    arguments={"keyword": kw, "count": c},
+                )
+        # 提取返回内容中的文本块
+        parts = []
+        for item in (getattr(result, "content", None) or []):
+            t = getattr(item, "text", None)
+            if t:
+                parts.append(str(t))
+        text = "\n".join(parts).strip()
+        if getattr(result, "isError", False):
+            return {"ok": False,
+                    "text": f"❌ 淘宝 MCP 返回错误: {text[:300] or '（无错误文本）'}"}
+        if not text:
+            return {"ok": False, "text": "❌ 淘宝 MCP 返回空内容"}
+        return {"ok": True, "text": text}
+
+    try:
+        return await asyncio.wait_for(_session_flow(), timeout=TAOBAO_MCP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        print(f"🎈 [自由活动·逛淘宝] MCP 超时 keyword={kw!r} count={c}")
+        return {"ok": False, "text": f"❌ 淘宝 MCP 调用超时（{TAOBAO_MCP_TIMEOUT_SEC}s）"}
+    except Exception as e:
+        # 不打印 url（可能含认证信息）；只记 keyword/count 与异常类型/堆栈
+        print(f"🎈 [自由活动·逛淘宝] MCP 调用失败 keyword={kw!r} count={c} err={type(e).__name__}: {e}")
+        print(_tb.format_exc())
+        return {"ok": False, "text": f"❌ 淘宝 MCP 调用失败: {type(e).__name__}: {e}"}
 
 
 # ============================================================
@@ -339,6 +445,40 @@ TOOL_REGISTRY: dict[str, dict] = {
         "_server_name": "search_memory",
         "fixed_args": {},
     },
+    # ---------- 逛淘宝（只逛不买，仅 search_taobao_products） ----------
+    # ⚠️ 不暴露 convert_taobao_link / wallet_spend / 任何购买或转链工具。
+    "search_taobao_products": {
+        "description": "逛淘宝：搜索淘宝商品（只逛不买，看看新奇东西或挑礼物灵感）。"
+            "count 默认 8，范围 1-10。返回商品列表文本。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "搜索关键词"},
+                "count": {"type": "integer", "description": "返回条数 1-10，默认 8",
+                          "minimum": 1, "maximum": 10},
+            },
+            "required": ["keyword"],
+        },
+        "callable": _call_taobao_search,
+        "fixed_args": {},
+    },
+    # ---------- 网上冲浪（复用 server.py 既有 web_search，不复制实现） ----------
+    # callable=None + _server_name：延迟从 server 取 @mcp.tool 装饰后的 async 函数（与 save_memory/search_memory 同路径）。
+    "web_search": {
+        "description": "网上冲浪：网页搜索（配置 TAVILY_API_KEY 用 Tavily，否则回退 DuckDuckGo），"
+            "看新知识、热点或有趣话题。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索词"},
+                "max_results": {"type": "integer", "description": "结果数，默认 5"},
+            },
+            "required": ["query"],
+        },
+        "callable": None,
+        "_server_name": "web_search",
+        "fixed_args": {},
+    },
 }
 
 # 活动 → 允许调用的工具名（动态裁剪；空列表 = 无工具，退化现状轻量版）
@@ -355,7 +495,37 @@ ACTIVITY_TOOL_MAP: dict[str, list[str]] = {
     "想对方了":    [],
     "分享发现":    ["search_memory"],
     "偷偷关心":    [],
+    # ↓↓↓ 真实工具活动：双重白名单 — 工具须在 TOOL_REGISTRY 且在本活动映射内 ↓↓↓
+    # 逛淘宝：只暴露 search_taobao_products（只逛不买）。不含 convert_taobao_link / wallet_*。
+    "逛淘宝":      ["search_taobao_products"],
+    # 网上冲浪：只暴露 web_search（复用 server.py 既有实现）。
+    "网上冲浪":    ["web_search"],
 }
+
+
+# ============================================================
+# 逛淘宝 / 网上冲浪 — 活动专用 Prompt 规则（注入 stage2/stage3）
+# ============================================================
+# 淘宝只逛不买：工具层、活动 Prompt、最终日志 Prompt 三处一致。
+_TAOBAO_NO_BUY_RULES = (
+    "【逛淘宝铁律·只逛不买】\n"
+    "- 只能搜索和浏览商品，看新奇东西或挑礼物灵感\n"
+    "- 不购买、不下单、不支付、不加入购物车、不转换返利链接\n"
+    "- 不得声称商品已经买到、已经下单、已经付款、已经到手\n"
+    "- 健康类商品不要生成未经证实的医疗功效结论，只作一般日常实用品看待\n"
+)
+# 最终日志可写/不可写的内容（stage3 用）
+_TAOBAO_LOG_RULES = (
+    "日志可以写：搜了什么、看到什么商品、哪个商品有趣、为什么想到这个东西、是否产生礼物灵感。\n"
+    "日志不能写：我买了、我下单了、我付款了、我加入购物车了、商品已经到手。"
+)
+# 网上冲浪：热点查询须含当前日期或近期限定词；健康搜索须明示一般科普
+_SURF_DATE_RULES = (
+    "【网上冲浪规则】\n"
+    "- 搜索结果只作为一般阅读材料，不得作为心理诊断或医疗建议\n"
+    "- 若搜索热点/新闻/流行梗，query 应包含「近期」「今天」或当前具体日期，避免检索陈旧热点\n"
+    "- 健康类搜索须明确是一般科普，不得替代医生建议\n"
+)
 
 
 # ============================================================
@@ -524,6 +694,227 @@ def _build_tool_schema_block(activity: str) -> str:
 
 
 # ============================================================
+# 逛淘宝 / 网上冲浪 — 候选门控（§六 门控规则）
+# ============================================================
+# 门控原则：先根据情绪和配置裁剪候选活动，模型只能从裁剪后的活动中选择。
+#   - 最低阈值统一用 >=（刚好等于阈值可触发）
+#   - 抑制红线统一用 >（严格大于才抑制）
+#   - lust>0.85 只抑制“逛淘宝”，不抑制“网上冲浪”
+#   - TAOBAO_MCP_URL 空 → 逛淘宝不候选；FREE_ACTIVITY_TOOL_LOOP 关 → 两者都不候选
+#   - Supabase 查询失败 → 只关闭这两个新增候选，不影响其他自由活动（不得变成无限制）
+def _get_supabase_safe():
+    """延迟导入 server.supabase，避免循环依赖 / 无库环境报错。"""
+    try:
+        from server import supabase
+        return supabase
+    except Exception:
+        return None
+
+
+def _iso_to_epoch(iso: str) -> float | None:
+    """ISO8601（含 Z/+00:00 或朴素）→ epoch 秒。解析失败返回 None。"""
+    if not iso:
+        return None
+    import datetime as _dt
+    try:
+        s = str(iso).replace("Z", "+00:00")
+        d = _dt.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return None
+
+
+def _bj_epoch(now_bj) -> float:
+    """把朴素北京时间 now_bj（utcnow+8h，无 tzinfo）转 epoch 秒。"""
+    import datetime as _dt
+    try:
+        return now_bj.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=8))).timestamp()
+    except Exception:
+        import time as _t
+        return _t.time()
+
+
+def _get_activity_stats(title: str, now_bj) -> dict:
+    """只读查询：当天（北京时间0点起）指定标题的自由活动记录，用于冷却/每日上限判断。
+
+    返回 {count, last_success_epoch, error}。
+    - error 非 None 表示查询异常（调用方应保守关闭该活动候选）。
+    - created_at 是 timestamptz，查询字符串带 +08:00 时区，避免被按 UTC 解释错 8 小时。
+    """
+    sb = _get_supabase_safe()
+    if not sb:
+        return {"count": 0, "last_success_epoch": None, "error": "supabase unavailable"}
+    try:
+        import datetime as _dt
+        today_start = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
+        iso_start = today_start.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        r = (sb.table("memories").select("created_at")
+             .eq("tags", "Free_Activity").eq("title", title)
+             .gte("created_at", iso_start)
+             .order("created_at", desc=True).execute())
+        rows = r.data or []
+        count = len(rows)
+        last_epoch = None
+        if rows:
+            last_epoch = _iso_to_epoch(rows[0].get("created_at", ""))
+        return {"count": count, "last_success_epoch": last_epoch, "error": None}
+    except Exception as e:
+        return {"count": 0, "last_success_epoch": None, "error": f"{type(e).__name__}: {e}"}
+
+
+def _gate_taobao(drive: dict, display: dict, stats: dict, now_epoch: float) -> dict:
+    """逛淘宝门控。返回 {allowed, directions, reason}。
+
+    drive / display 来自 DesireSnapshot；stats 来自 _get_activity_stats。
+    任何缺失（情感引擎关）→ 视为无门控数据 → 不候选（保守）。
+    """
+    # 1) 配置门控
+    if not TAOBAO_MCP_URL:
+        return {"allowed": False, "directions": [], "reason": "TAOBAO_MCP_URL 未配置"}
+    if not TOOL_LOOP_ENABLED:
+        return {"allowed": False, "directions": [], "reason": "工具循环关闭"}
+    # 2) 情感数据缺失 → 不候选（None=无快照；空 dict 表示全零值，合法）
+    if drive is None or display is None:
+        return {"allowed": False, "directions": [], "reason": "无情感快照"}
+
+    # 3) 抑制红线（任一命中 → 不候选；统一 >）
+    sup = []
+    if display.get("anxiety", 0.0) > 0.50:
+        sup.append("anxiety")
+    if display.get("dejection", 0.0) > 0.40:
+        sup.append("dejection")
+    if display.get("fatigue", 0.0) > 0.60:
+        sup.append("fatigue")
+    if display.get("lust", 0.0) > 0.85:
+        sup.append("lust")
+    if sup:
+        return {"allowed": False, "directions": [], "reason": f"抑制红线: {','.join(sup)}"}
+
+    # 4) 冷却 / 每日上限（查询异常 → 保守关闭）
+    if stats.get("error"):
+        return {"allowed": False, "directions": [], "reason": f"频次查询失败: {stats['error']}"}
+    if stats.get("count", 0) >= _TAOBAO_DAILY_CAP:
+        return {"allowed": False, "directions": [], "reason": f"已达每日上限 {_TAOBAO_DAILY_CAP}"}
+    last = stats.get("last_success_epoch")
+    if last:
+        if (now_epoch - last) < _TAOBAO_COOLDOWN_MIN * 60:
+            remain = int(_TAOBAO_COOLDOWN_MIN * 60 - (now_epoch - last))
+            return {"allowed": False, "directions": [],
+                    "reason": f"冷却中(剩余{remain}s)"}
+
+    # 5) 橱窗模式（OR；最低阈值 >=）
+    directions = []
+    if drive.get("curiosity", 0.0) >= 0.50 and display.get("seeking", 0.0) >= 0.35:
+        directions.append("好奇橱窗：新奇小玩意/创意家居/数码玩具/桌面摆件")
+    if display.get("play", 0.0) >= 0.70 and display.get("vitality", 0.0) >= 0.45:
+        directions.append("整活橱窗：搞怪礼物/发光玩具/沙雕摆件/奇怪杯子")
+    if drive.get("attachment", 0.0) >= 0.65 and (
+            display.get("intimacy", 0.0) >= 0.35 or display.get("possessiveness", 0.0) >= 0.45):
+        directions.append("送礼橱窗：毛绒玩具/发夹/氛围灯/情侣小物")
+    if display.get("protectiveness", 0.0) >= 0.50 and drive.get("attachment", 0.0) >= 0.60:
+        directions.append("守护橱窗：护颈/护眼/保暖/收纳等日常实用品")
+    if not directions:
+        return {"allowed": False, "directions": [], "reason": "无橱窗命中"}
+    return {"allowed": True, "directions": directions, "reason": "ok"}
+
+
+def _gate_surf(drive: dict, display: dict, stats: dict, now_epoch: float, now_bj) -> dict:
+    """网上冲浪门控。返回 {allowed, directions, reason}。
+
+    与淘宝差异：不要求 TAOBAO_MCP_URL；lust>0.85 不抑制冲浪；
+    抑制红线为 anxiety>0.70 / dejection>0.60 / fatigue>0.70。
+    """
+    if not TOOL_LOOP_ENABLED:
+        return {"allowed": False, "directions": [], "reason": "工具循环关闭"}
+    # drive/display 为 None（无快照）才视为缺门控数据；空 dict 表示“全零值”，合法。
+    if drive is None or display is None:
+        return {"allowed": False, "directions": [], "reason": "无情感快照"}
+
+    sup = []
+    if display.get("anxiety", 0.0) > 0.70:
+        sup.append("anxiety")
+    if display.get("dejection", 0.0) > 0.60:
+        sup.append("dejection")
+    if display.get("fatigue", 0.0) > 0.70:
+        sup.append("fatigue")
+    if sup:
+        return {"allowed": False, "directions": [], "reason": f"抑制红线: {','.join(sup)}"}
+
+    if stats.get("error"):
+        return {"allowed": False, "directions": [], "reason": f"频次查询失败: {stats['error']}"}
+    if stats.get("count", 0) >= _SURF_DAILY_CAP:
+        return {"allowed": False, "directions": [], "reason": f"已达每日上限 {_SURF_DAILY_CAP}"}
+    last = stats.get("last_success_epoch")
+    if last:
+        if (now_epoch - last) < _SURF_COOLDOWN_MIN * 60:
+            remain = int(_SURF_COOLDOWN_MIN * 60 - (now_epoch - last))
+            return {"allowed": False, "directions": [],
+                    "reason": f"冷却中(剩余{remain}s)"}
+
+    today_str = now_bj.strftime("%Y-%m-%d")
+    directions = []
+    # 求知欲：curiosity>=0.55 OR seeking>=0.45
+    if drive.get("curiosity", 0.0) >= 0.55 or display.get("seeking", 0.0) >= 0.45:
+        directions.append("求知欲：新技术/教程/冷知识/原理")
+    # 夜航船：reflection>=0.35 且 anxiety<0.30 且 dejection<0.30
+    if (drive.get("reflection", 0.0) >= 0.35
+            and display.get("anxiety", 0.0) < 0.30
+            and display.get("dejection", 0.0) < 0.30):
+        directions.append("夜航船：心理学/情感/成长/意义向文章")
+    # 热点吃瓜：social>=0.50 且 curiosity>=0.40
+    if drive.get("social", 0.0) >= 0.50 and drive.get("curiosity", 0.0) >= 0.40:
+        directions.append(f"热点吃瓜：近期热点/流行梗/社群话题/新闻（query 须含「近期」或今天日期 {today_str}）")
+    # 守护搜索：protectiveness>=0.55
+    if display.get("protectiveness", 0.0) >= 0.55:
+        directions.append("守护搜索：健康科普/日常护理/颈椎/护眼（须明示一般科普，不替代医生建议）")
+    if not directions:
+        return {"allowed": False, "directions": [], "reason": "无方向命中"}
+    return {"allowed": True, "directions": directions, "reason": "ok"}
+
+
+async def _gate_activities(snap, now_bj) -> tuple[set[str], dict[str, str]]:
+    """计算本轮允许进入候选的活动集合 + 新活动的方向提示文本。
+
+    - 现有活动（非新增两个）始终允许。
+    - 逛淘宝/网上冲浪 按情绪+配置+冷却+每日上限裁剪。
+    - snap 为 None（情感引擎关/无快照）→ 两个新活动不候选（无门控数据）。
+    返回 (allowed_set, direction_hints)，direction_hints 形如 {"逛淘宝": "...", "网上冲浪": "..."}。
+    """
+    allowed = set(_VALID_ACTIVITY_NAMES)
+    hints: dict[str, str] = {}
+    drive = getattr(snap, "drive", None) if snap else None
+    display = getattr(snap, "display", None) if snap else None
+    now_epoch = _bj_epoch(now_bj)
+
+    # 并行只读查询两个活动的当日频次（互不阻塞；任一失败只关自己）
+    tb_stats, sf_stats = await asyncio.gather(
+        asyncio.to_thread(_get_activity_stats, _TAOBAO_TITLE, now_bj),
+        asyncio.to_thread(_get_activity_stats, _SURF_TITLE, now_bj),
+        return_exceptions=True,
+    )
+    if isinstance(tb_stats, Exception):
+        tb_stats = {"count": 0, "last_success_epoch": None, "error": f"{type(tb_stats).__name__}: {tb_stats}"}
+    if isinstance(sf_stats, Exception):
+        sf_stats = {"count": 0, "last_success_epoch": None, "error": f"{type(sf_stats).__name__}: {sf_stats}"}
+
+    tb = _gate_taobao(drive, display, tb_stats, now_epoch)
+    sf = _gate_surf(drive, display, sf_stats, now_epoch, now_bj)
+    if tb["allowed"]:
+        hints["逛淘宝"] = "；".join(tb["directions"])
+    else:
+        allowed.discard("逛淘宝")
+        print(f"🎈 [门控] 逛淘宝 本轮不候选：{tb['reason']}")
+    if sf["allowed"]:
+        hints["网上冲浪"] = "；".join(sf["directions"])
+    else:
+        allowed.discard("网上冲浪")
+        print(f"🎈 [门控] 网上冲浪 本轮不候选：{sf['reason']}")
+    return allowed, hints
+
+
+# ============================================================
 # 核心：进程内调用单个工具
 # ============================================================
 async def _resolve_callable(spec: dict):
@@ -678,6 +1069,8 @@ async def run_free_activity_tool_loop(
     now_bj,
     avoid: str,
     desire_hint: str,
+    desire_snapshot=None,
+    desire_suggested_activity: str | None = None,
     log_prefix: str = "🎈 [自由活动·工具循环]",
 ) -> tuple[str, str] | None:
     """自由活动的工具调用循环入口。
@@ -695,12 +1088,25 @@ async def run_free_activity_tool_loop(
       now_bj      当前北京时间
       avoid       防连续重复：最近两轮做了的活动名（需避开）
       desire_hint 欲望驱动注入文本（可空）
+      desire_snapshot      DesireSnapshot（emotion/desire 引擎一拍结果），
+                           用于逛淘宝/网上冲浪的情绪门控。None=情感引擎关，
+                           此时两个新活动不候选（无门控数据）。
+      desire_suggested_activity  欲望建议的自由活动名（可空）。若本轮不在门控
+                           候选内，desire_hint 会被丢弃，模型从剩余候选选。
 
     返回 (activity, log_text)；None 表示本轮应跳过（草稿 log 为空）。
     主循环拿到结果后自行写 memories / 外向推送 / desire satisfy。
     """
-    # 防重复：构造候选与 avoid_hint
-    options = [f"{name}（{desc}）" for name, desc in _FREE_ACTIVITIES if name != avoid]
+    # ── 候选门控：根据情绪/配置/冷却/每日上限裁剪活动（§六）──
+    # 主循环已调用一次 desire_bridge.tick() 取得快照，这里直接复用，不再二次 tick。
+    gated, direction_hints = await _gate_activities(desire_snapshot, now_bj)
+    # desire_hint 门控联动：建议活动本轮不在候选 → 丢弃 hint（倾向不能绕过门控）
+    if desire_suggested_activity and desire_suggested_activity not in gated:
+        desire_hint = ""
+
+    # 防重复：构造候选与 avoid_hint（仅从门控通过的活动里选）
+    gated_activities = [(n, d) for n, d in _FREE_ACTIVITIES if n in gated and n != avoid]
+    options = [f"{name}（{desc}）" for name, desc in gated_activities]
     options_text = "\n".join(f"- {o}" for o in options)
     avoid_hint = f"\n注意：你最近连着做了两次「{avoid}」，这次换点别的。" if avoid else ""
 
@@ -745,9 +1151,13 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
     activity = (d1.get("activity") or "").strip()
     log_draft = (d1.get("log") or "").strip()
 
-    if activity not in _VALID_ACTIVITY_NAMES:
-        activity = random.choice([n for n, _ in _FREE_ACTIVITIES if n != avoid])
-        print(f"{log_prefix} 阶段1 未按格式选活动，兜底: {activity}")
+    if activity not in gated:
+        # 门控执行：模型选了被门控裁掉的活动（或乱编）→ 从门控候选里兜底随机
+        pool = [n for n, _ in _FREE_ACTIVITIES if n in gated and n != avoid]
+        if not pool:  # 极端兜底：所有候选都被 avoid 排除
+            pool = [n for n, _ in _FREE_ACTIVITIES if n != avoid]
+        activity = random.choice(pool)
+        print(f"{log_prefix} 阶段1 选了被门控裁掉的活动，兜底: {activity}")
 
     # 🌤️ 查天气专用确定性路径：始终拉真实天气 + 落小屋，不依赖 TOOL_LOOP 开关
     if activity == "查天气":
@@ -770,6 +1180,12 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
 
     # ── 阶段 2a：让模型基于该 activity 的工具 schema 输出 tool_calls ──
     schema_block = _build_tool_schema_block(activity)
+    # 活动专用规则 + 本轮命中方向（逛淘宝只逛不买 / 网上冲浪日期与健康科普）
+    extra_rules = ""
+    if activity == "逛淘宝":
+        extra_rules = _TAOBAO_NO_BUY_RULES + "\n本轮命中方向：" + direction_hints.get("逛淘宝", "") + "\n"
+    elif activity == "网上冲浪":
+        extra_rules = _SURF_DATE_RULES + "\n本轮命中方向：" + direction_hints.get("网上冲浪", "") + "\n"
     stage2_prompt = f"""
 你刚才选了「{activity}」这个自由活动。你现在可以真正调用以下工具来执行它（而非只是描述）：
 {schema_block}
@@ -779,7 +1195,7 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
 - 参数必须符合上面的类型与枚举。
 - source_key 用唯一字符串避免重复入账（如 tip_20260812_001）。
 - 不要调用上面没列出的工具。
-
+{extra_rules}
 只输出一行 JSON，不要多余文字：
 {{"tool_calls": [{{"name": "工具名", "args": {{...}}}}]}}
 """
@@ -821,13 +1237,27 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
                     "像平时微信发的，可结合 system 里 TA 的近况，别写成旁白）")
     else:
         log_rule = 'log 写第一人称"我刚才做了什么、有什么感受"的行动记录(80字内)'
+    # 活动专用日志约束：淘宝只逛不买（可写看了什么/为何想到/礼物灵感，不可写已买/已下单）；
+    # 网上冲浪结果只作一般阅读，不作心理诊断/医疗建议。
+    extra_log_rule = ""
+    if activity == "逛淘宝":
+        extra_log_rule = "\n" + _TAOBAO_LOG_RULES
+    elif activity == "网上冲浪":
+        extra_log_rule = "\n日志里搜索结果只作为一般阅读材料，不得作为心理诊断或医疗建议。"
+    # 工具失败约束：若有工具调用且全部失败，不得生成声称成功浏览的日志
+    tool_all_failed = bool(results) and not any(r.get("ok") for r in results)
+    fail_guard = ""
+    if tool_all_failed:
+        fail_guard = ("\n⚠️ 本轮工具调用全部失败。日志必须如实反映没有成功浏览到内容，"
+                      "不得写“我刚刚浏览了淘宝/网页看到…”这类假装成功的表述；"
+                      "可以写“想逛但没连上/没搜到”这类如实记录。")
     stage3_prompt = f"""
 你刚才选了「{activity}」这个自由活动，并执行了以下操作：
 {results_text}
 
 你最初的草稿是：{log_draft or "（空）"}
 
-请基于真实执行结果，生成最终的 log 内容。{log_rule}。
+请基于真实执行结果，生成最终的 log 内容。{log_rule}。{extra_log_rule}{fail_guard}
 只输出 log 内容本身，不要 JSON，不要多余文字、引号或前缀。
 """
     raw3 = await ask_llm(client, stage3_prompt, system_prompt=system_ctx, temperature=0.85)

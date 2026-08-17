@@ -350,6 +350,7 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `FREE_ACTIVITY_INTERVAL` | ❌ | `5400` | 自由活动触发间隔（秒），默认 1.5 小时；实际还会叠加 ±900s 抖动 / 自主心跳动态间隔。 |
 | `FREE_ACTIVITY_TOOL_LOOP` | ❌ | `false` | 🆕 **工具调用循环开关（灰度）**。关：所有活动只走"单次 LLM 输出 `{activity, log}`"的轻量版（行为与改造前完全一致）。开：有工具的活动（如"记点小账"→`wallet_*`、"逛虚拟小屋"→`house_*`/`cat_*`）会真正调用 `home_system` 纯函数执行副作用，再基于真实工具结果生成 log。安全护栏：工具白名单 + 按 activity 动态裁剪 + JSON Schema 参数校验 + 固定身份注入（`wallet_id`/`user_id` 不让 LLM 控制）+ 单轮上限 + 错误隔离。详见 [tool_loop.py](tool_loop.py)。 |
 | `FREE_ACTIVITY_TOOL_MAX_CALLS` | ❌ | `5` | 🆕 单轮自由活动最多调用多少个工具（防 LLM 刷工具）。超出部分截断。 |
+| `TAOBAO_MCP_URL` | ❌ | 空 | 🆕 淘宝 MCP 的完整 Streamable HTTP 端点（通常是 `http://<host>:<port>/mcp`）。留空时“逛淘宝”不进入自由活动候选。端点必须包含实际 MCP 路径（一般是 `/mcp`）。⚠️ 不要默认用 `localhost`：网关运行在容器时 localhost 指向网关容器自身，应填淘宝 MCP 服务的实际可达地址。本变量仅用于自由活动“逛淘宝”，只调用 `search_taobao_products`（只逛不买），不涉及购买、下单、支付、加购物车或 `convert_taobao_link` 转链。 |
 
 > 💡 **开启建议**：先把 `FREE_ACTIVITY_TOOL_LOOP=true`，观察日志里 `🎈 [自由活动·工具循环] 工具 ...` 的执行结果一段时间，确认工具调用合理（没乱扣钱、没误删物品）再正式常开。默认关时零行为变化。
 
