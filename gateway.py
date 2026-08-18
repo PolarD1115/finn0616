@@ -108,6 +108,11 @@ def _normalize_registry(reg: dict) -> dict:
     default = str(reg.get("default", "") or "").strip()
     roles = reg.get("roles") if isinstance(reg.get("roles"), dict) else {}
 
+    # 归一化每个模型项的 thinking 字段为 auto/on/off（向后兼容旧数据）
+    for _m in models:
+        if isinstance(_m, dict):
+            _m["thinking"] = _normalize_thinking(_m.get("thinking"))
+
     # 旧 assignments 字段迁移到 roles（仅当 roles.background 未设置时）
     assignments = reg.get("assignments") if isinstance(reg.get("assignments"), dict) else {}
     for r in _LLM_ROLES:
@@ -234,6 +239,51 @@ def _find_enabled_model(reg: dict, model_id: str):
         if m.get("id") == model_id and m.get("enabled", True):
             return m
     return None
+
+
+# 思考开关合法取值
+_THINKING_VALUES = ("auto", "on", "off")
+
+
+def _normalize_thinking(val) -> str:
+    """把 thinking 字段归一化为 auto/on/off 三选一，非法/缺失降级为 auto。"""
+    v = str(val or "").strip().lower()
+    return v if v in _THINKING_VALUES else "auto"
+
+
+def _thinking_params(model_name: str, setting: str) -> dict:
+    """按上游真实模型名 + 思考设置（auto/on/off）返回要注入请求体的参数字典。
+
+    auto 或未知模型一律返回 {}（不传参，走模型默认）。
+    厂商映射（基于 2025-2026 官方文档查证）：
+      - DeepSeek V4 / GLM 4.5+ / Kimi K2.x：{"thinking":{"type":"enabled"/"disabled"}}
+      - Kimi K3（思考常开，用 effort 间接控制）：{"reasoning_effort":"max"/"low"}
+      - Qwen3 / QwQ：{"enable_thinking":true/false}
+      - OpenAI o1/o3/o4/gpt-5 推理系：{"reasoning_effort":"medium"/"minimal"}
+      - 其他/未知：不传（避免上游报未知参数错）
+    """
+    s = _normalize_thinking(setting)
+    if s == "auto":
+        return {}
+    m = (model_name or "").lower()
+    on = s == "on"
+    # DeepSeek V4 / GLM 4.5+ / Kimi K2.x —— 同款 thinking.type 格式
+    if ("deepseek" in m or "v4-flash" in m or "v4-pro" in m
+            or "glm" in m
+            or "kimi-k2" in m):
+        return {"thinking": {"type": "enabled" if on else "disabled"}}
+    # Kimi K3（思考常开，只能调 effort）
+    if "kimi-k3" in m or m.endswith("k3"):
+        return {"reasoning_effort": "max" if on else "low"}
+    # Qwen3 / QwQ
+    if "qwen3" in m or "qwq" in m:
+        return {"enable_thinking": bool(on)}
+    # OpenAI o 系推理模型
+    import re as _re
+    if _re.match(r"\b(o1|o3|o4|gpt-5)\b", m):
+        return {"reasoning_effort": "medium" if on else "minimal"}
+    # 未知模型：不传参，避免报错
+    return {}
 
 
 def _has_legacy_llm_settings() -> bool:
@@ -1348,6 +1398,22 @@ class HostFixMiddleware:
             upstream_url = f"{base}/v1/chat/completions"
 
         # ==========================================
+        # 🧠 思考开关：按模型注册表 thinking 配置注入厂商对应参数
+        # raw HTTP 下这些字段直接作为 JSON 顶层 key 塞进 req_data（等价于 SDK 的 extra_body）。
+        # 流式转发与 tool loop 都从 req_data 取参，此处注入一次即覆盖两条路径。
+        # ==========================================
+        try:
+            _reg = _load_llm_registry()
+            _entry = _find_enabled_model(_reg, requested_model) if matched else None
+            if _entry:
+                _tp = _thinking_params(_entry.get("model", ""), _entry.get("thinking", "auto"))
+                if _tp:
+                    req_data.update(_tp)
+                    _log(f"🧠 [thinking] model={_entry.get('model')} setting={_entry.get('thinking')} → {_tp}")
+        except Exception as _te:
+            _log(f"⚠️ [thinking] 注入失败（已降级不传参）: {_te}")
+
+        # ==========================================
         # 🧠 智能体模式：注入上文/人设/记忆（仅当配了 Supabase 时启用）
         # ==========================================
         sb = _get_supabase()
@@ -2142,6 +2208,7 @@ class HostFixMiddleware:
                     "has_key": bool(str(m.get("api_key", "")).strip()),
                     "model": m.get("model", ""),
                     "enabled": m.get("enabled", True),
+                    "thinking": m.get("thinking", "auto"),
                     # 当前承担的身份（便于前端展示"当前身份"列）
                     "roles": [r for r, v in {
                         "chat": mid in (roles.get("chat") or []),
@@ -2307,6 +2374,7 @@ class HostFixMiddleware:
                 "base_url": base_url or (existing.get("base_url") if existing else ""),
                 "model": real_model,
                 "enabled": bool(payload.get("enabled", existing.get("enabled", True) if existing else True)),
+                "thinking": _normalize_thinking(payload.get("thinking", existing.get("thinking", "auto") if existing else "auto")),
             }
             # 禁用模型时检查角色占用：禁止禁用仍被角色使用的模型
             if existing and existing.get("enabled", True) and not entry["enabled"]:

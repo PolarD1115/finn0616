@@ -732,6 +732,13 @@ function openModelModal(id){
     <label>上游真实模型名</label><input id="mModel" value="${esc(m?m.model:"")}"/>
     <label>Base URL</label><input id="mBase" value="${esc(m?m.base_url:"")}" placeholder="https://api.example.com/v1"/>
     <label>API Key ${m?'（留空=保留旧值）':''}</label><input id="mKey" type="password" placeholder="${m?'已配置（'+esc(m.api_key_masked)+'），留空保留':'sk-...' }"/>
+    <label>深度思考 (thinking)</label>
+    <div style="display:flex;gap:14px;margin-bottom:4px">
+      <label style="display:inline-flex;align-items:center;gap:5px;font-size:13px"><input type="radio" name="mThinking" value="auto" ${(!m||m.thinking==="auto"||!m.thinking)?"checked":""} style="width:auto"/> auto 跟随默认</label>
+      <label style="display:inline-flex;align-items:center;gap:5px;font-size:13px"><input type="radio" name="mThinking" value="on" ${(m&&m.thinking==="on")?"checked":""} style="width:auto"/> on 强制开启</label>
+      <label style="display:inline-flex;align-items:center;gap:5px;font-size:13px"><input type="radio" name="mThinking" value="off" ${(m&&m.thinking==="off")?"checked":""} style="width:auto"/> off 强制关闭</label>
+    </div>
+    <div class="d" style="font-size:12px;color:var(--mute);margin-bottom:8px">后端按模型名自动映射（GLM/Kimi K2/DeepSeek→thinking.type，Qwen3→enable_thinking，o系→reasoning_effort）</div>
     <label class="tab" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:12px"><input type="checkbox" id="mEnabled" ${(!m||m.enabled)?"checked":""} style="width:auto"/> 启用</label>
     <div class="btn-row"><button onclick="saveModel(${m?("'"+esc(m.id)+"'"):"null"})"><i data-lucide="save"></i>保存</button><button class="ghost" onclick="closeModal()">取消</button></div>
   </div></div>`;
@@ -744,7 +751,8 @@ async function saveModel(id){
     model:document.getElementById("mModel").value.trim(),
     base_url:document.getElementById("mBase").value.trim(),
     api_key:document.getElementById("mKey").value.trim(),
-    enabled:document.getElementById("mEnabled").checked};
+    enabled:document.getElementById("mEnabled").checked,
+    thinking:(document.querySelector('input[name=mThinking]:checked')||{}).value||"auto"};
   try{
     const d=await api("/api/models",{method:"POST",body});
     if(d){toast(d.saved?"模型已保存":"保存失败","ok");closeModal();loadModels();}
