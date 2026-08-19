@@ -21,10 +21,23 @@ STATE_FIELDS = [
 
 
 def _get_supabase():
-    """延迟获取 server.py 中初始化的 supabase 客户端。"""
+    """延迟获取 server.py 中初始化的 supabase 客户端（anon，用于只读直查）。"""
     try:
         import server
         return server.supabase
+    except Exception:
+        return None
+
+
+def _get_supabase_service():
+    """获取 service_role 客户端（仅用于 RPC 写操作，绕过 RLS）。
+
+    Home Runtime 的 RPC 对 anon/authenticated 撤销了执行权限，
+    只有 service_role 能调。读操作仍用 _get_supabase()（anon + RLS 保护）。
+    """
+    try:
+        import server
+        return server.supabase_service
     except Exception:
         return None
 
@@ -341,10 +354,21 @@ def fetch_pending_jobs(limit: int = 10) -> list[dict]:
 # ============================================================
 
 def _call_rpc(name: str, params: dict | None = None) -> dict:
-    """调用 Home Runtime RPC 函数。返回 RPC 返回的 JSON 或错误 dict。"""
-    sb = _get_supabase()
+    """调用 Home Runtime RPC 函数（写操作，需 service_role）。
+
+    Home Runtime 的 RPC 对 anon/authenticated 撤销了执行权限，只有
+    service_role 能调。这里用 _get_supabase_service() 获取 service_role
+    客户端。读操作（fetch_*）仍用 _get_supabase()（anon + RLS 保护）。
+
+    返回 RPC 返回的 JSON 或错误 dict。
+    """
+    sb = _get_supabase_service()
     if sb is None:
-        return {"ok": False, "error_code": "DB_UNAVAILABLE", "message": "数据库未连接"}
+        # service client 未配置时，给出明确的可操作错误提示
+        return {"ok": False, "error_code": "SERVICE_KEY_MISSING",
+                "message": "写操作需要 SUPABASE_SERVICE_KEY 环境变量（service_role key），当前未配置。"
+                           "请在 Supabase 控制台 Project Settings → API → service_role key 获取，"
+                           "并配置到环境变量 SUPABASE_SERVICE_KEY 后重启网关。"}
     try:
         resp = sb.rpc(name, params or {}).execute()
         if resp.data is not None:

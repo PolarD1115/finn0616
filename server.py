@@ -89,6 +89,17 @@ try:
 except Exception as e:
     print(f"⚠️ Supabase 初始化失败: {e}")
 
+# ---------- 数据库客户端 (Supabase, service_role — 仅用于 RPC 写操作) ----------
+# Home Runtime 的 RPC 对 anon/authenticated 撤销了执行权限，只有 service_role 能调。
+# 读操作（fetch_*）仍用上面的 anon client + RLS 保护；写操作（_call_rpc）用这个 client。
+supabase_service = None
+try:
+    SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        supabase_service = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+except Exception as e:
+    print(f"⚠️ Supabase service client 初始化失败: {e}")
+
 # ---------- 小屋/小满/小钱包 业务模块 ----------
 import home_system as _hs
 

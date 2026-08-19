@@ -79,7 +79,8 @@
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
 | `SUPABASE_URL` | ✅ | 空 | Supabase 项目 URL，如 `https://xxxxx.supabase.co` |
-| `SUPABASE_KEY` | ✅ | 空 | Supabase service_role key（生产推荐）或 anon key |
+| `SUPABASE_KEY` | ✅ | 空 | Supabase **anon** key（只读查询，受 RLS 保护） |
+| `SUPABASE_SERVICE_KEY` | ✅ | 空 | Supabase **service_role** key（RPC 写操作：种植/烹饪/钱包等。缺失时写操作返回 `SERVICE_KEY_MISSING`） |
 
 > 建表 SQL 见 `DEPLOY_ZEABUR.md` 附录。
 >

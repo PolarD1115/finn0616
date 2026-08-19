@@ -134,7 +134,7 @@ def _format_result(ok: bool, message: str, data: dict | None = None, error_code:
 # 3. DB IO 封装（调用 Supabase RPC）
 # ============================================================
 def _get_supabase():
-    """延迟获取 server.py 中初始化的 supabase 客户端。"""
+    """延迟获取 server.py 中初始化的 supabase 客户端（anon，用于只读直查）。"""
     try:
         import server
         return server.supabase
@@ -142,11 +142,27 @@ def _get_supabase():
         return None
 
 
+def _get_supabase_service():
+    """获取 service_role 客户端（仅用于 RPC 写操作，绕过 RLS）。
+
+    钱包 RPC 对 anon/authenticated 撤销了执行权限，只有 service_role 能调。
+    """
+    try:
+        import server
+        return server.supabase_service
+    except Exception:
+        return None
+
+
 def _rpc(name: str, params: dict) -> dict:
-    """调用 PostgreSQL RPC 函数。"""
-    sb = _get_supabase()
+    """调用 PostgreSQL RPC 函数（需 service_role）。"""
+    sb = _get_supabase_service()
     if sb is None:
-        return _format_result(False, "数据库未连接", error_code="DB_UNAVAILABLE")
+        return _format_result(
+            False,
+            "写操作需要 SUPABASE_SERVICE_KEY 环境变量（service_role key），当前未配置。",
+            error_code="SERVICE_KEY_MISSING",
+        )
     try:
         # Supabase Python 客户端通过 .rpc(name, params) 调用函数
         resp = sb.rpc(name, params).execute()
