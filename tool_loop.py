@@ -193,22 +193,21 @@ TOOL_REGISTRY: dict[str, dict] = {
     },
     "wallet_earn": {
         "description": "钱包入账（往储蓄罐存收入）。"
-            "bypass_cap=false（默认）：接活赚钱，计入周上限80元，超额部分按50%进加班银行。"
+            "接活赚钱，计入周上限80元，超额部分按50%进加班银行。"
             "适用场景：完成自主任务后领取报酬，如写随笔/观察笔记/短篇(5-10元)、研究话题整理笔记(8-15元)、给小屋做建设(5-12元)。"
-            "bypass_cap=true：不计周上限、不进加班银行。适用场景：每周零花钱(source_key=allowance_YYYYW##)、打赏(source_key=tip_<时间戳>)。"
+            "零花钱和打赏不通过此工具，由管理 API 处理。"
             "source_key 用于幂等防重，相同 source_key 重复调用会被拒绝。",
         "parameters": {
             "type": "object",
             "properties": {
                 "amount": {"type": "number", "description": "金额（CNY）"},
-                "source_key": {"type": "string", "description": "唯一标识防重复入账，如 task_essay_20260814_001 或 allowance_2026W33"},
+                "source_key": {"type": "string", "description": "唯一标识防重复入账，如 task_essay_20260814_001"},
                 "reason": {"type": "string", "description": "入账理由"},
-                "bypass_cap": {"type": "boolean", "description": "false=接活赚钱(计周上限)，true=零花钱/打赏(不计周上限)"},
             },
             "required": ["amount", "source_key", "reason"],
         },
         "callable": _hs.wallet_earn,
-        "fixed_args": {"wallet_id": _hs.DEFAULT_WALLET_ID, "meta": {}},
+        "fixed_args": {"wallet_id": _hs.DEFAULT_WALLET_ID, "meta": {}, "bypass_cap": False},
     },
     "wallet_spend": {
         "description": "钱包支出（扣余额）",
@@ -942,14 +941,12 @@ async def call_tool(name: str, args: dict) -> dict:
         return {"ok": False, "text": f"❌ 工具 {name} 不可用（callable 未解析）"}
     full_args = {**spec.get("fixed_args", {}), **(args or {})}
 
-    # 赚钱系统入口门控：wallet_earn 且 bypass_cap=False（Agent 自主赚钱）时，
-    # 若 money_earning_enabled=false 则拒绝。bypass_cap=True（零花钱/打赏）不受影响。
-    # 这是最终入口门控，防止仅在前端/暴露层隐藏后被 MCP 直调绕过。
+    # 赚钱系统入口门控：wallet_earn 时（固定 bypass_cap=False），
+    # 若 money_earning_enabled=false 则拒绝。
+    # Phase 6.1：bypass_cap 已从 schema 移除，fixed_args 固定 False。
     if name == "wallet_earn" and not _money_earning_enabled():
-        bypass_cap = bool(full_args.get("bypass_cap", False))
-        if not bypass_cap:
-            return {"ok": False,
-                    "text": "❌ 赚钱系统已关闭，Agent 暂不能自主入账 (MONEY_EARNING_DISABLED)"}
+        return {"ok": False,
+                "text": "❌ 赚钱系统已关闭，Agent 暂不能自主入账 (MONEY_EARNING_DISABLED)"}
 
     try:
         if inspect.iscoroutinefunction(fn):

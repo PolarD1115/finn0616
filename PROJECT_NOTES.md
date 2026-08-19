@@ -30,6 +30,473 @@
 
 ## 📦 变更日志
 
+### Phase 6.2 — 钱包 RPC 权限与记忆过滤收口（2026-08-19）
+**性质**：Phase 6.1 最小安全收口补丁。
+
+**修复内容**：
+
+| # | 问题 | 修复方式 |
+|---|------|----------|
+| 1 | authenticated 可直调 7 个钱包/宠物 RPC | REVOKE EXECUTE FROM authenticated（7个全部） |
+| 2 | search_memory `.neq("tags","Secret_Diary")` 会误过滤 NULL 标签 | 改用 `.or_("tags.neq.Secret_Diary,tags.is.null")` |
+| 3 | MCP bypass_cap 额外参数行为未验证 | 真实测试确认：TypeError 被 mcp_error_handler 捕获，返回错误字符串 |
+| 4 | 服务层 Pinecone tags 过滤不处理 list 格式 | 增加 isinstance(meta_tags, list) 分支 |
+
+**RPC 最终权限矩阵**：
+
+| RPC | anon | authenticated | PUBLIC | service_role | 类型 |
+|-----|------|---------------|--------|-------------|------|
+| rpc_wallet_check | false | **false** | — | true | 只读 |
+| rpc_wallet_earn | false | **false** | — | true | 写 |
+| rpc_wallet_spend | false | **false** | — | true | 写 |
+| rpc_wallet_exchange | false | **false** | — | true | 写 |
+| rpc_wallet_overtime_withdraw | false | **false** | — | true | 写 |
+| rpc_wallet_log | false | **false** | — | true | 只读 |
+| rpc_cat_shop_buy | false | **false** | — | true | 写 |
+
+**search_memory NULL 标签修复**：
+- 旧：`.neq("tags", "Secret_Diary")` — SQL 三值逻辑下 `NULL != 'Secret_Diary'` 为 NULL，NULL 标签行被排除
+- 新：`.or_("tags.neq.Secret_Diary,tags.is.null")` — 等价于 `tags IS NULL OR tags != 'Secret_Diary'`
+- 当前 memories 表 0 个 NULL tags（无实际影响），但修复确保未来安全
+- 服务层二次过滤增加 list 格式 tags 处理
+
+**MCP bypass_cap 兼容行为**（`[已确认事实]` 真实测试）：
+- 客户端传 `bypass_cap=True` → `TypeError: wallet_earn() got an unexpected keyword argument 'bypass_cap'`
+- 被 `@mcp_error_handler` 捕获 → 返回 `"❌ 工具执行出错: wallet_earn() got an unexpected keyword argument 'bypass_cap'"`
+- 行为分类：**B. Python TypeError**（非静默忽略）
+
+**source_key 唯一索引语义**（`[已确认事实]`）：
+- 定义：`CREATE UNIQUE INDEX ... ON wallet_log (source_key) WHERE (source_key IS NOT NULL)`
+- 空字符串 `''` 是非 NULL → **会被索引**，只允许一条
+- 当前 wallet_log：16 个 NULL source_key（不被索引），2 个有效 source_key，0 个空字符串
+- wallet_earn 要求 source_key 非空（`_validate_reason` 校验），不会写空字符串
+- wallet_spend/exchange/overtime_withdraw 写 NULL source_key → 不被索引 → 无冲突
+
+**数据库修改**（迁移 `phase6_2_revoke_authenticated_wallet`）：
+- REVOKE EXECUTE FROM authenticated（7 个 RPC，签名明确写出）
+
+**代码修改**：
+| 文件 | 修改内容 |
+|------|----------|
+| `server.py` | search_memory 改用 `or_` 保留 NULL 标签；服务层增加 list tags 处理 |
+| `test_phase6_2_rpc_permissions.py` | 新增 18 项测试 |
+| `test_phase6_1_wallet_api.py` | 适配 or_ 变更（1 处） |
+
+**验证结果**：
+- `python -m py_compile` 通过 ✅
+- `python -m unittest` 454/454 通过 ✅
+- Supabase 验证：7 个 RPC authenticated 全 false、旧数据不变 ✅
+
+### Phase 6.1 — 钱包前端兼容与秘密记忆检索防泄露（2026-08-19）
+**性质**：Phase 6 收口补丁，修复 4 个安全与兼容问题。
+
+**修复内容**：
+
+| # | 问题 | 修复方式 |
+|---|------|----------|
+| 1 | search_memory 无 tags 过滤，Secret_Diary 正文可被检索 | Supabase 查询加 `.neq("tags","Secret_Diary")`；Pinecone 结果加服务层二次过滤（_PRIVATE_TAGS 黑名单） |
+| 2 | 前端直调 sb.rpc("rpc_wallet_earn") 传 bypass_cap=true | 新增后端 API `/api/wallet/allowance` `/api/wallet/tip` `/api/wallet/spend` `/api/wallet` `/api/wallet/log`；前端改走 fetch + API_SECRET |
+| 3 | MCP wallet_earn 暴露 bypass_cap 参数 | MCP 签名移除 bypass_cap，固定 False；tool_loop schema 移除 bypass_cap，fixed_args 固定 False |
+| 4 | RPC 权限数量核对 | 7 个钱包/宠物 RPC 逐个确认：anon 全部 false，authenticated 全部 true |
+
+**search_memory 隐私修复**：
+- Supabase 查询：`.neq("tags", "Secret_Diary")` 在 SQL 层排除
+- Pinecone 结果：服务层检查 metadata tags，跳过 _PRIVATE_TAGS 中的记录
+- 无 include_private 参数可绕过
+
+**钱包后端 API**（受 API_SECRET 保护）：
+| 路由 | 方法 | 调用的封装 | 客户端不可控字段 |
+|------|------|-----------|----------------|
+| /api/wallet | GET | wallet_check | — |
+| /api/wallet/log | GET | wallet_log | wallet_id |
+| /api/wallet/allowance | POST | wallet_earn(bypass_cap=True) | wallet_id, source_key, bypass_cap |
+| /api/wallet/tip | POST | wallet_earn(bypass_cap=True) | wallet_id, source_key, bypass_cap |
+| /api/wallet/spend | POST | wallet_spend | wallet_id |
+
+**bypass_cap 收紧**：
+- MCP `wallet_earn`：移除 bypass_cap 参数，固定 False
+- `tool_loop` TOOL_REGISTRY：schema 移除 bypass_cap，fixed_args 固定 False
+- 零花钱/打赏：通过 `/api/wallet/allowance` 和 `/api/wallet/tip` 后端 API（后端内部固定 bypass_cap=True）
+- `call_tool` 门控：移除 bypass_cap 条件判断，固定拦截
+
+**前端修改**：
+- console.html / miniapp.html：移除 `_walletEarnRpc` 和 `sb.rpc("rpc_wallet_earn")`，改用 `fetch("/api/wallet/allowance")` 和 `fetch("/api/wallet/tip")`
+- 不暴露 service_role key 到浏览器
+
+**代码修改**：
+| 文件 | 修改内容 |
+|------|----------|
+| `server.py` | search_memory 加 Secret_Diary 过滤；wallet_earn MCP 移除 bypass_cap |
+| `gateway.py` | 新增 _handle_wallet_api + 5 个 /api/wallet/* 路由 |
+| `tool_loop.py` | wallet_earn schema 移除 bypass_cap，fixed_args 固定 False，call_tool 移除 bypass 条件 |
+| `console.html` | 钱包操作改走后端 API |
+| `miniapp.html` | 同 console.html |
+| `test_phase6_1_wallet_api.py` | 新增 15 项测试 |
+| `test_money_earning.py` | 适配 bypass_cap 移除（3 处测试更新） |
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_phase6_1_wallet_api test_money_earning test_wallet test_home_diary_compat test_home_expression_security test_home_expressions test_home test_home_state test_home_garden test_house test_cat test_cat_tick` — 438/438 通过 ✅
+- Supabase 验证：旧数据全部不变（Secret_Diary=36, wallet=1, wallet_log=18, pet_inventory=6, home_private_diaries=0）✅
+
+### Phase 6 — 旧秘密日记兼容与钱包边界整理（2026-08-19）
+**性质**：兼容和边界收口阶段，不新增功能。
+
+**A. 私密日记兼容**：
+- 旧 Secret_Diary（36条）：保留为只读历史来源，heartbeat.py 仍在写入（遗留写入口）
+- 新 home_private_diaries（0条）：未来 Home Runtime 私密日记权威写入源
+- 新增统一索引服务函数 `list_private_diary_index(limit, offset)` — 合并新旧日记元数据，不返回正文
+- 新增统一正文读取 `read_private_diary_by_reference(reference, is_internal)` — 仅内部受控调用
+- reference 格式：`legacy:<id>` 或 `home:<diary_key>`
+- 移除 `list_private_diary` MCP 注册（私密元数据不通过通用 MCP 暴露）
+- `/api/memories?category=secret_diary` 保留不变（API_SECRET 保护，只读旧 Secret_Diary）
+
+**B. 钱包边界**：
+- **wallet + wallet_log**：唯一正式钱包权威源
+- Home Runtime **不**保存第二套余额、不缓存余额、不直接修改钱包
+- 种植/烹饪/信件/便利贴等行为**不**隐式收费或赚钱
+- `rpc_wallet_earn` 等 7 个钱包 RPC + `rpc_cat_shop_buy`：**REVOKE FROM anon, PUBLIC**（原 anon 可执行，前端直连绕过门控）
+- `wallet_log` 新增 `source_key` 唯一索引（原幂等只在 RPC 内部检查，并发可绕过）
+- `bypass_cap` 安全边界：MCP 工具 `wallet_earn` 仍暴露 `bypass_cap` 参数，但 anon 直连 RPC 已收紧；客户端通过 API_SECRET 调用 MCP 时受 `money_earning_enabled` 门控（bypass_cap=False 时）
+- `expenses`（0行）：独立的用户记账本，不代表钱包余额，保留不删除
+- `piggy_bank`：不存在于 user_facts，`manage_piggy_bank` 仍注册但无实际数据
+
+**数据库修改**（迁移 `home_runtime_phase6_wallet_security`）：
+- REVOKE 7 个钱包 RPC + 1 个宠物商店 RPC 的 anon 执行权限
+- 新增 `idx_wallet_log_source_key_unique` 唯一索引（WHERE source_key IS NOT NULL）
+
+**代码修改**：
+| 文件 | 修改内容 |
+|------|----------|
+| `server.py` | 移除 list_private_diary MCP 注册 |
+| `home/repository.py` | 新增 fetch_legacy_secret_diaries + count_legacy_secret_diaries |
+| `home/service.py` | 新增 list_private_diary_index + read_private_diary_by_reference |
+| `test_home_diary_compat.py` | 新增 16 项测试 |
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_diary_compat test_home_expression_security test_home_expressions test_home test_home_state test_home_garden test_wallet test_money_earning test_house test_cat test_cat_tick` — 423/423 通过 ✅
+- Supabase 验证：钱包 RPC anon 不可执行、source_key 唯一索引存在、旧数据不变 ✅
+
+### Phase 5.1 — 私密表达鉴权收口（2026-08-19）
+**性质**：安全补丁，收口 Phase 5 安全补丁仍存在的三个问题。不新增功能。
+
+**三个已确认问题与修复**：
+
+| # | 问题 | 修复方式 |
+|---|------|----------|
+| 1 | write_private_diary 仍作为 MCP 工具，客户端可伪造 AI 日记 | 移除 MCP 注册，仅保留 service 内部函数（is_internal=True） |
+| 2 | open_letter/archive_letter 无收件人校验，letter_key 可枚举 | RPC 加固定 recipient_key='user' 校验；letter_key 改用随机 UUID；不存在和无权限统一返回 NOT_FOUND_OR_FORBIDDEN |
+| 3 | API_SECRET 为空时受保护入口直接放行 | _check_api_secret 空值时返回 503 拒绝（不再 return True） |
+
+**数据库修改**（迁移 `home_runtime_phase5_1_letter_auth`）：
+- `CREATE OR REPLACE FUNCTION rpc_home_open_letter` — 加 `recipient_key != 'user'` 校验，不存在和无权限统一返回 `NOT_FOUND_OR_FORBIDDEN`；事件 summary 不再含标题
+- `CREATE OR REPLACE FUNCTION rpc_home_archive_letter` — 同上加收件人校验
+- `CREATE OR REPLACE FUNCTION rpc_home_write_letter` — letter_key 改用 `letter_` + `gen_random_uuid()`（不可枚举）；事件 summary 不再含标题
+- REVOKE 保持，签名不变
+
+**代码修改**：
+| 文件 | 修改内容 |
+|------|----------|
+| `server.py` | 移除 write_private_diary MCP 注册（@mcp.tool 删除） |
+| `gateway.py` | _check_api_secret 空值时返回 503 拒绝（不再放行） |
+| `test_home_expression_security.py` | 新增 6 项测试（write/read/archive 不在 MCP + API_SECRET 空/正确/错误） |
+| `VARIABLES.md` | API_SECRET 文档更新：标注必填，说明空值时返回 503 |
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_expression_security -v` — 30/30 通过 ✅
+- `python -m unittest test_home_expressions test_home_expression_security test_home test_home_state test_home_garden test_house test_cat test_cat_tick` — 340/340 通过 ✅
+- Supabase 验证：RPC 签名未变、anon 无执行权限、表达表行数为 0（未因测试改变）✅
+
+### Phase 5 Security Patch — 私密表达访问控制与防泄露加固（2026-08-19）
+**性质**：安全补丁，修复 Phase 5 表达系统的 6 个安全问题。不新增功能。
+
+**已确认安全问题与修复**：
+
+| # | 问题 | 证据 | 修复方式 |
+|---|------|------|----------|
+| 1 | read_private_diary 作为 MCP 工具，任何调用方可读正文 | server.py 注册 @mcp.tool，service 无身份检查 | 移除 MCP 注册，service 加 is_internal 门控 |
+| 2 | archive_private_diary 作为 MCP 工具，任何调用方可归档 | 同上 | 移除 MCP 注册，service 加 is_internal 门控 |
+| 3 | write_private_diary 信任客户端 author_key | service 仅字符串比较，MCP 默认值=ai_primary | MCP 路径强制 author_key=ai_primary，不信任客户端 |
+| 4 | fetch_notes_by_room SELECT content 列后 Python 截取 | repository 查询含 content | SQL 层不 SELECT content |
+| 5 | read_note 不校验房间 enabled/hidden | service/RPC 均无房间检查 | service 先查 note 所属房间并校验 |
+| 6 | RLS Policy 对 authenticated 全表放开含 content 列 | pg_policies qual=true + 列授权含 content | ALTER POLICY 收紧 + REVOKE content 列 |
+
+**数据库修改**（迁移 `home_runtime_phase5_security_patch`）：
+- `ALTER POLICY home_private_diaries_select_all TO authenticated USING (false)` — authenticated 完全不可读
+- `ALTER POLICY home_letters_select_all TO authenticated USING (status != 'archived')` — 只看非归档
+- `ALTER POLICY home_notes_select_all TO authenticated USING (status != 'archived' AND visibility != 'private')` — 排除归档和私密
+- `REVOKE SELECT (content) ON home_letters, home_notes, home_private_diaries FROM authenticated, anon` — 列级权限收紧
+
+**代码修改**：
+| 文件 | 修改内容 |
+|------|----------|
+| `home/repository.py` | fetch_notes_by_room 不 SELECT content；新增 fetch_note_by_key |
+| `home/service.py` | write_private_diary MCP 路径强制 author_key；read/archive_private_diary 加 is_internal 门控；read_note 加房间校验 |
+| `server.py` | 移除 read_private_diary 和 archive_private_diary MCP 注册；write_private_diary 不接受 author_key 参数 |
+| `test_home_expressions.py` | 适配安全补丁变更（4 处） |
+| `test_home_expression_security.py` | 新增 24 项安全测试 |
+
+**当前真实身份能力**：
+- MCP 框架（FastMCP v1）无法提供调用者身份上下文
+- API_SECRET 保护 MCP 入口（/sse, /messages），但为全局单密钥、无用户级区分
+- 后端使用 service_role key（绕过 RLS）
+- 客户端可通过 author_key 参数冒充 AI（补丁后 MCP 路径强制覆盖）
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_expression_security -v` — 24/24 通过 ✅
+- `python -m unittest test_home_expressions test_home test_home_state test_home_garden test_house test_cat test_cat_tick` — 310/310 通过 ✅
+- Supabase 验证：RLS Policy 已收紧、旧表行数不变、Secret_Diary 不变 ✅
+
+### Phase 5 — 信件、便利贴与私密表达系统（2026-08-18）
+**性质**：实现三种异步表达载体（信件/便利贴/私密日记），各自有独立的数据、权限和生命周期。
+
+**私密日记方案选择**：方案 B（新建 `home_private_diaries` 表）。理由：需要 Home Runtime action_key 幂等关联、独立访问控制、避免扩展 memories 混合语义。旧 memories 中的 35 条 Secret_Diary 保留不动。
+
+**新增数据库对象**（迁移 `home_runtime_phase5_expressions`）：
+- 3 张新表：`home_letters`(0) / `home_notes`(0) / `home_private_diaries`(0)
+- 9 个 SECURITY DEFINER RPC（均设 `search_path = public, pg_temp`，REVOKE FROM PUBLIC）：
+  - 信件：`rpc_home_write_letter` / `rpc_home_open_letter` / `rpc_home_archive_letter`
+  - 便利贴：`rpc_home_leave_note` / `rpc_home_read_note` / `rpc_home_archive_note`
+  - 私密日记：`rpc_home_write_private_diary` / `rpc_home_read_private_diary` / `rpc_home_archive_private_diary`
+- RLS：3 张表 authenticated 只读
+
+**信件状态**：unopened → opened → archived
+- 未拆信列表不返回正文（只返回 title/preview）
+- 只有调用 open_letter 才返回正文
+- archive 为软归档，不删除
+
+**便利贴状态**：active → read → archived
+- 绑定房间，隐藏房间不可创建/读取
+- list_room_notes 只返回预览（前50字），不返回全文
+- 只有调用 read_note 才返回全文
+
+**私密日记**：
+- 仅 AI 本体（ai_primary）可写，服务层强制校验
+- 写入 home_events 时 visibility='private'（不进入普通时间线）
+- list_private_diary 只返回标题/心情/时间，不返回正文
+- 只有调用 read_private_diary 才返回正文
+- 独立于旧 memories.Secret_Diary（35条保留不动）
+
+**新增 MCP 工具**（12 个）：
+- 信件：`write_letter` / `list_letters` / `open_letter` / `archive_letter`
+- 便利贴：`leave_note` / `list_room_notes` / `read_note` / `archive_note`
+- 私密日记：`write_private_diary` / `list_private_diary` / `read_private_diary` / `archive_private_diary`
+
+**可见性矩阵**：
+| 数据 | AI | 用户 | 聊天上下文 | 普通时间线 | 房间观察 |
+|------|----|------|-----------|-----------|---------|
+| 未拆信正文 | 否 | 否 | 否 | 否 | 否 |
+| 已拆信正文 | 是 | 是(open_letter) | 否 | 摘要 | 摘要 |
+| 便利贴全文 | 是 | 是(read_note) | 否 | 摘要 | 预览 |
+| 私密日记正文 | 是 | 是(read_private_diary) | 否 | 否 | 否 |
+| 未拆信数量 | 是 | 是 | 是(Home Context) | — | — |
+
+**Home Context 变化**：增加未拆信件数量提示（"✉️ 有 N 封未拆开的信"）
+
+**新增文件**：
+| 文件 | 说明 |
+|------|------|
+| `test_home_expressions.py` | 40 项测试（信件/便利贴/私密日记/幂等/安全/降级） |
+| `migrations/20260818_011_home_runtime_phase5.sql` | 迁移存档 |
+
+**修改文件**：
+| 文件 | 改动 |
+|------|------|
+| `home/repository.py` | 新增 9 个 RPC 封装 + 4 个只读查询 |
+| `home/service.py` | 新增 12 个服务函数 |
+| `home/context.py` | 增加未拆信件数量提示 |
+| `server.py` | 新增 12 个 MCP 工具 |
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_expressions -v` — 40/40 通过 ✅
+- `python -m unittest test_home test_home_state test_home_garden test_house test_cat test_cat_tick -v` — 270/270 通过 ✅
+- Supabase 验证：3 张新表存在、旧表行数不变、旧 Secret_Diary 35条不变、anon 无执行权限 ✅
+
+### Phase 4 — 种植、库存与烹饪生活闭环（2026-08-18）
+**性质**：实现"种植→收获→库存→烹饪→食用/喂食"真实生活闭环。所有动作有真实副作用、原子事务、幂等保护、可追溯事件。
+
+**新增数据库对象**（迁移 `home_runtime_phase4_garden_cooking`）：
+- 5 张新表：`home_seed_catalog`(5行种子) / `home_plants`(0) / `home_inventory`(0) / `home_recipe_catalog`(3行菜谱) / `home_dishes`(0)
+- 8 个 SECURITY DEFINER RPC（均设 `search_path = public, pg_temp`，REVOKE FROM PUBLIC）：
+  - `_home_plant_settle(p_plant_id)` — 植物状态结算（elapsed-time 生长+水分衰减）
+  - `rpc_home_plant_seed(action_key, actor_key, seed_key)` — 种植
+  - `rpc_home_water_plant(action_key, actor_key, plant_id)` — 浇水
+  - `rpc_home_harvest_plant(action_key, actor_key, plant_id)` — 收获（原子：标记收获+增加库存）
+  - `rpc_home_cook_recipe(action_key, actor_key, recipe_key)` — 按菜谱烹饪（原子：扣库存+生成菜品）
+  - `rpc_home_cook_freestyle(action_key, actor_key, ingredients)` — 自由烹饪（最多5种食材）
+  - `rpc_home_eat_dish(action_key, actor_key, dish_id)` — 食用（扣份数+改状态）
+  - `rpc_home_feed_member(action_key, actor_key, target_key, dish_id)` — 喂食（扣份数+改目标状态+intimacy日限）
+- 种子目录：番茄/胡萝卜/生菜/草莓/薄荷（5种）
+- 菜谱目录：番茄炒蛋/蔬菜汤/薄荷茶（3个）
+- RLS：5 张表 authenticated 只读
+
+**新增 MCP 工具**（9 个）：
+- `garden_observe` / `plant_seed` / `water_plant` / `harvest_plant` — 花园系列
+- `pantry_observe` / `cook_recipe` / `cook_freestyle` / `eat_dish` / `feed_member` — 厨房系列
+
+**植物生长规则**：
+- 阶段：planted → growing → mature → harvested
+- 水分每小时 -10，水分为0时健康 -5/h，水分充足时健康 +2/h
+- 生长时间由种子目录 growth_minutes 决定（30-120分钟）
+- 只有 mature 可收获，收获后不可重复
+- 收获数量 = 种子目录 base_yield
+
+**库存规则**：
+- 唯一约束：(owner_member_id, storage_location, item_kind, item_key)
+- quantity CHECK >= 0，不允许负库存
+- 收获增加库存用 ON CONFLICT DO UPDATE（原子累加）
+- 烹饪扣除库存用 FOR UPDATE 行锁（防并发超扣）
+
+**烹饪规则**：
+- 按菜谱：验证所有食材 → FOR UPDATE 锁定 → 原子扣除 → 生成菜品 → 写事件
+- 自由烹饪：最多5种食材，总量最多20，确定性生成（名称/份数/品质由食材决定）
+- 菜品有 servings（份数），食用/喂食扣 1 份
+
+**新增文件**：
+| 文件 | 说明 |
+|------|------|
+| `test_home_garden.py` | 50 项测试（参数校验/幂等/错误码/观察/降级/安全） |
+| `migrations/20260818_010_home_runtime_phase4.sql` | 迁移存档 |
+
+**修改文件**：
+| 文件 | 改动 |
+|------|------|
+| `home/repository.py` | 新增 7 个 RPC 封装 + 5 个只读查询函数 |
+| `home/service.py` | 新增 9 个服务函数（garden_observe/plant_seed/water_plant/harvest_plant/pantry_observe/cook_recipe/cook_freestyle/eat_dish/feed_member） |
+| `home/context.py` | 扩展 build_home_context 增加花园植物/库存/菜品摘要 |
+| `server.py` | 新增 9 个 MCP 工具 |
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_garden -v` — 50/50 通过 ✅
+- `python -m unittest test_home test_home_state test_house test_cat test_cat_tick -v` — 220/220 通过 ✅
+- Supabase 验证：5 张新表存在、种子/菜谱数据正确、旧表行数不变、anon 无执行权限 ✅
+
+### Phase 3 — 家庭成员、生命状态与基础生活行为（2026-08-18）
+**性质**：初始化家庭成员 + elapsed-time 状态结算 + 基础生活动作（进入房间/休息/睡眠/陪伴）+ 上下文接入。RLS 收紧。
+
+**RLS 权限收紧**（ALTER POLICY，不删除 Policy）：
+- 7 张 home_* 表的 SELECT 策略从 `TO anon, authenticated` 改为 `TO authenticated`
+- `home_events` 额外在 USING 中过滤 `visibility NOT IN ('private','system')`
+- 6 个新 RPC 全部 `REVOKE EXECUTE FROM anon, authenticated, PUBLIC`
+
+**新增数据库对象**（迁移 `home_runtime_phase3_rls_and_rpcs` + `home_runtime_revoke_public_execute`）：
+- 6 个 SECURITY DEFINER RPC（均设 `search_path = public, pg_temp`）：
+  - `_home_settle_internal(p_member_id)` — 内部结算（仅 AI，宠物跳过）
+  - `rpc_home_initialize_members()` — 幂等初始化 AI + 小满
+  - `rpc_home_settle_member(p_member_key)` — 公开结算接口
+  - `rpc_home_enter_room(p_action_key, p_member_key, p_room_key)` — 进入房间
+  - `rpc_home_rest(p_action_key, p_member_key, p_duration_minutes, p_mode)` — 休息/睡眠
+  - `rpc_home_spend_time(p_action_key, p_actor_key, p_target_key, p_activity, p_duration_minutes)` — 陪伴互动
+
+**成员初始化结果**（幂等，已执行）：
+| 成员 | stable_key | member_type | 初始值来源 | 状态 |
+|------|-----------|-------------|-----------|------|
+| Finn | ai_primary | ai | 默认保守值(hunger=70,energy=70,health=100,intimacy=50) | alive |
+| 小满 | pet_xiaoman | pet | pets 表只读快照(hunger≈35,energy≈45,health=100) | alive |
+
+**状态结算规则**（AI 本体，宠物不结算）：
+- 清醒：hunger-1.5/h, energy-1.0/h, comfort-0.2/h, connection-0.1/h(地板20), cleanliness-0.2/h
+- 休息：energy+1.0/h, comfort+0.3/h
+- 睡眠：energy+2.0/h, comfort+0.5/h, hunger-0.5/h
+- 不衰减：intimacy, health, mood
+- 单次最大跨度 48h，最小 60s，时钟回拨不结算
+- 陪伴：comfort+2, connection+1.5, intimacy+1(每日上限3)
+
+**新增文件**：
+| 文件 | 说明 |
+|------|------|
+| `home/state.py` | 纯函数状态结算引擎（clamp/elapsed/衰减/恢复/陪伴/宠物策略/默认值） |
+| `test_home_state.py` | 70 项测试（纯函数/校验/幂等/降级/安全） |
+| `migrations/20260818_009_home_runtime_phase3.sql` | 迁移存档 |
+
+**修改文件**：
+| 文件 | 改动 |
+|------|------|
+| `home/repository.py` | 新增 6 个 RPC 封装（_call_rpc + rpc_initialize/settle/enter_room/rest/spend_time） |
+| `home/service.py` | 新增 6 个服务函数（initialize_members/settle_member/enter_room/rest/sleep/spend_time） |
+| `server.py` | 新增 4 个写 MCP 工具 + _home_build_context_safe() + 上下文注入(server.py:721后) |
+| `gateway.py` | 新增 _home_context_enabled() + _gw_home_context_safe() + runtime config 加 home_context_enabled + 上下文注入(gateway.py:1836后) |
+
+**新增 MCP 工具**（4 个写工具，不在旧自由活动白名单中）：
+- `home_enter_room(actor_key, room_key, action_key)` — 进入房间
+- `home_rest(actor_key, duration_minutes, action_key)` — 休息
+- `home_sleep(actor_key, duration_minutes, action_key)` — 睡眠
+- `home_spend_time(actor_key, target_key, activity, duration_minutes, action_key)` — 陪伴互动
+
+**上下文接入**：
+- Web 渠道：gateway._inject_context volatile_block 中注入（device_snapshot 后、时间戳前）
+- TG/QQ 渠道：server._build_channel_context volatile_parts 中注入（device_snapshot 后、时间戳前）
+- 受 `_home_context_enabled()` 运行时门控（sys_config, 5s 热生效, 默认 true）
+- 放在 volatile 区域，不破坏 prompt cache 稳定前缀
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home_state test_home -v` — 127/127 通过 ✅
+- `python -m unittest test_house test_cat test_cat_tick test_console -v` — 124/124 通过（2 skipped）✅
+- Supabase 验证：成员已初始化、幂等有效、旧表不变、anon 无执行权限、RLS 收紧 ✅
+
+**未实现（按 Prompt 要求排除）**：种植/烹饪/信件/便利贴/作品/自主决策引擎/Home Jobs 消费者/旧系统迁移/前端改造
+
+### Phase 2 — Home Runtime 基础模型与只读观察层（2026-08-18）
+**性质**：建立 Home Runtime 基础层（7 张新表 + 代码骨架 + 只读观察工具），不实现写操作和生活副作用。
+
+**新增数据库对象**（Supabase 迁移 `home_runtime_base_tables`）：
+- 7 张新表：`home_rooms`(9行种子)、`home_members`(0行)、`home_member_states`(0行)、`home_objects`(0行)、`home_events`(0行)、`home_action_runs`(0行)、`home_jobs`(0行)
+- 7 个索引（房间物品、事件时间/房间/成员/类型、行动状态、任务调度）
+- RLS：7 张表全部启用，每表 1 条 SELECT 策略（anon/authenticated 只读，写需 service_role）
+- 种子数据：9 个初始房间（客厅/卧室/厨房/书房/工作室/花园/海边/观星台[隐藏]/地下室[隐藏]），ON CONFLICT DO NOTHING 幂等
+
+**新增文件**：
+| 文件 | 说明 |
+|------|------|
+| `home/__init__.py` | Home Runtime 包入口 |
+| `home/models.py` | dataclass 数据模型（房间/成员/状态/物品/事件/行动/任务） |
+| `home/schemas.py` | 枚举常量 + 校验函数 + 统一返回格式 |
+| `home/repository.py` | Supabase 查询封装层（只读，不拼接 SQL） |
+| `home/service.py` | 只读观察服务（observe_home/room/member, timeline, action_status） |
+| `home/context.py` | 上下文构建（build_home_context，纯函数，未接入聊天链路） |
+| `test_home.py` | 57 项单元测试（校验/模型/观察/幂等/安全/降级/上下文） |
+| `migrations/20260818_008_home_runtime_base.sql` | 迁移 SQL 存档 |
+
+**修改文件**：
+| 文件 | 改动 |
+|------|------|
+| `server.py` | 新增 `from home import service as _home_svc` 软导入 + 4 个只读 MCP 工具（`home_observe`/`home_observe_room`/`home_observe_member`/`home_timeline`） |
+
+**新增 MCP 工具**（4 个，全部只读）：
+- `home_observe()` — 观察整个家庭状态（房间/成员/事件/待执行任务数）
+- `home_observe_room(room_key)` — 观察指定房间（详情/物品/近期事件）
+- `home_observe_member(member_key)` — 观察指定成员（信息/状态/近期事件）
+- `home_timeline(limit, event_type)` — 事件时间线（按时间倒序，排除 private）
+
+**关键设计决策**：
+- 不复用 `agent_jobs`：agent_jobs 绑定 assistant_id + 分布式 claim 机制，语义与 Home Runtime 不同，新建 `home_jobs`
+- 不复用 `house_rooms`/`house_objects`：旧表字段不足（无 stable_key/is_hidden/unlock_condition），新建 `home_*` 前缀表
+- RLS 策略：anon/authenticated 只读（比旧表更严格，旧表给 anon 全读写）；写操作需 service_role
+- 不迁移旧数据：`home_members` 为空，不自动把 `pets` 记录迁入；`home_objects` 为空，不复制 `house_objects`
+- `home_events` 的 `event_key` 可空（非所有事件需幂等），`home_action_runs` 的 `action_key` 非空唯一（幂等必需）
+- 成员状态核心字段结构化（8 个 numeric CHECK 0-100），扩展状态放 `extra` JSONB
+
+**验证结果**：
+- `python -m py_compile` 全部通过 ✅
+- `python -m unittest test_home -v` — 57/57 通过 ✅
+- `python -m unittest test_house test_cat test_cat_tick -v` — 93/93 通过（回归）✅
+- Supabase 验证：7 张新表存在、RLS 启用、9 行种子房间正确、旧表行数全部不变 ✅
+- 静态检查：新代码无 DELETE/DROP/TRUNCATE ✅
+
+**未实现（按 Prompt 要求排除）**：
+- 种植/浇水/收获/冰箱/烹饪/喂食成员/信件/便利贴/秘密日记重做/绘画/音乐
+- 自主决策引擎
+- 后台 Home Runtime 调度
+- 前端改造
+- 旧表删除/旧 RPC 删除
+- 旧数据迁移到新表
+
 ### v5.2 — Prompt Cache 命中率修复（TTL 缓存 + 可观测性 + 自适应历史 + Claude 标记）
 **背景**：缓存命中率极度不稳定——高时 60-70%，大部分时候只有 4-5% 甚至不 cached。参考 Haven-Ombre 仓库的缓存统计做法后诊断出 4 个根因，逐一修复。
 
@@ -1449,4 +1916,359 @@ python -m unittest test_tool_loop
 ### Git commit 状态
 
 项目目录非 Git 仓库（环境已确认 `Is a git repository: no`），未执行任何 `git` 操作，未提交。如需提交，建议：`fix(gateway): remove lust inhibitor from taobao activity`。
+
+---
+
+## Phase 7 — 宠物状态权威源与 Home Runtime 融合（2026-08-19）
+
+### 日期
+2026-08-19
+
+### 前情基线
+Phase 1–6.2 已完成项目审计、Home Runtime 基础、家庭成员、种植烹饪、信件日记、钱包边界。Phase 7 目标：解决小满在旧宠物系统和新 Home Runtime 之间的权威来源和生活互动问题。
+
+### 子智能体调查
+启动 7 个并行只读子智能体调查：旧宠物写入链、Home Runtime 宠物链、数据库和 RPC、房间权威来源、喂食事务、事件和上下文、测试规划。全部完成，结论交叉验证。
+
+### 实际权威来源矩阵
+
+| 数据 | 旧字段(pets) | Home 字段 | 最终权威 | 修改前差异 |
+|---|---|---|---|---|
+| hunger | pets.hunger(26.93) | home_member_states.hunger(35.27) | **pets** | +8.34 |
+| happiness/mood | pets.happiness(40.06) | home_member_states.mood(47.56) | **pets** | +7.50 |
+| energy | pets.energy(40.0) | home_member_states.energy(45.0) | **pets** | +5.0 |
+| cleanliness | pets.cleanliness(50.97) | home_member_states.cleanliness(42.63) | **pets** | -8.34 |
+| health | pets.health(100) | home_member_states.health(100) | **pets** | 0 |
+| status/mood | pets.status/mood | N/A | **pets** | — |
+| current_room | pets.current_room(study) | home_member_states.current_room_id(living_room) | **pets** | 不一致 |
+| intimacy/connection/comfort | N/A | home_member_states | **home_member_states** | — |
+
+### 小满状态差异
+修改前 pets 与 home_member_states 已全面偏移，current_room 不一致（study vs living_room）。home_member_states 为初始化快照，从未重新同步。
+
+### 生理状态权威源
+pets 为小满生理状态唯一权威源。`_home_settle_internal` 已对 pet 返回 `non_ai_skip`，无双重衰减。
+
+### 关系状态权威源
+home_member_states 为小满关系状态（comfort/connection/intimacy）唯一权威源。
+
+### 房间权威源
+pets.current_room 为小满当前房间权威源，映射到 home_rooms.stable_key。balcony 在 home_rooms 中不存在 → room_mapping_status="unknown"，不自动建房、不映射 garden、不回退过期快照。
+
+### 结算边界
+`_home_settle_internal` 对 `member_type != 'ai'` 返回 `non_ai_skip`，宠物不被 Home Runtime 衰减。`rpc_cat_tick` 继续作为宠物唯一衰减机制。无需修改。
+
+### 喂食事务
+`rpc_home_feed_member` 重写：宠物目标分支写入 pets.hunger（仅 hunger_restore，依据 cat_feed 规则），不写 home_member_states.hunger。事务顺序：幂等→成员校验→宠物映射校验+FOR UPDATE pets→FOR UPDATE home_member_states→FOR UPDATE home_dishes→业务写入。所有校验和锁定在第一次业务写入前完成。新增错误码：PET_MAPPING_NOT_FOUND、PET_NOT_FOUND、PET_NOT_FEEDABLE、HOME_STATE_NOT_FOUND。
+
+### 陪伴规则
+`rpc_home_spend_time` 未修改。仅更新 Home 关系状态（comfort/connection/intimacy），不触碰 pets，不触发宠物结算，不调用 cat_play/cat_pet。
+
+### Home Context 适配
+`_compose_member_view()` 作为唯一组合逻辑实现。context.py 调用 service._compose_member_view() 获取组合视图，仅格式化文本，不自行查询 pets。pets 不可用时生理字段返回 null，physiology_source='unavailable'，禁止回退过期快照。
+
+### 旧事件边界
+旧操作（cat_feed/play/clean/pet/tick/room_mischief）继续以 pets/pet_tick_log/pet_agent_outbound 为审计源。新 Home 行为写 home_events。不做双写。pet_agent_outbound 9 条 pending 死队列，仅只读确认。
+
+### 数据库迁移
+迁移名：`home_pet_bridge`，通过 Supabase apply_migration 执行。
+- CREATE OR REPLACE FUNCTION rpc_home_feed_member（签名不变）
+- CREATE OR REPLACE FUNCTION rpc_home_enter_room（签名不变，新增 PET_CANNOT_ACT 拦截）
+无 DELETE/DROP/TRUNCATE。
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|---|---|---|
+| migrations/20260819_001_home_pet_bridge.sql | 新增迁移文件 | CREATE OR REPLACE 两个 RPC |
+| home/repository.py | 新增 fetch_pet_by_member | 只读查询 pets 权威源 |
+| home/service.py | 新增 _compose_member_view；修改 observe_member/observe_home/enter_room | 组合视图+宠物拦截 |
+| home/context.py | 修改 build_home_context/format_member_brief | 使用组合视图，不自行查询 pets |
+| test_home_pet_bridge.py | 新增 59 个测试 | 覆盖权威来源/房间/喂食/陪伴/Context/源码约束/迁移约束 |
+| PROJECT_NOTES.md | 追加本节 | Phase 7 记录 |
+
+### 测试结果
+- `py_compile` home/repository.py home/service.py home/context.py test_home_pet_bridge.py → ✅ 通过
+- `python -m unittest test_home_pet_bridge` → ✅ 59/59 通过
+- `python -m unittest test_home test_home_state test_home_garden test_home_pet_bridge` → ✅ 236/236 通过
+- `python -m unittest test_cat test_cat_tick test_cat_check` → ✅ 94/94 通过
+- `python -m unittest test_tool_loop` → 5 预先失败（weather tool schema / tool loop 行为，与 Phase 7 无关）
+
+### Supabase 验证
+- pets 行数=1，小满 hunger=26.93 未变 ✅
+- pet_inventory=6、wallet=1、home_dishes=0、home_events=0、home_member_states=2、home_members=2、pet_tick_log=93、pet_agent_outbound=9 全部未变 ✅
+- rpc_home_feed_member 签名：(p_action_key text, p_actor_key text, p_target_key text, p_dish_id uuid) ✅
+- rpc_home_enter_room 签名：(p_action_key text, p_member_key text, p_room_key text) ✅
+- 两个函数 search_path = public, pg_temp ✅
+- 无 DELETE/DROP/TRUNCATE ✅
+
+### Advisor 结果
+- Security：无本阶段引入的新问题。所有 WARN/INFO 均为历史遗留（eventide search_path、anon SECURITY DEFINER、pg_trgm 扩展等）。
+- Performance：无本阶段引入的新问题。所有 INFO/WARN 均为历史遗留（unindexed FK、unused index、multiple permissive policies）。
+
+### 未验证内容
+- 真实喂食写链未端到端验证（home_dishes 为空，按 Phase 7 要求不在生产库喂测试菜品）
+- RPC 函数体修改已部署到生产库，但未用测试数据触发
+
+### 已知风险
+- balcony 房间映射缺口（rpc_cat_room_mischief 可将小满移到 balcony，home_rooms 无此房间 → unknown）
+- intimacy 上限分池（fed_member + played 各 3.0/日，合计可达 6.0/日，既有行为，不在 Phase 7 修改）
+- pet_agent_outbound 死队列持续增长
+
+### 是否执行数据库写入
+是：CREATE OR REPLACE FUNCTION（签名不变）
+
+### 是否执行删除
+否：无 DELETE/DROP/TRUNCATE，未删除旧 RPC/Policy/索引/数据
+
+### Git commit 状态
+项目目录非 Git 仓库，未执行 git 操作。建议 commit message：`fix(home): bridge pet authority into home runtime`
+
+---
+
+## Phase 8 — 种植与烹饪规则验证、调整与项目收尾（2026-08-19）
+
+### 日期
+2026-08-19
+
+### 实施前规则
+审计了种植/烹饪/库存/食用/喂食/Context 全链路规则。启动 4 个并行只读子智能体（植物规则审计、库存守恒审计、菜谱和Context审计、事务和测试审计），结合直接 Supabase 查询确认。
+
+### 实际数据库结构
+- home_seed_catalog: 5 行（lettuce/tomato/carrot/strawberry/mint，全部 is_enabled=true）
+- home_recipe_catalog: 3 行（tomato_egg/vegetable_soup/mint_tea，全部 is_enabled=true）
+- home_plants: 0 行
+- home_inventory: 0 行
+- home_dishes: 0 行
+- home_events: 0 行
+- home_action_runs: 0 行
+- pets: 1 行（小满，未因 Phase 8 变化）
+
+### 子智能体调查
+4 个子智能体全部完成。关键发现：
+1. cook_recipe 和 cook_freestyle 验证全部食材 FOR UPDATE 后才扣减 ✅
+2. harvest 原子事务（标记收获 + 增加库存同一事务）✅
+3. 库存 CHECK(quantity>=0) 兜底 ✅
+4. home_inventory 和 pet_inventory 不混用 ✅
+5. LLM 不能传自定义恢复值/品质/份数 ✅
+6. **eat_dish 锁顺序错误**：dish→state（与 feed_member 的 state→dish 相反），且无 HOME_STATE_NOT_FOUND 检查 ❌
+7. **water_plant 初始 SELECT 无 FOR UPDATE**：并发收获后仍可浇水 ❌
+8. **harvest stage 比较有 NULL 旁路**：COALESCE 缺失 ❌
+
+### 植物规则最终状态
+- 种植：仅 garden 房间，seed_key 必须存在且启用，growth_minutes/base_yield 来自种子目录（LLM 不可传），action_key 幂等
+- 生长：elapsed-time 结算，UTC，时钟回拨安全，48h 最大跨度，水分 -10/h，health 水分<10 时 -5/h 否则 +2/h
+- 浇水：恢复 water_level=100，无功能冷却（watering_interval_minutes schema'd 但未实现，记录为已知限制），已收获植物不可浇水
+- 收获：仅 mature 可收获，FOR UPDATE 锁定，重复收获 ALREADY_HARVESTED，产量=base_yield，植物标记+库存增加同一事务
+
+### 库存规则最终状态
+- UNIQUE(owner_member_id, storage_location, item_kind, item_key)
+- CHECK(quantity>=0) 兜底
+- 收获：INSERT ON CONFLICT DO UPDATE（原子 UPSERT）
+- 烹饪：FOR UPDATE 验证全部食材 → 扣减 → 生成菜品
+- home_inventory 和 pet_inventory 完全隔离
+
+### 菜谱规则最终状态
+- recipe_key 必须来自启用的菜谱目录
+- 食材需求来自 required_ingredients JSONB
+- yield_quantity/base_quality/hunger_restore/mood_restore/energy_restore 全部来自数据库，LLM 不可传
+- 菜谱扣除和菜品生成同一事务
+
+### 自由烹饪规则最终状态
+- 最多 5 种食材，总量最多 20，每项正整数
+- 确定性生成：servings=max(1,total/3)，quality=min(80,40+count*10)，hunger=25/mood=8/energy=12
+- LLM 不可传自定义效果
+
+### Finn 食用规则
+- eat_dish：锁定 state→dish（Phase 8 修复后），servings>0，扣 1 份，更新 home_member_states hunger/mood/energy（clamp 100），写 'ate' 事件
+
+### 小满喂食规则
+- feed_member（Phase 7）：宠物目标写 pets.hunger（仅 hunger_restore）+ home_member_states.intimacy，不写 home_member_states.hunger/mood/energy
+
+### 事务与幂等验证
+- 所有 RPC 使用 action_key 幂等（home_action_runs UNIQUE）
+- cook_recipe/cook_freestyle：验证全部食材 FOR UPDATE 后才扣减 ✅
+- harvest：植物标记+库存增加同一事务 ✅
+- **Phase 8 修复**：eat_dish 锁顺序改为 state→dish + HOME_STATE_NOT_FOUND ✅
+- **Phase 8 修复**：water_plant 初始 SELECT 增加 FOR UPDATE ✅
+- **Phase 8 修复**：harvest stage 比较增加 COALESCE 防 NULL 旁路 ✅
+
+### Home Context 验证
+- 显示花园植物、库存摘要、菜品摘要、Finn 状态、小满 pets 权威值 ✅
+- 不显示 UUID、API Key、私密日记 ✅
+- 不写数据库 ✅
+- 位于 volatile 区域 ✅
+- Web/QQ/TG 共享同一来源 ✅
+
+### 修复内容
+
+| 文件或对象 | 修改内容 | 原因 |
+|---|---|---|
+| rpc_home_eat_dish | 锁顺序改为 state→dish + HOME_STATE_NOT_FOUND | 防止菜品扣除后状态行不存在导致静默成功；与 feed_member 锁顺序一致 |
+| rpc_home_water_plant | 初始 SELECT 增加 FOR UPDATE | 防止并发收获后仍浇水 |
+| rpc_home_harvest_plant | stage 比较增加 COALESCE | 防 NULL 旁路导致 withered 植物被收获 |
+| migrations/20260819_002_home_phase8_transaction_fixes.sql | 新增迁移文件 | 版本记录 |
+| test_home_phase8.py | 新增 50 个测试 | 覆盖植物/库存/烹饪/食用/Context/事务/源码约束 |
+
+### 测试结果
+- `py_compile` 全部通过 ✅
+- `test_home_phase8` → 50/50 通过 ✅
+- `test_home test_home_state test_home_garden test_home_pet_bridge test_home_phase8 test_home_expressions test_home_expression_security test_home_diary_compat` → 372/372 通过 ✅
+- `test_cat test_cat_tick test_cat_check test_wallet test_house test_console test_gateway_routes` → 199/199 通过（2 skipped）✅
+- `test_tool_loop` → 5 预先失败（weather tool schema，与 Phase 8 无关）
+
+### Supabase 验证
+- 所有表行数未因 Phase 8 变化（pet_tick_log 100 是 heartbeat 自动运行，非 Phase 8 写入）✅
+- 3 个修复的 RPC 签名不变 ✅
+- 无 DELETE/DROP/TRUNCATE ✅
+
+### Advisor 结果
+- Security：无本阶段引入的新问题
+- Performance：无本阶段引入的新问题
+
+### 未验证内容
+- 真实种植/烹饪/食用/收获写链未端到端验证（home_plants/inventory/dishes 为空，按 Phase 8 要求不在生产库写测试数据）
+- RPC 函数体修改已部署到生产库，但未用测试数据触发
+
+### 已知风险
+- watering_interval_minutes schema'd 但未实现（浇水无冷却，记录为已知限制不扩展）
+- 植物不会 wither（withered 状态是死代码，_home_plant_settle 不设置此状态）
+- cook_recipe/cook_freestyle 库存查询未过滤 storage_location（单位置流程正常，多位置可能歧义）
+- eat_dish/cook 无 ownership 检查（家庭场景可接受）
+- garden_observe 不触发 settle（观察数据可能 stale，但无写副作用）
+- pet_agent_outbound 死队列持续增长
+
+### 明确不实现的功能
+新植物种类、植物遗传、枯萎死亡重生、植物交易/商店、自动购买种子、钱包收费、菜品保质期/变质、复杂菜谱树、烹饪小游戏/动画、新宠物商品、新钱包玩法、新自主决策、后台自动种植/浇水/烹饪、Home Jobs 消费者、前端完整花园/厨房页面、作品系统、画室、音乐室、隐藏剧情
+
+### 是否执行数据库写入
+是：CREATE OR REPLACE FUNCTION（3 个 RPC，签名不变）
+
+### 是否执行删除
+否：无 DELETE/DROP/TRUNCATE，未删除旧 RPC/Policy/索引/数据
+
+### Git commit 状态
+项目目录非 Git 仓库，未执行 git 操作。建议 commit message：`fix(home): finalize plant and cooking consistency`
+
+---
+
+## 最终验收记录 — Home Runtime Phase 1–8
+
+### 1. 验收日期和环境
+- 日期：2026-08-19
+- 平台：Windows 10.0.26200 x64
+- Python：3.11
+- 项目目录非 Git 仓库（`.git` 不存在）
+- 无 `.venv` 虚拟环境（使用系统 Python）
+
+### 2. 验收范围
+Phase 1–8 全部产出物的只读核验：代码实现、数据库结构、RPC 权限、测试结果、后台自主生活接入状态、端到端验证状态、遗留系统、已知技术债。
+
+### 3. 实际读取的核心文件
+PROJECT_NOTES.md, VARIABLES.md, README.md, AGENT_HANDOFF_HOME_SYSTEM.md, home/models.py, home/schemas.py, home/repository.py, home/service.py, home/state.py, home/context.py, server.py, gateway.py, heartbeat.py, tool_loop.py, home_system.py, 全部 test_*.py, migrations/*.sql。
+
+### 4. Supabase 只读基线
+**Home Runtime 表**：home_rooms(9), home_members(2), home_member_states(2), home_objects(0), home_events(0), home_action_runs(0), home_jobs(0), home_seed_catalog(5), home_plants(0), home_inventory(0), home_recipe_catalog(3), home_dishes(0), home_letters(0), home_notes(0), home_private_diaries(0)。
+**旧系统表**：pets(1), pet_items(44), pet_inventory(6), pet_tick_log(103), pet_agent_outbound(9 pending), wallet(1), wallet_log(18), memories(2128), memory_house(5), house_rooms(5), house_objects(0), house_diary(23), virtual_creatures(2), expenses(0)。
+**关键发现**：home_events=0, home_action_runs=0 → Home Runtime 写操作从未在真实数据库执行过。Secret_Diary=41 条。pet_agent_outbound=9 pending（死队列）。
+**RPC 权限**：全部 home_* RPC 和 wallet RPC 对 anon/authenticated 均=false（仅 service_role 可执行）。cat_* RPC（除 shop_buy）对 anon=true（历史遗留）。
+**RLS**：全部表 RLS 已启用。
+
+### 5. 已完成能力
+- Home Runtime 数据模型（7 基础表 + 5 种植烹饪表 + 3 异步表达表）✅
+- 显式 MCP 工具注册（home_observe/enter_room/rest/sleep/spend_time, garden_observe/plant_seed/water_plant/harvest_plant, pantry_observe/cook_recipe/cook_freestyle/eat_dish/feed_member, 信件/便利贴/私密日记工具）✅
+- 数据库 RPC 函数（全部 SECURITY DEFINER, search_path=public,pg_temp）✅
+- Phase 7 宠物权威源融合（pets 为生理唯一权威源, _compose_member_view 组合视图, feed_member 写 pets.hunger, enter_room 拦截 pet actor）✅
+- Phase 8 事务修复（eat_dish 锁顺序+HOME_STATE_NOT_FOUND, water_plant FOR UPDATE, harvest COALESCE）✅
+- Home Context 注入（volatile 区域, Web/QQ/TG 共享, pets 权威值, 不写 DB）✅
+- 钱包权限加固（anon/authenticated 不可执行钱包 RPC, 前端走 /api/wallet/*）✅
+- 私密日记权限隔离（不通过通用 MCP 暴露, search_memory 排除 Secret_Diary）✅
+- 单元测试覆盖（733 个测试, 727 passed, 6 failed, 2 skipped）✅
+
+### 6. 已实现但未真实端到端验证的能力
+以下能力代码和 RPC 已部署，但 home_events/home_action_runs/home_plants/home_inventory/home_dishes 均为 0 行，证明从未在真实数据库执行过：
+- 进入房间（B. mock 验证）
+- 休息/睡眠（B. mock 验证）
+- 陪伴（B. mock 验证）
+- 种植（B. mock 验证）
+- 时间生长（C. 静态审计）
+- 浇水（B. mock 验证）
+- 收获（B. mock 验证）
+- 库存增加（B. mock 验证）
+- 正式烹饪（B. mock 验证）
+- 自由烹饪（B. mock 验证）
+- Finn 食用（B. mock 验证）
+- 小满喂食（B. mock 验证）
+- 写信/拆信（B. mock 验证）
+- 便利贴（B. mock 验证）
+- 新私密日记（B. mock 验证）
+- 宠物状态组合观察（B. mock 验证）
+
+### 7. 后台自主生活接入状态
+**新 Home Runtime 当前是显式工具系统。只有用户或受控 Agent 明确调用时才执行；旧后台仍运行旧自由活动和宠物逻辑。**
+
+- AI 不会在后台自主使用新种植工具 ❌
+- AI 不会在后台自主使用新烹饪工具 ❌
+- AI 不会在后台自主写新信件 ❌
+- AI 不会在后台自主留新便利贴 ❌
+- AI 不会在后台写入新 home_private_diaries ❌
+- heartbeat.py 和 tool_loop.py 的 TOOL_REGISTRY/ACTIVITY_TOOL_MAP 不包含任何 home_* 工具
+- Home Context 作为只读上下文注入后台 LLM（通过 _build_channel_context），但这不是工具执行
+
+### 8. 新旧系统边界
+- 新 Home Runtime（home/ 包）：显式 MCP 工具，service_role 调用 RPC，home_* 表
+- 旧虚拟小屋（home_system.py）：house_*/cat_* 工具，后台自动执行，house_*/pets/pet_* 表
+- 旧后台（heartbeat.py + tool_loop.py）：仅调用旧 home_system，不调用新 home/
+- 宠物权威源：pets 为生理唯一权威源，home_member_states 为关系唯一权威源
+- 钱包：wallet/wallet_log 为唯一权威源，前端走 /api/wallet/*
+- 私密日记：旧 memories.Secret_Diary 保留不迁移，新 home_private_diaries 为未来权威源
+
+### 9. 完整测试命令和结果
+命令：`python -m unittest discover -v`
+结果：**Ran 733 tests in 13.502s — FAILED (failures=6, skipped=2)**
+- Passed: 725
+- Failed: 6（全部在 test_tool_loop，与 Home Runtime 无关）
+- Skipped: 2
+- 语法检查：`python -m compileall home/ server.py gateway.py heartbeat.py tool_loop.py home_system.py` → 全部通过
+
+### 10. 所有失败、错误和跳过
+**6 个失败（全部在 test_tool_loop，与 Home Runtime 无关）：**
+1. `test_tool_loop.TestHelpers.test_build_tool_schema_block_empty_activity` — weather tool schema 变更后测试未更新
+2. `test_tool_loop.TestRunLoop.test_avout_hint_passed_to_stage1` — stage1 prompt 路径变更
+3. `test_tool_loop.TestRunLoop.test_disabled_degrades_single_call` — ask.call_count=2≠1
+4. `test_tool_loop.TestRunLoop.test_empty_draft_no_tools_returns_none` — 返回值非 None
+5. `test_tool_loop.TestRunLoop.test_enabled_no_tools_activity_single_call` — ask.call_count=2≠1
+6. `test_tool_loop.TestRunLoop.test_invalid_activity_fallback_random` — 活动回退逻辑变更
+
+**2 个跳过**：test_console 中 2 个测试（与 Home Runtime 无关）
+
+### 11. 保留的遗留系统
+旧 pets/pet_inventory/pet_items/pet_tick_log/pet_agent_outbound, 旧 cat_* RPC, heartbeat.py, tool_loop.py, memory_house, house_rooms/house_diary/house_objects, memories.Secret_Diary(41条), expenses, virtual_creatures, piggy_bank(user_facts)
+
+### 12. 明确不做的功能
+后台自主调用新 Home Runtime, Home Jobs 消费者, 前端完整花园/厨房页面, 真实端到端验收, 画室/音乐室/作品系统, 隐藏剧情, 新自主决策引擎, 复杂社交系统, 新植物种类/遗传/枯萎, 植物交易/商店, 菜品保质期/变质, 复杂菜谱树
+
+### 13. 已知技术债
+- test_tool_loop 6 个失败（weather schema 变更，与 Home Runtime 无关）
+- pet_agent_outbound 9 条 pending 无消费者
+- balcony 房间映射缺口（home_rooms 无 balcony）
+- watering_interval_minutes 未实现（浇水无冷却）
+- 植物不会枯萎（withered 状态是死代码）
+- garden_observe 不主动结算（观察数据可能 stale）
+- cook 库存查询未过滤 storage_location
+- eat_dish/cook 无 ownership 检查
+- 真实数据库写链未端到端验收
+- Phase 4/5 迁移文件是 stub（实际 SQL 通过 apply_migration 直接部署，未版本控制）
+
+### 14. Advisor 结果
+**本项目阶段新增的问题**：无。Phase 1–8 未引入任何新的 Advisor 问题。
+**历史遗留问题**：eventide 函数 search_path 可变, anon 可执行 cat_*/house_* SECURITY DEFINER 函数, pg_trgm 扩展在 public schema, cat_shop_whitelist SECURITY DEFINER 视图, 多个表 RLS 无 policy。
+**当前只记录不处理的问题**：全部历史遗留 Advisor 问题。
+
+### 15. 数据库操作声明
+本次仅执行：代码和文档读取, Supabase 只读查询, 语法检查, 测试, PROJECT_NOTES.md 追加记录。
+本次未执行：数据库写入, 数据库迁移, DELETE, DROP, TRUNCATE, RPC 修改, Policy 修改, 索引修改, 生产数据修改, 代码修复, 新功能开发, 生产调用链切换。
+
+### 16. 最终验收结论
+Home Runtime Phase 1–8 的数据模型、显式生活工具和主要数据库事务已经实现，既有规则完成了静态审计及相关单元测试，旧聊天、宠物、钱包与后台系统保持兼容。新 Home Runtime 尚未接入旧后台自由活动，因此当前属于"显式工具可用"，不是"AI 已在后台自主使用新生活系统"。种植、收获、库存、烹饪、食用、喂食及异步表达等真实数据库写链因缺少隔离测试环境，尚未完成端到端验收。完整测试套件仍存在已知失败，项目不能表述为全部测试通过或生产闭环全部验证。
 

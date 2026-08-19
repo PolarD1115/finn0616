@@ -44,7 +44,7 @@
 |--------|:---:|--------|------|
 | `PORT` | ✅ | `10000` | 网关监听端口（Dockerfile `EXPOSE 10000`） |
 | `GATEWAY_HOST` | ❌ | `localhost:8000` | 反代场景下修正的 Host 头，一般留空 |
-| `API_SECRET` | ✅ | 空 | `/api/*` 管理接口的安全密钥，防止未授权调用 |
+| `API_SECRET` | ✅ | 空 | `/api/*`、`/sse`、`/messages`、`/v1/*` 受保护入口的安全密钥。**必填**：未配置时受保护入口返回 503 拒绝访问（Phase 5.1 安全修复）。配置后通过 `Authorization: Bearer <secret>` 或 `X-Api-Key: <secret>` 校验 |
 | `LOG_FILE` | ❌ | 空 | 日志文件路径（供 `/api/logs` 读取，留空则用平台日志） |
 | `RESTART_WEBHOOK_URL` | ❌ | 空 | 云平台重启回调 URL（供 `/api/restart` 调用） |
 

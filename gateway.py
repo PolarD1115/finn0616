@@ -693,6 +693,8 @@ def _default_runtime_config() -> dict:
         # Agent 赚钱系统：false 时禁止 Agent 自主入账（wallet_earn bypass_cap=False），
         # 但不关闭钱包（余额查询/消费/猫用品购买/零花钱/打赏不受影响）。
         "money_earning_enabled": True,
+        # Home Runtime 上下文注入：true 时在聊天上下文中注入家庭房间/成员/事件摘要
+        "home_context_enabled": True,
     }
 
 
@@ -789,6 +791,24 @@ def _money_earning_enabled() -> bool:
     都会调用本函数，防止仅前端隐藏后被 MCP 直调绕过。
     """
     return _get_runtime_config().get("money_earning_enabled", True)
+
+
+def _home_context_enabled() -> bool:
+    """Home Runtime 上下文注入门控（sys_config 运行时开关，5s 热生效）。
+
+    True（默认）：在聊天上下文 volatile_block 中注入家庭房间/成员/事件摘要。
+    False：不注入 Home Runtime 上下文（聊天仍正常工作）。
+    """
+    return _get_runtime_config().get("home_context_enabled", True)
+
+
+def _gw_home_context_safe() -> str:
+    """安全构建 Home Runtime 上下文文本。失败时返回空字符串。"""
+    try:
+        from home import context as _home_ctx
+        return _home_ctx.build_home_context()
+    except Exception:
+        return ""
 
 
 def _config_source_of(key: str) -> str:
@@ -1265,6 +1285,23 @@ class HostFixMiddleware:
         # ---------- 🐱 Tick 日志查询 ----------
         if scope["path"] == "/api/ticks":
             await self._handle_ticks_api(scope, receive, send)
+            return
+
+        # ---------- 💰 钱包后端代理 API（Phase 6.1：前端不再直调 Supabase RPC） ----------
+        if scope["path"] == "/api/wallet" and scope["method"] == "GET":
+            await self._handle_wallet_api(scope, send, action="check")
+            return
+        if scope["path"] == "/api/wallet/log" and scope["method"] == "GET":
+            await self._handle_wallet_api(scope, send, action="log")
+            return
+        if scope["path"] == "/api/wallet/allowance" and scope["method"] == "POST":
+            await self._handle_wallet_api(scope, send, action="allowance", receive=receive)
+            return
+        if scope["path"] == "/api/wallet/tip" and scope["method"] == "POST":
+            await self._handle_wallet_api(scope, send, action="tip", receive=receive)
+            return
+        if scope["path"] == "/api/wallet/spend" and scope["method"] == "POST":
+            await self._handle_wallet_api(scope, send, action="spend", receive=receive)
             return
 
         # ---------- 🎛️ 内置模型管理网页 ----------
@@ -1824,6 +1861,14 @@ class HostFixMiddleware:
         )
         if device_snapshot:
             volatile_block += f"{device_snapshot}\n"
+        # 🏠 Home Runtime 上下文（只读，受运行时门控，放在 volatile 区域不破坏缓存前缀）
+        if _home_context_enabled():
+            try:
+                _home_ctx_text = await asyncio.to_thread(_gw_home_context_safe)
+                if _home_ctx_text:
+                    volatile_block += f"{_home_ctx_text}\n"
+            except Exception:
+                pass
         volatile_block += (
             f"------------------------------------------------\n"
             f"[实时状态 · 回复前请先读这里]\n"
@@ -3118,6 +3163,126 @@ class HostFixMiddleware:
             "has_more": (page * size) < total,
         })
 
+    async def _handle_wallet_api(self, scope, send, action: str, receive=None):
+        """钱包后端代理 API。所有写操作由后端固定 wallet_id/user_id/bypass_cap。
+        前端不再直调 Supabase RPC。受 API_SECRET 保护。"""
+        import home_system as _hs
+        import datetime as _dt
+        import uuid as _uuid
+
+        async def _read_body():
+            """读取 ASGI 请求体。"""
+            body = b""
+            if receive:
+                while True:
+                    msg = await receive()
+                    body += msg.get("body", b"")
+                    if not msg.get("more_body", False):
+                        break
+            return body
+
+        async def _ok(data):
+            await _send_json_resp(send, 200, data)
+
+        async def _err(code, msg, status=400):
+            await _send_json_resp(send, status, {"ok": False, "error_code": code, "message": msg})
+
+        try:
+            if action == "check":
+                result = await asyncio.to_thread(_hs.wallet_check)
+                await _ok(result)
+
+            elif action == "log":
+                # 解析分页参数
+                query_params = scope.get("query_string", b"").decode("utf-8", errors="ignore")
+                limit = 20
+                offset = 0
+                for pair in query_params.split("&"):
+                    if pair.startswith("limit="):
+                        try:
+                            limit = max(1, min(100, int(pair.split("=")[1])))
+                        except Exception:
+                            pass
+                    elif pair.startswith("offset="):
+                        try:
+                            offset = max(0, int(pair.split("=")[1]))
+                        except Exception:
+                            pass
+                result = await asyncio.to_thread(_hs.wallet_log, limit, offset)
+                await _ok(result)
+
+            elif action in ("allowance", "tip", "spend"):
+                # 读取 POST body
+                body = await _read_body()
+                try:
+                    data = json.loads(body) if body else {}
+                except Exception:
+                    await _err("INVALID_JSON", "请求体不是合法 JSON")
+                    return
+
+                if action == "allowance":
+                    amount = data.get("amount", 25)
+                    try:
+                        amount = float(amount)
+                    except (TypeError, ValueError):
+                        await _err("INVALID_AMOUNT", "金额无效")
+                        return
+                    if amount <= 0 or amount > 200:
+                        await _err("INVALID_AMOUNT", "金额须为 0..200")
+                        return
+                    # 后端生成 source_key（按周幂等）
+                    bj_now = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=8)
+                    iso_week = bj_now.strftime("%G-W%V")
+                    source_key = f"allowance_{iso_week}"
+                    reason = f"每周零花钱 {iso_week}"
+                    result = await asyncio.to_thread(
+                        _hs.wallet_earn, _hs.DEFAULT_WALLET_ID, amount, source_key, reason, True
+                    )
+                    await _ok(result)
+
+                elif action == "tip":
+                    amount = data.get("amount", 10)
+                    try:
+                        amount = float(amount)
+                    except (TypeError, ValueError):
+                        await _err("INVALID_AMOUNT", "金额无效")
+                        return
+                    if amount <= 0 or amount > 200:
+                        await _err("INVALID_AMOUNT", "金额须为 0..200")
+                        return
+                    reason = data.get("reason", "打赏")
+                    if len(reason) > 200:
+                        reason = reason[:200]
+                    source_key = f"tip_{_uuid.uuid4().hex[:12]}"
+                    result = await asyncio.to_thread(
+                        _hs.wallet_earn, _hs.DEFAULT_WALLET_ID, amount, source_key, reason, True
+                    )
+                    await _ok(result)
+
+                elif action == "spend":
+                    amount = data.get("amount", 0)
+                    try:
+                        amount = float(amount)
+                    except (TypeError, ValueError):
+                        await _err("INVALID_AMOUNT", "金额无效")
+                        return
+                    if amount <= 0 or amount > 1000:
+                        await _err("INVALID_AMOUNT", "金额须为 0..1000")
+                        return
+                    reason = data.get("reason", "支出")
+                    if len(reason) > 200:
+                        reason = reason[:200]
+                    result = await asyncio.to_thread(
+                        _hs.wallet_spend, _hs.DEFAULT_WALLET_ID, amount, reason
+                    )
+                    await _ok(result)
+
+            else:
+                await _err("UNKNOWN_ACTION", "未知操作", 404)
+
+        except Exception as e:
+            await _err("RPC_ERROR", "操作失败", 500)
+
     async def _handle_emotion_page(self, send):
         """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""
         try:
@@ -3144,7 +3309,11 @@ async def _check_api_secret(scope, send):
     """校验 API_SECRET。返回 True=通过，False=已拒绝(已发送 401)"""
     api_secret = os.environ.get("API_SECRET", "").strip()
     if not api_secret:
-        return True   # 没配就不强制鉴权（保持兼容）
+        # Phase 5.1 安全修复：API_SECRET 为空时拒绝受保护入口，不再放行
+        await send({"type": "http.response.start", "status": 503,
+                    "headers": [(b"content-type", b"application/json"), (b"access-control-allow-origin", b"*")]})
+        await send({"type": "http.response.body", "body": b'{"error":"Service unavailable: API_SECRET not configured"}'})
+        return False
     headers_dict = {k.decode("utf-8").lower(): v.decode("utf-8") for k, v in scope.get("headers", [])}
     auth_token = headers_dict.get("authorization", "").replace("Bearer ", "").replace("bearer ", "").strip()
     x_api_key = headers_dict.get("x-api-key", "").strip()

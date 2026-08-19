@@ -92,6 +92,15 @@ except Exception as e:
 # ---------- 小屋/小满/小钱包 业务模块 ----------
 import home_system as _hs
 
+# ---------- Home Runtime 基础层（只读观察） ----------
+try:
+    from home import service as _home_svc
+    _HAS_HOME_RUNTIME = True
+except ImportError:
+    _home_svc = None  # type: ignore
+    _HAS_HOME_RUNTIME = False
+    print("[Home] 未找到 home/ 包，Home Runtime 观察工具已降级关闭")
+
 # 🌤️ 天气工具（软导入：漏传 weather_tools.py 时降级，不影响启动）
 try:
     import weather_tools  # type: ignore
@@ -582,6 +591,17 @@ def _query_weather_hit(text: str) -> bool:
     return False
 
 
+def _home_build_context_safe() -> str:
+    """安全构建 Home Runtime 上下文。失败时返回空字符串（不阻断聊天）。"""
+    try:
+        if not _HAS_HOME_RUNTIME:
+            return ""
+        from home import context as _home_ctx
+        return _home_ctx.build_home_context()
+    except Exception:
+        return ""
+
+
 async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", inject_device: Optional[bool] = None) -> str:
     """
     🧠 全渠道智能体上下文（TG / QQ 渠道注入用）
@@ -711,6 +731,15 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         volatile_parts.append(f"【近期对话回顾】:\n{history_text}")
     if device_snapshot:
         volatile_parts.append(device_snapshot)
+    # 🏠 Home Runtime 上下文（只读，受运行时门控，放在 volatile 区域不破坏缓存前缀）
+    try:
+        import gateway as _gw
+        if _gw._home_context_enabled():
+            _home_ctx = await asyncio.to_thread(_home_build_context_safe)
+            if _home_ctx:
+                volatile_parts.append(_home_ctx)
+    except Exception:
+        pass
     volatile_parts.append(
         f"[实时状态 · 回复前请先读这里]\n"
         f"⏰ 当前时间：{time_str}（北京时间）\n"
@@ -991,7 +1020,11 @@ async def save_memory(title: str, content: str, category: str = "事件"):
 @mcp.tool()
 @mcp_error_handler
 async def search_memory(query: str):
-    """【搜索记忆】先查向量库 (语义相似)，再查数据库 (关键词模糊)，合并结果。"""
+    """【搜索记忆】先查向量库 (语义相似)，再查数据库 (关键词模糊)，合并结果。
+    安全：排除 Secret_Diary 等私密标签，不返回私密日记正文。
+    NULL 标签的普通记忆不会被误过滤。"""
+    # 私密标签黑名单——这些 tags 的记忆不通过通用搜索暴露
+    _PRIVATE_TAGS = {"Secret_Diary"}
     ans_parts = []
     # 1. 向量语义搜索
     try:
@@ -1000,21 +1033,42 @@ async def search_memory(query: str):
             res_list = vec_results.get("results", vec_results) if isinstance(vec_results, dict) else vec_results
             if isinstance(res_list, list) and res_list:
                 ans_parts.append("🧠 【语义相似记忆】:")
-                for r in res_list[:3]:
+                count = 0
+                for r in res_list:
+                    if count >= 3:
+                        break
                     mem = r.get("memory", r.get("text", str(r))) if isinstance(r, dict) else str(r)
+                    # 服务层二次过滤：检查 metadata 中的 tags 是否为私密标签
+                    if isinstance(r, dict):
+                        meta_tags = r.get("tags", "")
+                        # 处理字符串/列表/None 各种格式
+                        if isinstance(meta_tags, list):
+                            if any(t in _PRIVATE_TAGS for t in meta_tags):
+                                continue
+                        elif isinstance(meta_tags, str) and meta_tags in _PRIVATE_TAGS:
+                            continue
                     ans_parts.append(f"- {mem}")
+                    count += 1
     except Exception:
         pass
-    # 2. 数据库关键词搜索
+    # 2. 数据库关键词搜索（排除私密标签，保留 NULL 标签）
     if supabase:
         def _query():
-            return supabase.table("memories").select("id, title, content, importance").or_(
+            # Phase 6.2 修复：使用 or_ 确保 NULL 标签的普通记忆不被误过滤
+            # PostgREST: tags.neq.Secret_Diary 排除 Secret_Diary
+            #            tags.is.null 包含 NULL 标签
+            # 合并后等价于：tags IS NULL OR tags != 'Secret_Diary'
+            return supabase.table("memories").select("id, title, content, importance, tags").or_(
                 f"title.ilike.%{query}%,content.ilike.%{query}%"
-            ).order("importance", desc=True).limit(5).execute()
+            ).or_("tags.neq.Secret_Diary,tags.is.null").order("importance", desc=True).limit(5).execute()
         sb_res = await asyncio.to_thread(_query)
         if sb_res and sb_res.data:
             ans_parts.append("🔍 【关键词匹配记忆】:")
             for r in sb_res.data:
+                # 服务层二次过滤（防御性）
+                r_tags = r.get("tags")
+                if isinstance(r_tags, str) and r_tags in _PRIVATE_TAGS:
+                    continue
                 ans_parts.append(f"- 【{r.get('title', '无题')}】: {r['content']}")
     if not ans_parts:
         return "🧠 暂未搜到相关记忆。"
@@ -1514,23 +1568,22 @@ async def wallet_check():
 
 @mcp.tool()
 @mcp_error_handler
-async def wallet_earn(amount: float, source_key: str, reason: str, bypass_cap: bool = False):
+async def wallet_earn(amount: float, source_key: str, reason: str):
     """【小钱包·入账】向 finn_wallet 入账。source_key 用于幂等防重。
-    bypass_cap=True 时全额入账、不计周上限、不进加班银行（零花钱/打赏用）。"""
-    # 赚钱系统运行时门控：bypass_cap=False（Agent 自主赚钱）且 money_earning_enabled=false
-    # 时拒绝。bypass_cap=True（零花钱/打赏）不受影响。这是 MCP 直调的最终入口门控，
-    # 防止仅在前端/自由活动暴露层隐藏后被 MCP 直调绕过。
-    if not bypass_cap:
-        try:
-            import gateway as _gw
-            if not _gw._money_earning_enabled():
-                return {"ok": False, "error_code": "MONEY_EARNING_DISABLED",
-                        "message": "赚钱系统已关闭，Agent 暂不能自主入账。"
-                                   "不影响钱包余额、消费、猫用品购买、零花钱和打赏。"}
-        except Exception:
-            pass  # 读不到配置时保持默认开启，不阻断
+    受 money_earning_enabled 门控和周上限约束。
+    零花钱/打赏请通过管理 API /api/wallet/allowance 和 /api/wallet/tip。"""
+    # Phase 6.1 安全修复：MCP 移除 bypass_cap 参数，固定 False
+    # 零花钱/打赏通过 API_SECRET 保护的后端 API 执行（后端内部固定 bypass_cap=True）
+    try:
+        import gateway as _gw
+        if not _gw._money_earning_enabled():
+            return {"ok": False, "error_code": "MONEY_EARNING_DISABLED",
+                    "message": "赚钱系统已关闭，Agent 暂不能自主入账。"
+                               "不影响钱包余额、消费、猫用品购买、零花钱和打赏。"}
+    except Exception:
+        pass  # 读不到配置时保持默认开启，不阻断
     def _call():
-        return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason, bypass_cap=bypass_cap)
+        return _hs.wallet_earn(_hs.DEFAULT_WALLET_ID, amount, source_key, reason, bypass_cap=False)
     return await asyncio.to_thread(_call)
 
 
@@ -1954,6 +2007,389 @@ async def cover_existing_song(song_url: str):
         return "❌ 超时"
     result = await asyncio.to_thread(_cover)
     return f"🎙️ 翻唱完成: {result}" if isinstance(result, str) and result.startswith("http") else result
+
+
+# ==========================================
+# 🏠 Home Runtime 只读观察工具（Phase 2）
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def home_observe():
+    """【家庭·观察全局】观察整个家庭状态：可见房间、活跃成员及其状态、近期生活事件。
+    只读，不修改数据库。返回结构化 JSON。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.observe_home()
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_observe_room(room_key: str = ""):
+    """【家庭·观察房间】查看指定房间的详情、物品和近期事件。
+    room_key: 房间标识（如 living_room / bedroom / kitchen / study / studio / garden / seaside）
+    只读，不修改数据库。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.observe_room(room_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_observe_member(member_key: str = ""):
+    """【家庭·观察成员】查看指定家庭成员的信息、状态和近期事件。
+    member_key: 成员标识（如 finn / xiaoman，或 UUID）
+    只读，不修改数据库。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.observe_member(member_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_timeline(limit: int = 20, event_type: str = ""):
+    """【家庭·事件时间线】查看家庭生活事件时间线，按时间倒序。
+    limit: 返回条数（1..100，默认 20）
+    event_type: 可选事件类型过滤（如 rested / ate / cooked / planted / watered 等）
+    只读，不修改数据库。private 可见性事件不会返回。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.get_recent_events(limit=limit, event_type=event_type)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 🏠 Home Runtime 生活动作工具（Phase 3）
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def home_enter_room(actor_key: str = "ai_primary", room_key: str = "", action_key: str = ""):
+    """【家庭·进入房间】让成员进入指定房间。先结算状态，再更新位置，写生活事件。
+    actor_key: 成员标识（默认 ai_primary）
+    room_key: 房间标识（如 living_room / bedroom / kitchen / study / studio / garden / seaside）
+    action_key: 幂等键（必填，相同键重复调用返回原结果不重复执行）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.enter_room(actor_key, room_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_rest(actor_key: str = "ai_primary", duration_minutes: int = 30, action_key: str = ""):
+    """【家庭·休息】让成员休息一段时间，恢复精力和舒适度。不阻塞线程，是模拟结算。
+    actor_key: 成员标识（默认 ai_primary）
+    duration_minutes: 休息时长（1..1440 分钟）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.rest(actor_key, duration_minutes, action_key, mode="rest")
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_sleep(actor_key: str = "ai_primary", duration_minutes: int = 480, action_key: str = ""):
+    """【家庭·睡眠】让成员睡眠，大幅恢复精力。不阻塞线程，是模拟结算。
+    actor_key: 成员标识（默认 ai_primary）
+    duration_minutes: 睡眠时长（1..1440 分钟，默认 480=8小时）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.sleep(actor_key, duration_minutes, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def home_spend_time(actor_key: str = "ai_primary", target_key: str = "", activity: str = "", duration_minutes: int = 30, action_key: str = ""):
+    """【家庭·陪伴互动】与另一成员共度时光，小幅改善舒适度/连接/亲密度。
+    actor_key: 行动者标识（默认 ai_primary）
+    target_key: 目标成员标识（如 pet_xiaoman）
+    activity: 活动描述（如 一起看书 / 摸摸头）
+    duration_minutes: 时长（1..480 分钟）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.spend_time(actor_key, target_key, activity, duration_minutes, action_key)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 🏠 Home Runtime 种植与烹饪工具（Phase 4）
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def garden_observe():
+    """【花园·观察】查看花园当前状态：植物列表（阶段/水分/健康/是否成熟）、可种植种子、近期种植事件。
+    只读，不修改数据库。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.garden_observe()
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def plant_seed(actor_key: str = "ai_primary", seed_key: str = "", action_key: str = ""):
+    """【花园·种植】在花园种下一颗种子。种子目录决定生长时间和产量。
+    actor_key: 成员标识（默认 ai_primary）
+    seed_key: 种子标识（如 tomato / carrot / lettuce / strawberry / mint）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.plant_seed(actor_key, seed_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def water_plant(actor_key: str = "ai_primary", plant_id: str = "", action_key: str = ""):
+    """【花园·浇水】给指定植物浇水，恢复水分到100。
+    actor_key: 成员标识（默认 ai_primary）
+    plant_id: 植物UUID（从 garden_observe 获取）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.water_plant(actor_key, plant_id, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def harvest_plant(actor_key: str = "ai_primary", plant_id: str = "", action_key: str = ""):
+    """【花园·收获】收获成熟的植物，食材进入库存。只有成熟植物可收获，收获后不可重复。
+    actor_key: 成员标识（默认 ai_primary）
+    plant_id: 植物UUID
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.harvest_plant(actor_key, plant_id, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def pantry_observe():
+    """【厨房·观察】查看库存和菜品：食材库存、现有菜品（含份数）、可烹饪菜谱。
+    只读，不修改数据库。"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.pantry_observe()
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cook_recipe(actor_key: str = "ai_primary", recipe_key: str = "", action_key: str = ""):
+    """【厨房·按菜谱烹饪】按菜谱烹饪，原子扣除食材库存并生成菜品。
+    actor_key: 成员标识（默认 ai_primary）
+    recipe_key: 菜谱标识（如 tomato_egg / vegetable_soup / mint_tea）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.cook_recipe(actor_key, recipe_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def cook_freestyle(actor_key: str = "ai_primary", ingredient_choices: str = "", action_key: str = ""):
+    """【厨房·自由烹饪】用自选食材自由烹饪（最多5种食材，总量最多20）。
+    actor_key: 成员标识（默认 ai_primary）
+    ingredient_choices: JSON字符串，如 {"tomato":2,"egg":1}
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    import json as _json
+    def _call():
+        try:
+            choices = _json.loads(ingredient_choices) if ingredient_choices else {}
+        except Exception:
+            return {"ok": False, "error_code": "INVALID_JSON", "message": "ingredient_choices 不是合法 JSON"}
+        return _home_svc.cook_freestyle(actor_key, choices, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def eat_dish(actor_key: str = "ai_primary", dish_id: str = "", action_key: str = ""):
+    """【厨房·食用】吃一份菜品，恢复饱腹/心情/精力。扣除一份份数，改变真实状态。
+    actor_key: 成员标识（默认 ai_primary）
+    dish_id: 菜品UUID（从 pantry_observe 获取）
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.eat_dish(actor_key, dish_id, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def feed_member(actor_key: str = "ai_primary", target_key: str = "", dish_id: str = "", action_key: str = ""):
+    """【厨房·喂食】将菜品喂给另一个家庭成员。改变目标状态，intimacy小幅增加（每日上限）。
+    actor_key: 行动者标识（默认 ai_primary）
+    target_key: 目标成员标识（如 pet_xiaoman）
+    dish_id: 菜品UUID
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.feed_member(actor_key, target_key, dish_id, action_key)
+    return await asyncio.to_thread(_call)
+
+
+# ==========================================
+# 🏠 Home Runtime 信件/便利贴/私密日记工具（Phase 5）
+# ==========================================
+
+@mcp.tool()
+@mcp_error_handler
+async def write_letter(author_key: str = "ai_primary", title: str = "", content: str = "", action_key: str = "", preview: str = "", room_key: str = ""):
+    """【家庭·写信】写一封信给用户。信件保存为未拆封，用户需主动拆信才能看到正文。
+    author_key: 作者标识（默认 ai_primary）
+    title: 信件标题
+    content: 信件正文
+    action_key: 幂等键（必填）
+    preview: 可选摘要（不传则自动取正文前80字）
+    room_key: 可选，绑定房间"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.write_letter(author_key, title, content, action_key, preview, room_key=room_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def list_letters(status_filter: str = ""):
+    """【家庭·信件列表】查看信件列表。只返回标题、摘要和时间，不返回未拆信正文。
+    status_filter: 可选过滤（unopened / opened / archived），默认不返回 archived"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.list_letters(status_filter)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def open_letter(letter_key: str = "", action_key: str = ""):
+    """【家庭·拆信】拆开一封信，返回完整正文。只有调用此工具才能看到正文。
+    letter_key: 信件标识
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.open_letter(letter_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def archive_letter(letter_key: str = "", action_key: str = ""):
+    """【家庭·归档信件】将信件归档（软归档，不删除）。已归档信件不在默认列表显示。
+    letter_key: 信件标识
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.archive_letter(letter_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def leave_note(author_key: str = "ai_primary", room_key: str = "", content: str = "", action_key: str = ""):
+    """【家庭·留便利贴】在指定房间留一张便利贴。进入该房间时可看到。
+    author_key: 作者标识（默认 ai_primary）
+    room_key: 房间标识（如 living_room / bedroom / kitchen）
+    content: 便利贴内容
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.leave_note(author_key, room_key, content, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def list_room_notes(room_key: str = "", include_read: bool = False):
+    """【家庭·便利贴列表】查看指定房间的便利贴。只返回预览，不返回全文。
+    room_key: 房间标识
+    include_read: 是否包含已读便利贴"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.list_room_notes(room_key, include_read)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def read_note(note_key: str = "", action_key: str = ""):
+    """【家庭·读便利贴】读取便利贴全文。标记为已读。
+    note_key: 便利贴标识
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.read_note(note_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+@mcp.tool()
+@mcp_error_handler
+async def archive_note(note_key: str = "", action_key: str = ""):
+    """【家庭·归档便利贴】将便利贴归档（软归档，不删除）。
+    note_key: 便利贴标识
+    action_key: 幂等键（必填）"""
+    if not _HAS_HOME_RUNTIME:
+        return "❌ Home Runtime 模块未加载"
+    def _call():
+        return _home_svc.archive_note(note_key, action_key)
+    return await asyncio.to_thread(_call)
+
+
+# Phase 6 安全收口：list_private_diary 不再注册为 MCP 工具。
+# 原因：私密日记标题/心情/时间属于 AI 私密元数据，FastMCP v1 无法区分调用者身份。
+# 统一索引通过内部 service 函数或 API_SECRET 保护的管理 API 提供。
+# 旧 write/read/archive_private_diary 已在 Phase 5.1 移除 MCP 注册。
+
+# Phase 5.1 安全收口：write_private_diary 不再注册为 MCP 工具。
+# 原因：FastMCP v1 无法提供调用者身份上下文，即使后端强制 author_key=ai_primary，
+# 任何能调用 MCP 的客户端仍可写入私密日记（伪造 AI 表达）。
+# 私密日记写入仅保留为服务层内部受控函数（is_internal=True），
+# 供未来后台任务或 API_SECRET 保护的管理 API 使用。
+# 数据库 RPC 保持不变，仍可通过 service_role 内部调用。
+
+# 安全补丁：read_private_diary 和 archive_private_diary 不再注册为 MCP 工具。
+# 原因：当前 MCP 框架（FastMCP v1）无法提供调用者身份上下文，
+# 任何能调用 MCP 的客户端都可伪造身份读取/归档私密日记正文。
+# 私密日记的读取和归档仅保留为服务层内部受控函数（is_internal=True），
+# 供未来后台任务或 API_SECRET 保护的管理 API 使用。
+# 数据库 RPC 保持不变，仍可通过 service_role 内部调用。
 
 
 # ==========================================

@@ -1215,49 +1215,30 @@ function _isoWeekLabel(){
   return tmp.getUTCFullYear() + "W" + String(week).padStart(2, "0");
 }
 
-async function _walletEarnRpc(amount, sourceKey, reason, bypassCap){
-  const sb = getSb(); if(!sb) return;
-  try{
-    const { data, error } = await sb.rpc("rpc_wallet_earn", {
-      p_wallet_id: "finn_wallet",
-      p_amount: parseFloat(amount),
-      p_source_key: sourceKey,
-      p_reason: reason,
-      p_meta: {},
-      p_week_cap: 80,
-      p_overtime_rate: 0.5,
-      p_birthday_enabled: true,
-      p_bypass_cap: bypassCap
-    });
-    if(error) throw new Error(error.message);
-    const result = (data && typeof data === "object") ? data : { ok: false, message: String(data) };
-    if(result.ok){
-      toast("✅ " + (result.message || "入账成功"), "ok");
-      loadWallet(sb);
-    } else {
-      toast("❌ " + (result.message || result.error_code || "入账失败"), "err");
-    }
-  }catch(e){
-    toast("❌ " + e.message, "err");
-  }
-}
-
 async function walletAllowance(){
   const amount = parseFloat(document.getElementById("allowanceAmount").value) || 25;
   if(amount <= 0){ toast("金额必须大于 0","err"); return; }
-  const weekLabel = _isoWeekLabel();
-  const sourceKey = "allowance_" + weekLabel;
-  const reason = "本周零花钱（" + weekLabel + "）";
-  await _walletEarnRpc(amount, sourceKey, reason, true);
+  try{
+    const r = await fetch(ORIGIN+"/api/wallet/allowance", {
+      method:"POST", headers:headers(true), body:JSON.stringify({amount})
+    });
+    const d = await r.json();
+    if(d.ok){ toast("✅ " + (d.message || "零花钱已发"), "ok"); loadWallet(getSb()); }
+    else { toast("❌ " + (d.message || d.error_code || "失败"), "err"); }
+  }catch(e){ toast("❌ " + e.message, "err"); }
 }
 
 async function walletTip(){
   const amount = parseFloat(document.getElementById("tipAmount").value) || 10;
   if(amount <= 0){ toast("金额必须大于 0","err"); return; }
-  const ts = Date.now();
-  const sourceKey = "tip_" + ts;
-  const reason = "打赏";
-  await _walletEarnRpc(amount, sourceKey, reason, true);
+  try{
+    const r = await fetch(ORIGIN+"/api/wallet/tip", {
+      method:"POST", headers:headers(true), body:JSON.stringify({amount, reason:"打赏"})
+    });
+    const d = await r.json();
+    if(d.ok){ toast("✅ " + (d.message || "打赏已发"), "ok"); loadWallet(getSb()); }
+    else { toast("❌ " + (d.message || d.error_code || "失败"), "err"); }
+  }catch(e){ toast("❌ " + e.message, "err"); }
 }
 function renderDonut(containerId, balance, totalEarned, totalSpent){
   const total = totalEarned + totalSpent;
