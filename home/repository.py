@@ -505,7 +505,7 @@ def fetch_seed_catalog() -> list[dict]:
 
 
 def fetch_plants(owner_member_id: str = "", room_id: str = "") -> list[dict]:
-    """查询植物列表。"""
+    """查询植物列表（原始查询，不结算）。"""
     sb = _get_supabase()
     if sb is None:
         return []
@@ -521,6 +521,27 @@ def fetch_plants(owner_member_id: str = "", room_id: str = "") -> list[dict]:
     except Exception as e:
         logger.warning("home.repository.fetch_plants 失败: %s", e)
         return []
+
+
+def fetch_plants_settled() -> list[dict]:
+    """查询植物列表（先批量结算 active 植物的生长/水分/健康度，再返回最新状态）。
+
+    解决 garden_observe / build_home_context 只读查询不结算、
+    导致 stage/health/water_level 长期 stale 的问题。
+    service_role 不可用或 RPC 失败时降级为 fetch_plants()（不结算）。
+    """
+    sb = _get_supabase_service()
+    if sb is None:
+        return fetch_plants()
+    try:
+        resp = sb.rpc("rpc_home_settle_plants", {}).execute()
+        if resp.data and resp.data.get("ok"):
+            return resp.data.get("plants", [])
+        logger.warning("home.repository.fetch_plants_settled RPC 返回异常: %s", resp.data)
+        return fetch_plants()
+    except Exception as e:
+        logger.warning("home.repository.fetch_plants_settled 失败，降级为不结算查询: %s", e)
+        return fetch_plants()
 
 
 def fetch_inventory(owner_member_id: str = "", item_kind: str = "") -> list[dict]:

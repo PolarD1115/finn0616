@@ -77,8 +77,8 @@ def build_home_context() -> str:
     else:
         lines.append("📋 最近没有生活事件记录。")
 
-    # 花园状态（Phase 4）
-    plants = repo.fetch_plants()
+    # 花园状态（Phase 4）— 先结算再注入，避免 AI 上下文看到 stale 的 stage
+    plants = repo.fetch_plants_settled()
     if plants:
         plant_strs = []
         for p in plants:

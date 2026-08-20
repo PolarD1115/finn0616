@@ -439,8 +439,12 @@ def spend_time(
 # ============================================================
 
 def garden_observe() -> dict:
-    """只读观察花园：植物列表、种子目录、近期种植/收获事件。"""
-    plants = repo.fetch_plants()
+    """只读观察花园：植物列表、种子目录、近期种植/收获事件。
+
+    内部先批量结算 active 植物的生长/水分/健康度，确保 observe 看到的
+    stage/health/water_level 是最新值（而非上次操作时的 stale 快照）。
+    """
+    plants = repo.fetch_plants_settled()
     seeds = repo.fetch_seed_catalog()
     events = repo.fetch_recent_events(limit=5, event_type="", exclude_private=True)
 
