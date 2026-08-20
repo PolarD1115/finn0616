@@ -579,6 +579,31 @@ def _stable_set(key: str, value: str) -> None:
     _stable_prefix_cache[key] = {"value": value, "ts": time.time()}
 
 
+# ==========================================
+# 📦 静态常驻提示词文件（prompts/*.md）
+#   世界书 / 回复规则等静态常驻内容从 rikkahub 客户端迁到网关，
+#   进 stable_system 前缀 → 享受 TTL 缓存前缀命中 + 不干扰自适应注入
+#   （_client_msg_count 回归真实历史条数）。启动时读一次，进程级常量。
+# ==========================================
+_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+
+
+def _load_prompt_file(name: str) -> str:
+    """读取 prompts/ 下的静态提示词文件；不存在或读取失败返回空串（优雅降级）。"""
+    try:
+        p = os.path.join(_PROMPTS_DIR, name)
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception as _e:
+        _log(f"⚠️ 加载提示词文件 {name} 失败: {_e}")
+    return ""
+
+
+_WORLD_BOOK_TEXT = _load_prompt_file("world_book.md")     # 世界书（表情包规则等），注入 persona 之后
+_REPLY_RULES_TEXT = _load_prompt_file("reply_rules.md")   # 回复规则（看时间戳/thinking 要求等），注入 stable 最末紧邻 volatile 时间戳
+
+
 def _log_cache_usage(model: str, usage: dict | None) -> None:
     """
     解析上游 usage 里的 prompt cache 字段并打日志。
@@ -1850,9 +1875,13 @@ class HostFixMiddleware:
         stable_parts = []
         if persona:
             stable_parts.append(persona)
+        if _WORLD_BOOK_TEXT:
+            stable_parts.append(_WORLD_BOOK_TEXT)
         stable_parts.append(f"【{user_name}的核心画像】:\n{user_prof}")
         if not _skip_core_summaries:
             stable_parts.append(f"【近3次阶段总结】:\n{core_summaries}")
+        if _REPLY_RULES_TEXT:
+            stable_parts.append(_REPLY_RULES_TEXT)
         stable_system = "\n\n".join(stable_parts)
 
         volatile_block = (
@@ -2192,17 +2221,22 @@ class HostFixMiddleware:
 
             # 2. 写入 Pinecone（可选）—— 同属"聊天记录写入"，受同一开关控制
             mc = _get_pinecone_memory()
-            if mc and user_msg:
+            if mc and mc.index and user_msg:
                 try:
                     def _add_m():
-                        mc.add([
+                        return mc.add([
                             {"role": "user", "content": user_msg},
                             {"role": "assistant", "content": final_save_text},
                         ], user_id=user_id)
-                    await asyncio.to_thread(_add_m)
-                    _log("🧠 Pinecone 已写入")
+                    _vec_ok = await asyncio.to_thread(_add_m)
+                    if _vec_ok:
+                        _log("🧠 Pinecone 已写入")
+                    else:
+                        _log("⚠️ Pinecone 写入返回 False（嵌入失败或索引不可用），本次向量未真正落库 —— 检查 DOUBAO_API_KEY/DOUBAO_EMBEDDING_EP")
                 except Exception as e:
                     _log(f"Pinecone 写入失败: {e}")
+            elif mc and not mc.index:
+                _log("🔇 Pinecone 未配置（PINECONE_API_KEY 缺失），跳过向量写入")
 
         # 3. 🧠 异步触发全渠道统一对话总结（不阻塞响应）
         #    监控网页/QQ/TG/邮件等所有渠道的对话流水，

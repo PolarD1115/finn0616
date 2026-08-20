@@ -147,9 +147,19 @@ class PineconeMemoryClient:
         try:
             vec = _get_embedding(query)
             if not vec:
+                print("⚠️ Pinecone 搜索跳过：嵌入向量为空（DOUBAO_API_KEY/DOUBAO_EMBEDDING_EP 未配置或 API 调用失败）")
                 return []
-            r = self.index.query(vector=vec, top_k=limit, include_metadata=True)
-            results = [{"memory": m.metadata.get("text", ""), "id": m.id}
+            # user_id 隔离：与 add() 写入的 metadata.user_id 对齐。
+            # 仅当调用方显式传 filters 时才加 filter，避免 search_memory 工具（不传 filters）误过滤。
+            query_kwargs = {"vector": vec, "top_k": limit, "include_metadata": True}
+            if isinstance(filters, dict) and filters:
+                pine_filter = {"user_id": user_id}
+                pine_filter.update(filters)
+                query_kwargs["filter"] = pine_filter
+            r = self.index.query(**query_kwargs)
+            results = [{"memory": m.metadata.get("text", ""),
+                        "id": m.id,
+                        "tags": m.metadata.get("tags", "")}
                        for m in r.matches if m.metadata]
             return {"results": results} if results else []
         except Exception as e:
@@ -401,18 +411,29 @@ def _save_memory_to_db(title: str, content: str, category: str = "流水", mood:
         return False
 
 
+# 嵌入失败一次性警告标志（避免每轮搜索都刷屏）
+_embedding_warned = {"config": False, "api": False}
+
+
 def _get_embedding(text: str):
     """调用向量嵌入 API 生成文本向量 (供 Pinecone 记忆检索用)。变量名兼容 DOUBAO_API_KEY。"""
+    global _embedding_warned
     try:
         api_key = os.environ.get("DOUBAO_API_KEY", "").strip()
         embed_endpoint = os.environ.get("DOUBAO_EMBEDDING_EP", "").strip()
         if not api_key or not embed_endpoint:
+            if not _embedding_warned["config"]:
+                print("⚠️ 向量嵌入未配置：DOUBAO_API_KEY / DOUBAO_EMBEDDING_EP 为空，Pinecone 读写将静默失败（此警告仅打印一次）")
+                _embedding_warned["config"] = True
             return []
         url = "https://api.siliconflow.cn/v1/embeddings"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {"model": embed_endpoint, "input": text}
         response = http_session.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code != 200:
+            if not _embedding_warned["api"]:
+                print(f"⚠️ 向量嵌入 API 返回 {response.status_code}：{response.text[:200]}（此警告仅打印一次）")
+                _embedding_warned["api"] = True
             return []
         data = response.json()
         if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
@@ -420,7 +441,10 @@ def _get_embedding(text: str):
             if raw_vec:
                 return [float(x) for x in raw_vec]
         return []
-    except Exception:
+    except Exception as e:
+        if not _embedding_warned["api"]:
+            print(f"⚠️ 向量嵌入 API 异常: {e}（此警告仅打印一次）")
+            _embedding_warned["api"] = True
         return []
 
 
@@ -1021,10 +1045,13 @@ async def save_memory(title: str, content: str, category: str = "事件"):
         return f"⏭️ 已跳过（{reason}）：{title}"
 
     await asyncio.to_thread(_save_memory_to_db, title, content, category)
+    _vec_ok = False
     try:
-        await asyncio.to_thread(pinecone_memory.add, [{"role": "assistant", "content": f"{title}: {content}"}])
-    except Exception:
-        pass
+        _vec_ok = await asyncio.to_thread(pinecone_memory.add, [{"role": "assistant", "content": f"{title}: {content}"}])
+    except Exception as e:
+        print(f"⚠️ save_memory Pinecone 写入异常: {e}")
+    if not _vec_ok:
+        print(f"⚠️ save_memory 向量写入未成功（嵌入未配置/失败或 Pinecone 不可用），仅落库 DB: {title}")
     return f"✅ 记忆已保存: {title}"
 
 
