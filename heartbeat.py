@@ -1433,6 +1433,61 @@ async def async_pet_house_tick():
         await asyncio.sleep(interval)
 
 
+async def async_home_autonomy_tick():
+    """🏠 Home Runtime 后台自主生活 tick。
+
+    按 HOME_AUTONOMY_INTERVAL（默认 7200s=2小时）触发，让 AI 自主观察家庭状态
+    并决定做什么（种植/烹饪/写信/休息等）。默认关闭（HOME_AUTONOMY_ENABLED=false）。
+
+    灰度分层由 HOME_AUTONOMY_PHASE 控制（在 tool_loop.run_home_autonomy_tool_loop 内检查）：
+      0=关 1=只读 2=+信件便利贴 3=+种植烹饪 4=+基础生活
+    """
+    from server import (
+        _get_llm_client, _ask_llm_async, _save_memory_to_db,
+        _get_now_bj, _build_channel_context
+    )
+    import tool_loop
+
+    print("🏠 Home 自主生活神经已上线...")
+    interval = int(os.environ.get("HOME_AUTONOMY_INTERVAL", "7200"))
+    enabled = os.environ.get("HOME_AUTONOMY_ENABLED", "false").strip().lower() not in ("0", "false", "no")
+    if not enabled:
+        print("🏠 Home 自主生活已关闭 (HOME_AUTONOMY_ENABLED=false)")
+        return
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            client = _get_llm_client("background")
+            if not client:
+                continue
+
+            now_bj = _get_now_bj()
+            system_ctx = await _build_channel_context(
+                "家庭自主生活观察", channel_tag="TG_MSG"
+            )
+
+            result = await tool_loop.run_home_autonomy_tool_loop(
+                client=client,
+                ask_llm=_ask_llm_async,
+                system_ctx=system_ctx,
+                now_bj=now_bj,
+            )
+            if result is None:
+                # 循环内部已打印跳过原因
+                continue
+            log_text, tools_used = result
+
+            # 写入 memories 留档（tag=Home_Autonomy，便于后台审计与前端面板区分）
+            await asyncio.to_thread(
+                _save_memory_to_db,
+                "🏠 家庭自主·生活", log_text, "记事", "平静", "Home_Autonomy"
+            )
+            print(f"🏠 [Home自主] 做了 {tools_used}: {log_text[:30]}...")
+        except Exception as e:
+            print(f"❌ Home 自主生活出错: {e}")
+
+
 async def run_background_process():
     """进程 B (后台进程) 主协程：把所有自主/定时任务跑在同一个事件循环里。
 
@@ -1448,6 +1503,7 @@ async def run_background_process():
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
         asyncio.create_task(async_schedule_secretary(), name="schedule"),
         asyncio.create_task(async_pet_house_tick(),    name="pet_house_tick"),
+        asyncio.create_task(async_home_autonomy_tick(), name="home_autonomy"),
     ]
 
     # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)；配了才启用

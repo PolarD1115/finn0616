@@ -41,11 +41,26 @@ except ImportError:
     weather_tools = None  # type: ignore
     _HAS_WEATHER_TOOLS = False
 
+# 🏠 Home Runtime（软导入，后台自主生活用）
+try:
+    import home.service as _home_svc
+    _HAS_HOME_RUNTIME = True
+except Exception:
+    _home_svc = None  # type: ignore
+    _HAS_HOME_RUNTIME = False
+
 # ============================================================
 # 环境变量（灰度开关 + 上限）
 # ============================================================
 TOOL_LOOP_ENABLED = os.environ.get("FREE_ACTIVITY_TOOL_LOOP", "true").strip().lower() in ("1", "true", "yes")
 MAX_TOOL_CALLS = int(os.environ.get("FREE_ACTIVITY_TOOL_MAX_CALLS", "5"))
+
+# ============================================================
+# 🏠 Home Runtime 后台自主生活
+# ============================================================
+HOME_AUTONOMY_ENABLED = os.environ.get("HOME_AUTONOMY_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+HOME_AUTONOMY_PHASE = int(os.environ.get("HOME_AUTONOMY_PHASE", "0"))  # 0关/1只读/2+信件/3+种植烹饪/4+基础生活
+HOME_AUTONOMY_INTERVAL = int(os.environ.get("HOME_AUTONOMY_INTERVAL", "7200"))  # 默认2小时
 
 # ============================================================
 # 逛淘宝 / 网上冲浪 — 候选门控常量（§六 门控规则）
@@ -478,6 +493,203 @@ TOOL_REGISTRY: dict[str, dict] = {
         "_server_name": "web_search",
         "fixed_args": {},
     },
+
+    # ---------- 🏠 Home Runtime（只读观察）----------
+    "home_observe": {
+        "description": "观察整个家庭状态：房间、活跃成员及状态、近期生活事件。只读。",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "callable": _home_svc.observe_home if _home_svc else None,
+        "fixed_args": {},
+    },
+    "garden_observe": {
+        "description": "观察花园状态：植物列表（阶段/水分/健康/是否成熟）、可种植种子、近期种植事件。只读。",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "callable": _home_svc.garden_observe if _home_svc else None,
+        "fixed_args": {},
+    },
+    "pantry_observe": {
+        "description": "观察厨房库存和菜品：食材库存、现有菜品（含份数）、可烹饪菜谱。只读。",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "callable": _home_svc.pantry_observe if _home_svc else None,
+        "fixed_args": {},
+    },
+    "list_letters": {
+        "description": "查看信件列表（标题/摘要/时间，不含未拆信正文）。只读。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status_filter": {"type": "string", "enum": ["unopened", "opened", "archived"],
+                                  "description": "可选过滤（默认不返回 archived）"},
+            },
+            "required": [],
+        },
+        "callable": _home_svc.list_letters if _home_svc else None,
+        "fixed_args": {},
+    },
+
+    # ---------- 🏠 Home Runtime（写操作 — action_key 由循环函数注入，不在 schema 内）----------
+    "plant_seed": {
+        "description": "在花园种下一颗种子。种子决定生长时间和产量。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "seed_key": {"type": "string",
+                             "enum": ["tomato", "carrot", "lettuce", "strawberry", "mint"],
+                             "description": "种子标识"},
+            },
+            "required": ["seed_key"],
+        },
+        "callable": _home_svc.plant_seed if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "water_plant": {
+        "description": "给指定植物浇水，恢复水分到100。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plant_id": {"type": "string", "description": "植物UUID（从 garden_observe 获取）"},
+            },
+            "required": ["plant_id"],
+        },
+        "callable": _home_svc.water_plant if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "harvest_plant": {
+        "description": "收获成熟的植物，食材进入库存。只有成熟植物可收获。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plant_id": {"type": "string", "description": "植物UUID"},
+            },
+            "required": ["plant_id"],
+        },
+        "callable": _home_svc.harvest_plant if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "cook_recipe": {
+        "description": "按菜谱烹饪，原子扣除食材库存并生成菜品。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "recipe_key": {"type": "string",
+                               "enum": ["tomato_egg", "vegetable_soup", "mint_tea"],
+                               "description": "菜谱标识"},
+            },
+            "required": ["recipe_key"],
+        },
+        "callable": _home_svc.cook_recipe if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "eat_dish": {
+        "description": "吃一份菜品，恢复饱腹/心情/精力。扣除一份份数。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "dish_id": {"type": "string", "description": "菜品UUID（从 pantry_observe 获取）"},
+            },
+            "required": ["dish_id"],
+        },
+        "callable": _home_svc.eat_dish if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "feed_member": {
+        "description": "将菜品喂给另一个家庭成员，改变目标状态，intimacy小幅增加。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_key": {"type": "string", "description": "目标成员标识（如 pet_xiaoman）"},
+                "dish_id": {"type": "string", "description": "菜品UUID"},
+            },
+            "required": ["target_key", "dish_id"],
+        },
+        "callable": _home_svc.feed_member if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "write_letter": {
+        "description": "写一封信给用户，保存为未拆封。用户需主动拆信才能看到正文。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "信件标题"},
+                "content": {"type": "string", "description": "信件正文"},
+                "preview": {"type": "string", "description": "可选摘要（不传则取正文前80字）"},
+                "room_key": {"type": "string", "description": "可选，绑定房间"},
+            },
+            "required": ["title", "content"],
+        },
+        "callable": _home_svc.write_letter if _home_svc else None,
+        "fixed_args": {"author_key": "ai_primary"},
+    },
+    "leave_note": {
+        "description": "在指定房间留一张便利贴，进入该房间时可看到。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "room_key": {"type": "string",
+                             "enum": ["living_room", "bedroom", "kitchen", "study", "studio", "garden", "seaside"],
+                             "description": "房间标识"},
+                "content": {"type": "string", "description": "便利贴内容"},
+            },
+            "required": ["room_key", "content"],
+        },
+        "callable": _home_svc.leave_note if _home_svc else None,
+        "fixed_args": {"author_key": "ai_primary"},
+    },
+    "home_enter_room": {
+        "description": "进入指定房间。先结算状态，再更新位置，写生活事件。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "room_key": {"type": "string",
+                             "enum": ["living_room", "bedroom", "kitchen", "study", "studio", "garden", "seaside"],
+                             "description": "房间标识"},
+            },
+            "required": ["room_key"],
+        },
+        "callable": _home_svc.enter_room if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "home_rest": {
+        "description": "休息一段时间，恢复精力和舒适度。模拟结算不阻塞。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "duration_minutes": {"type": "integer", "description": "休息时长（1..1440 分钟）",
+                                     "minimum": 1, "maximum": 1440},
+            },
+            "required": ["duration_minutes"],
+        },
+        "callable": _home_svc.rest if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary", "mode": "rest"},
+    },
+    "home_sleep": {
+        "description": "睡眠，大幅恢复精力。模拟结算不阻塞。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "duration_minutes": {"type": "integer", "description": "睡眠时长（1..1440 分钟，默认480=8小时）",
+                                     "minimum": 1, "maximum": 1440},
+            },
+            "required": ["duration_minutes"],
+        },
+        "callable": _home_svc.sleep if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
+    "home_spend_time": {
+        "description": "与另一成员共度时光，小幅改善舒适度/连接/亲密度。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_key": {"type": "string", "description": "目标成员标识（如 pet_xiaoman）"},
+                "activity": {"type": "string", "description": "活动描述（如 一起看书 / 摸摸头）"},
+                "duration_minutes": {"type": "integer", "description": "时长（1..480 分钟）",
+                                     "minimum": 1, "maximum": 480},
+            },
+            "required": ["target_key", "activity", "duration_minutes"],
+        },
+        "callable": _home_svc.spend_time if _home_svc else None,
+        "fixed_args": {"actor_key": "ai_primary"},
+    },
 }
 
 # 活动 → 允许调用的工具名（动态裁剪；空列表 = 无工具，退化现状轻量版）
@@ -500,6 +712,57 @@ ACTIVITY_TOOL_MAP: dict[str, list[str]] = {
     # 网上冲浪：只暴露 web_search（复用 server.py 既有实现）。
     "网上冲浪":    ["web_search"],
 }
+
+
+# ============================================================
+# 🏠 Home Runtime 后台自主工具白名单（按 phase 分层灰度）
+# ============================================================
+# HOME_AUTONOMY_PHASE 控制可用工具集（高 phase 含低 phase 的全部工具）：
+#   1 = 只读观察（observe / list_letters，无副作用）
+#   2 = + 低风险写入（write_letter / leave_note，限频控制日频次）
+#   3 = + 资源类（plant / water / harvest / cook / eat / feed，冷却+状态机）
+#   4 = + 基础生活（enter_room / rest / sleep / spend_time，最后接）
+_HOME_PHASE_TOOLS: dict[int, list[str]] = {
+    1: ["home_observe", "garden_observe", "pantry_observe", "list_letters"],
+    2: ["home_observe", "garden_observe", "pantry_observe", "list_letters",
+        "write_letter", "leave_note"],
+    3: ["home_observe", "garden_observe", "pantry_observe", "list_letters",
+        "write_letter", "leave_note",
+        "plant_seed", "water_plant", "harvest_plant", "cook_recipe", "eat_dish", "feed_member"],
+    4: ["home_observe", "garden_observe", "pantry_observe", "list_letters",
+        "write_letter", "leave_note",
+        "plant_seed", "water_plant", "harvest_plant", "cook_recipe", "eat_dish", "feed_member",
+        "home_enter_room", "home_rest", "home_sleep", "home_spend_time"],
+}
+# 写工具集合（需注入 action_key + 限频 + 熔断）
+_HOME_WRITE_TOOLS = {
+    "write_letter", "leave_note", "plant_seed", "water_plant", "harvest_plant",
+    "cook_recipe", "eat_dish", "feed_member",
+    "home_enter_room", "home_rest", "home_sleep", "home_spend_time",
+}
+# 只读工具集合（不限频、不熔断、不注入 action_key）
+_HOME_OBSERVE_ONLY = {"home_observe", "garden_observe", "pantry_observe", "list_letters"}
+
+# 按工具的冷却时间（秒）——靠 cooldown 时长控制日频次，无需 DB 查询日上限。
+# 进程内状态（进程重启归零，保守可接受：重启后最多多跑一轮，幂等 action_key + 状态机兜底）。
+_HOME_TOOL_COOLDOWN: dict[str, int] = {
+    "write_letter": 43200,      # 12h → 日最多 2 次
+    "leave_note": 28800,        # 8h  → 日最多 3 次
+    "plant_seed": 43200,        # 12h
+    "water_plant": 14400,       # 4h
+    "harvest_plant": 7200,      # 2h（状态机拦截未成熟）
+    "cook_recipe": 28800,       # 8h
+    "eat_dish": 14400,          # 4h
+    "feed_member": 28800,       # 8h
+    "home_enter_room": 14400,   # 4h
+    "home_rest": 14400,         # 4h
+    "home_sleep": 28800,        # 8h
+    "home_spend_time": 14400,   # 4h
+}
+# 进程内限频/熔断状态
+_home_tool_last_fire: dict[str, float] = {}     # 工具名 → 上次成功调用 epoch
+_home_tool_fail_count: dict[str, int] = {}      # 工具名 → 连续失败计数
+_HOME_BREAKER_THRESHOLD = 3                      # 连续失败 3 次 → 本轮跳过该工具（不熔断全局）
 
 
 # ============================================================
@@ -914,6 +1177,19 @@ async def _gate_activities(snap, now_bj) -> tuple[set[str], dict[str, str]]:
 # ============================================================
 # 核心：进程内调用单个工具
 # ============================================================
+def _gen_home_action_key(tool_name: str, now_bj) -> str:
+    """为后台自主 Home 工具调用生成唯一 action_key。
+
+    格式：auto_{tool}_{YYYYMMDDHHmmss}_{hex6}
+    每次调用独立 key 保证唯一；service 层 action_key UNIQUE 约束做最终幂等兜底，
+    状态机校验防不合逻辑的重复（如对已成熟植物重复收获会被 RPC 拒绝）。
+    """
+    import secrets
+    ts = now_bj.strftime("%Y%m%d%H%M%S")
+    rnd = secrets.token_hex(3)
+    return f"auto_{tool_name}_{ts}_{rnd}"
+
+
 async def _resolve_callable(spec: dict):
     """解析 callable。None + _server_name 时延迟从 server 取。"""
     fn = spec.get("callable")
@@ -1439,3 +1715,205 @@ async def run_pet_care_tool_loop(
     print(f"{log_prefix} 完成「{event_type}」(调了 {len(results)} 个工具, "
           f"care_effective={care_effective}, cat_status_ok={cat_status_ok}): {final_log[:30]}...")
     return (event_type, final_log, care_effective, cat_status_ok)
+
+
+# ============================================================
+# 🏠 Home Runtime 后台自主生活工具循环
+# ============================================================
+async def run_home_autonomy_tool_loop(
+    client,
+    ask_llm: Callable[..., Awaitable[str]],
+    system_ctx: str,
+    now_bj,
+    log_prefix: str = "🏠 [Home自主·工具循环]",
+) -> tuple[str, list[str]] | None:
+    """Home Runtime 后台自主生活工具循环。
+
+    按 HOME_AUTONOMY_PHASE 裁剪可用工具集，先观察家庭全局状态，再让 LLM 自主决策
+    做什么（种植/烹饪/写信/休息等），执行工具调用（注入 action_key + 限频 + 熔断），
+    最后基于真实工具结果生成一条生活日记。
+
+    安全护栏：
+    - 分层灰度：HOME_AUTONOMY_PHASE 控制可用工具集（0=关，1=只读，2=+信件，3=+种植烹饪，4=+基础生活）
+    - 固定身份：fixed_args 注入 actor_key="ai_primary"（LLM 无法覆盖，不在 schema 内）
+    - 幂等：action_key 由代码自动生成（auto_{tool}_{ts}_{hex6}），不让 LLM 控制
+    - 限频：写工具按 _HOME_TOOL_COOLDOWN 冷却（进程内存）
+    - 熔断：写工具连续失败 _HOME_BREAKER_THRESHOLD 次跳过（进程内存，只跳当前工具不熔断全局）
+    - 单轮上限：MAX_TOOL_CALLS 截断
+    - 错误隔离：call_tool try/except 吞异常（已有）
+
+    参数：
+      client      LLM 客户端（background 角色）
+      ask_llm     server._ask_llm_async 函数引用
+      system_ctx  已构建好的 system prompt 上下文
+      now_bj      当前北京时间
+
+    返回 (log_text, tools_used)；None 表示本轮跳过（phase 关闭或 Home Runtime 未加载）。
+    """
+    # ── 0. 前置检查 ──
+    if not _HAS_HOME_RUNTIME:
+        print(f"{log_prefix} Home Runtime 模块未加载，跳过")
+        return None
+    phase = HOME_AUTONOMY_PHASE
+    if phase < 1:
+        print(f"{log_prefix} HOME_AUTONOMY_PHASE={phase}（关闭），跳过")
+        return None
+    allowed_tools = _HOME_PHASE_TOOLS.get(phase, [])
+    if not allowed_tools:
+        print(f"{log_prefix} phase={phase} 无可用工具，跳过")
+        return None
+
+    import time
+
+    # ── 阶段 1：home_observe 拿全局状态（只读，不限频/不熔断）──
+    obs_res = await call_tool("home_observe", {})
+    obs_text = obs_res.get("text", "")
+    if not obs_res.get("ok"):
+        print(f"{log_prefix} home_observe 失败，本轮跳过: {obs_text[:80]}")
+        return None
+
+    # 如果 phase>=3，额外查花园和厨房状态（给 LLM 更完整的决策依据）
+    extra_obs = ""
+    if phase >= 3:
+        garden_res = await call_tool("garden_observe", {})
+        if garden_res.get("ok"):
+            extra_obs += "\n【花园】" + garden_res.get("text", "")[:300]
+        pantry_res = await call_tool("pantry_observe", {})
+        if pantry_res.get("ok"):
+            extra_obs += "\n【厨房】" + pantry_res.get("text", "")[:300]
+    if phase >= 2:
+        letters_res = await call_tool("list_letters", {})
+        if letters_res.get("ok"):
+            extra_obs += "\n【信件】" + letters_res.get("text", "")[:200]
+
+    # ── 阶段 2：构建工具 schema + 让 LLM 自主决策 ──
+    schema_lines = []
+    for n in allowed_tools:
+        spec = TOOL_REGISTRY.get(n)
+        if not spec:
+            continue
+        props = spec["parameters"].get("properties", {})
+        req = spec["parameters"].get("required", [])
+        if props:
+            pstr = ", ".join(
+                f'{pn}:{pinfo.get("type", "any")}'
+                + ("(必填)" if pn in req else "")
+                + (f'{pinfo["enum"]}' if "enum" in pinfo else "")
+                for pn, pinfo in props.items()
+            )
+        else:
+            pstr = "无参数"
+        schema_lines.append(f'- {n}（{spec["description"]}）参数: {pstr}')
+    schema_block = "\n".join(schema_lines)
+
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    phase_desc = {1: "只读观察", 2: "观察+写信/便利贴", 3: "+种植/烹饪", 4: "+基础生活"}.get(phase, "")
+    stage2_prompt = f"""
+现在是 {now_str}。你在家里自主生活（本轮可用范围：{phase_desc}）。
+
+家庭当前状态：
+{obs_text}{extra_obs}
+
+你可以调用以下工具来打理家庭生活：
+{schema_block}
+
+规则：
+- 最多调用 {MAX_TOOL_CALLS} 个工具；不需要工具时返回空数组。
+- 参数必须符合上面的类型与枚举。
+- 操作植物/菜品前先用 garden_observe / pantry_observe 拿 UUID 再操作。
+- 不要调用上面没列出的工具。
+- 只读阶段（phase=1）只观察不操作，返回空数组即可。
+
+只输出一行 JSON，不要多余文字：
+{{"tool_calls": [{{"name": "工具名", "args": {{...}}}}]}}
+"""
+    try:
+        raw2 = await ask_llm(client, stage2_prompt, system_prompt=system_ctx, temperature=0.6)
+    except Exception as e:
+        print(f"{log_prefix} LLM 决策失败: {e}")
+        return None
+    d2 = _parse_json_block(raw2)
+    tc_list = d2.get("tool_calls") or []
+    if not isinstance(tc_list, list):
+        tc_list = []
+
+    # ── 阶段 3：执行 tool_calls（白名单 + 限频 + 熔断 + action_key 注入 + 错误隔离）──
+    allowed = set(allowed_tools)
+    now_epoch = time.time()
+    results = []
+    tools_used = []
+    for tc in tc_list[:MAX_TOOL_CALLS]:
+        if not isinstance(tc, dict):
+            continue
+        name = (tc.get("name") or "").strip()
+        args = tc.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        if name not in allowed:
+            results.append({"name": name, "ok": False, "text": "不在 Home 自主可用工具范围内"})
+            continue
+
+        # 写工具：限频 + 熔断 + action_key 注入
+        if name in _HOME_WRITE_TOOLS:
+            # 熔断检查
+            fail_cnt = _home_tool_fail_count.get(name, 0)
+            if fail_cnt >= _HOME_BREAKER_THRESHOLD:
+                results.append({"name": name, "ok": False,
+                                "text": f"熔断中（连续失败{fail_cnt}次），本轮跳过"})
+                print(f"{log_prefix} {name} 熔断跳过（连续失败{fail_cnt}次）")
+                continue
+            # 限频检查
+            cooldown = _HOME_TOOL_COOLDOWN.get(name, 0)
+            last_fire = _home_tool_last_fire.get(name, 0.0)
+            if cooldown > 0 and (now_epoch - last_fire) < cooldown:
+                remain = int(cooldown - (now_epoch - last_fire))
+                results.append({"name": name, "ok": False,
+                                "text": f"冷却中（剩余{remain}s）"})
+                print(f"{log_prefix} {name} 冷却跳过（剩余{remain}s）")
+                continue
+            # 注入 action_key（代码生成，不让 LLM 控制）
+            args["action_key"] = _gen_home_action_key(name, now_bj)
+
+        res = await call_tool(name, args)
+        results.append({"name": name, "ok": res["ok"], "text": res["text"]})
+        print(f"{log_prefix} 工具 {name}: {'OK' if res['ok'] else 'FAIL'} {res['text'][:60]}")
+
+        # 更新限频/熔断状态（仅写工具）
+        if name in _HOME_WRITE_TOOLS:
+            if res["ok"]:
+                _home_tool_last_fire[name] = now_epoch
+                _home_tool_fail_count[name] = 0  # 成功重置熔断计数
+            else:
+                _home_tool_fail_count[name] = _home_tool_fail_count.get(name, 0) + 1
+        if res["ok"]:
+            tools_used.append(name)
+
+    # ── 阶段 4：基于真实工具结果生成生活日记 ──
+    if results:
+        results_text = "\n".join(
+            f"- {r['name']}: {'✅' if r['ok'] else '❌'} {r['text']}"
+            for r in results
+        )
+    else:
+        results_text = "（本轮仅观察，未执行操作）"
+
+    stage3_prompt = f"""
+你在家里自主生活，刚才做了以下事情：
+{results_text}
+
+写一条简短的生活日记。80字以内，第一人称。记录你做了什么、家里现在什么样、此刻的感受。
+只输出日记内容本身，不要 JSON、引号或前缀。
+"""
+    try:
+        raw3 = await ask_llm(client, stage3_prompt, system_prompt=system_ctx, temperature=0.85)
+    except Exception:
+        raw3 = ""
+    final_log = (raw3 or "").strip()
+    if not final_log:
+        if tools_used:
+            final_log = f"在家打理了生活（{', '.join(tools_used)}）"
+        else:
+            final_log = "在家观察了一圈，一切如常"
+
+    print(f"{log_prefix} 完成 (调了 {len(results)} 个工具, 成功 {len(tools_used)}): {final_log[:30]}...")
+    return (final_log, tools_used)

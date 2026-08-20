@@ -355,6 +355,20 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 
 > 💡 **开启建议**：先把 `FREE_ACTIVITY_TOOL_LOOP=true`，观察日志里 `🎈 [自由活动·工具循环] 工具 ...` 的执行结果一段时间，确认工具调用合理（没乱扣钱、没误删物品）再正式常开。默认关时零行为变化。
 
+### 12.3 Home Runtime 后台自主生活
+
+`heartbeat.py::async_home_autonomy_tick` 的 Home Runtime 自主生活循环。让 AI 在后台自主观察家庭状态并决定做什么（种植/烹饪/写信/休息等）。仿宠物照料独立循环模式，与自由活动循环隔离。
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `HOME_AUTONOMY_ENABLED` | ❌ | `false` | Home Runtime 后台自主生活总开关。`false` 时整个协程不启动。 |
+| `HOME_AUTONOMY_PHASE` | ❌ | `0` | 🆕 **分层灰度**。`0`=关闭（不进循环）；`1`=只读观察（observe/list_letters，无副作用）；`2`=+低风险写入（write_letter/leave_note，限频控制日频次）；`3`=+资源类（plant/water/harvest/cook/eat/feed，冷却+状态机）；`4`=+基础生活（enter_room/rest/sleep/spend_time，最后接）。高 phase 含低 phase 全部工具。 |
+| `HOME_AUTONOMY_INTERVAL` | ❌ | `7200` | Home 自主生活触发间隔（秒），默认 2 小时。 |
+
+> 💡 **安全护栏**：固定身份（`actor_key="ai_primary"` 由 fixed_args 注入，LLM 无法覆盖）；幂等（`action_key` 由代码自动生成 `auto_{tool}_{ts}_{hex6}`，不让 LLM 控制，service 层 UNIQUE 约束兜底）；限频（写工具按 `_HOME_TOOL_COOLDOWN` 冷却，进程内存）；熔断（连续失败 3 次跳过该工具，进程内存）；单轮上限（`MAX_TOOL_CALLS=5`）；错误隔离（`call_tool` try/except 吞异常）。
+>
+> 💡 **灰度建议**：先 `HOME_AUTONOMY_ENABLED=true HOME_AUTONOMY_PHASE=1` 观察日志里 `🏠 [Home自主·工具循环]` 的执行结果，确认 LLM 能正确读取家庭状态、决策合理后，逐级升 phase（2→3→4），每级观察一段时间再升。
+
 ---
 
 ## 13. 其他可选
