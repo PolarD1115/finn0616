@@ -1019,7 +1019,10 @@ def _fetch_device_snapshot(sb):
     top_apps = int(os.environ.get("DEVICE_CONTEXT_TOP_APPS", "5") or "5")
     max_notifs = int(os.environ.get("DEVICE_CONTEXT_MAX_NOTIFS", "3") or "3")
 
-    res = sb.table("device_data").select("*").order("id", desc=True).limit(1).execute()
+    # 取最近若干条：device_data 混有「完整快照」与「轻量事件行」(screen_on/off 等)，
+    # 单取最新一条常命中空事件行 → 快照几乎为空。这里取最近 8 条，从中挑出最新的
+    # 「富数据行」作为快照主体，并单独抓最新一条 device_event 补进来。
+    res = sb.table("device_data").select("*").order("id", desc=True).limit(8).execute()
     try:
         rows = res.data or []
     except Exception:
@@ -1027,7 +1030,18 @@ def _fetch_device_snapshot(sb):
     if not rows:
         return ""
 
-    row = rows[0]
+    # 富数据行判定：任一字段有值即算（app_usage/health_data/notifications/位置/前台应用）
+    def _has_payload(r):
+        return bool(
+            r.get("app_usage") or r.get("health_data") or r.get("notifications")
+            or (r.get("location_address") and str(r.get("location_address")).strip())
+            or (r.get("foreground_app") and str(r.get("foreground_app")).strip())
+        )
+
+    row = next((r for r in rows if _has_payload(r)), rows[0])
+    # 最新一条非空 device_event（可能来自比 row 更新的事件行，如刚发生的 screen_off）
+    latest_event_row = next((r for r in rows if r.get("device_event")), None)
+
     app_usage = _parse_json_field(row.get("app_usage"))
     notifications = _parse_json_field(row.get("notifications"))
     health = _parse_json_field(row.get("health_data")) or {}
@@ -1104,9 +1118,10 @@ def _fetch_device_snapshot(sb):
     if notifs:
         lines.append("🔔 最近通知：" + "；".join(notifs))
 
-    # 设备事件
-    if row.get("device_event"):
-        lines.append(f"⚡ 设备事件：{row['device_event']}")
+    # 设备事件（取最新一条事件行，可能比快照主体更新，如刚发生的 screen_off）
+    _evt = (latest_event_row or {}).get("device_event") if latest_event_row else None
+    if _evt:
+        lines.append(f"⚡ 设备事件：{_evt}")
 
     return "\n".join(lines)
 
