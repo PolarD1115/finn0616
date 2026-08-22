@@ -30,6 +30,89 @@
 
 ## 📦 变更日志
 
+### Phase 3 — 阻断旧回复与 reasoning 污染，建立 v2 记忆写入基础（2026-08-22）
+**性质**：记忆系统改造第 3 阶段，正式代码修改。
+
+**已确认根因**（基于前两阶段审计）：
+1. incoming messages 无字段白名单，客户端回传的 `reasoning_content` 被原样转发给上游模型。
+2. 网页/TG 自动聊天将 `user + assistant` 拼接为一个 Pinecone 向量写入，旧 AI 回复进入向量库。
+3. Pinecone metadata 仅 `text` + `user_id`，无 `source_role`/`memory_type`/`channel`/`schema_version`。
+4. Pinecone 召回无相似度阈值，旧 AI 回复原文被注入 prompt，且无"禁止模仿"约束。
+5. 网页查询用 `USER_ID`，TG 写入用 `MEM0_USER_ID`，可能不一致。
+
+**实际修改**：
+
+| 文件 | 修改内容 |
+|------|----------|
+| `server.py` | 新增 `_resolve_pinecone_user_id()` 统一解析（USER_ID→MEM0_USER_ID→default）；`search()` 始终加 user_id filter 且不可被覆盖 + 返回 score；`find_similar()` 加 user_id 过滤；`add()` 接受可选 metadata 参数；`save_memory` 工具传 v2 metadata（agent/curated_memory/mcp）；`_build_channel_context` 提示强化 + score 脱敏日志 |
+| `gateway.py` | 新增 `_strip_incoming_reasoning()` 清洗 incoming reasoning_content；`_handle_chat` 入口调用清洗；`_inject_context` 搜索用统一 user_id + score 脱敏日志 + 记忆纪律提示强化；`_save_conversation` Pinecone 写入改为 user-only + v2 metadata（web/chat_user_raw/v2/user） |
+| `heartbeat.py` | TG Pinecone 写入改为 user-only + v2 metadata（tg/chat_user_raw/v2/user）；导入 `_resolve_pinecone_user_id` |
+| `test_memory_phase3.py` | 新增专项测试 11 组（A~K），覆盖 reasoning 清洗、工具字段保留、多模态保留、user-only 写入、save_memory 分类、统一 user_id、search user_id 隔离、score 返回、纪律提示、旧数据兼容 |
+
+**兼容策略**：
+- 旧 Pinecone 向量不删除、不修改、不迁移
+- 旧向量无 `schema_version`，search 不崩溃，本阶段不按 score 过滤
+- `add(messages)` 旧调用无 metadata 仍可工作
+- `MEM0_USER_ID` 向后兼容（统一解析的 fallback）
+- 不配置 Pinecone 时网关仍能启动
+- 上游新产生的 `reasoning_content` 流式返回不受影响
+- `SAVE_THINKING` 含义不变（只控制本轮新生成 reasoning 的持久化）
+- Supabase memories 表仍保存 user + assistant 两条完整聊天流水
+
+**没有处理的内容**：
+- 尚未设置相似度阈值（score 仅记录脱敏日志，等积累真实样本后灰度）
+- 尚未核验生产 Pinecone metric/score 分布
+- 尚未处理旧混合向量（含 assistant 的旧格式向量仍可能被召回）
+- 尚未实现事件提取/人格学习/漂移审计
+- 尚未确认 RikkaHub 前端是否实际回传 reasoning_content
+
+**测试结果**：专项测试全部通过（详见 test_memory_phase3.py）
+
+**数据库操作情况**：未修改 Supabase schema 或数据
+
+**Pinecone 数据操作情况**：未删除、更新或迁移任何 Pinecone 向量；新写入从本阶段开始使用 v2 metadata
+
+**已知限制**：旧 Pinecone 向量仍可能被召回，但提示词已增加隔离约束；真正过滤旧向量必须等后续阶段决定。通过 score 日志可观察召回分数分布；旧格式向量比例仍无法由当前日志确认。
+
+### Phase 3.6 — 安全基线治理（2026-08-22）
+**性质**：解除 Mimosa 安全 Hook 阻塞，治理项目已有安全基线问题。
+
+**Mimosa 告警清单与判定**：
+
+| # | 文件/函数 | 类型 | 判定 | 依据 |
+|---|---|---|---|---|
+| 1 | server.py `_push_wechat` | SSRF | 误报 | URL host 固定 api.telegram.org，用户无法控制 host |
+| 2-3 | server.py `where_is_user` | SSRF | 误报 | URL host 固定 restapi.amap.com |
+| 4 | server.py `_scan_all_md_files` XML | 实体扩展 | **已修复** | 引入 defusedxml 替换 ET.fromstring |
+| 5-6 | server.py `read/write_obsidian_cloud` | SSRF | **已修复** | 增加 PROPFIND href 同域校验 |
+| 7 | server.py `write_obsidian_cloud` PUT | SSRF | 误报 | URL 从 WEBDAV_URL env + quote(file_name) 构建 |
+| 8 | test_console.py | SSRF | 测试脚本 | 未跟踪本地测试，硬编码 localhost |
+| 9 | _scan.py | 路径穿越 | 开发脚本 | 已跟踪但非生产代码，固定文件名 |
+| 10 | home_system.py `_rpc` | SQL注入 | 误报 | 固定 RPC 名 + JSON 参数绑定 |
+
+**实际修复**：
+
+| 文件 | 修改 | 解决的问题 |
+|------|------|----------|
+| `server.py` | `_scan_all_md_files` 中 `ET.fromstring` 替换为 `defusedxml.ElementTree.fromstring`，带 fallback | XML 实体膨胀/外部实体攻击防护 |
+| `server.py` | 新增 `_is_safe_href()` 同域校验函数，PROPFIND 爬取的 href 必须与 WEBDAV_URL 同域 | WebDAV 二级 SSRF 防护 |
+| `requirements.txt` | 新增 `defusedxml` 依赖 | 成熟安全 XML 解析库 |
+| `test_security_phase36.py` | 新增 16 个安全专项测试 | XML 安全、SSRF 防护、RPC 误报确认 |
+
+**新增依赖**：`defusedxml` 0.7.1（Apache 2.0 许可证，Python 3.11 兼容，官方推荐 XML 安全解析库）
+
+**兼容性**：defusedxml 的 `ElementTree.fromstring` API 与 stdlib `xml.etree.ElementTree.fromstring` 完全兼容；正常 WebDAV PROPFIND 响应解析不受影响；`_is_safe_href` 对相对路径和同域绝对 URL 放行，仅拒绝跨域绝对 URL
+
+**未修复的误报/不可达问题**：
+- 固定 API URL（Telegram/AMap/SiliconFlow/Resend/Tavily/HCTI/Replicate）：URL host 硬编码，用户无法控制，非真实 SSRF
+- home_system.py `_rpc`：固定 RPC 名 + JSON 参数绑定，非 SQL 拼接
+- _scan.py / test_console.py：本地开发/测试脚本，非生产代码
+
+**测试结果**：安全专项测试 16/16 通过；Phase 3 测试 33/33 通过；全量测试 759 tests / 38 failures（与修改前基线完全相同，无新增失败）
+
+**Supabase 操作声明**：未修改 Supabase schema 或数据
+**Pinecone 操作声明**：未操作真实 Pinecone
+
 ### Phase 6.2 — 钱包 RPC 权限与记忆过滤收口（2026-08-19）
 **性质**：Phase 6.1 最小安全收口补丁。
 

@@ -646,7 +646,7 @@ async def async_telegram_polling():
         _get_llm_client, _ask_llm_async, _push_wechat,
         _save_memory_to_db, _get_current_persona,
         get_latest_diary, where_is_user, pinecone_memory,
-        _build_channel_context
+        _build_channel_context, _resolve_pinecone_user_id
     )
 
     import requests
@@ -779,10 +779,17 @@ async def async_telegram_polling():
         if pinecone_memory and pinecone_memory.index:
             try:
                 def _add_mem():
-                    return pinecone_memory.add([
-                        {"role": "user", "content": text},
-                        {"role": "assistant", "content": reply}
-                    ], user_id=os.environ.get("MEM0_USER_ID", "default"))
+                    return pinecone_memory.add(
+                        [{"role": "user", "content": text}],
+                        user_id=_resolve_pinecone_user_id(),
+                        metadata={
+                            "schema_version": "v2",
+                            "source_role": "user",
+                            "memory_type": "chat_user_raw",
+                            "channel": "tg",
+                            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        }
+                    )
                 vector_saved = await asyncio.to_thread(_add_mem)
                 _tg_log(f"Pinecone写入={'成功' if vector_saved else '失败'} chat={chat_label}")
             except Exception as e:

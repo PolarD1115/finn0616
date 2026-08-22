@@ -33,3 +33,6 @@ google-api-python-client
 
 # Multimedia (AI Music / Cover, optional)
 replicate
+
+# XML Security (defusedxml — 防 XXE/实体膨胀，用于 WebDAV PROPFIND 响应解析)
+defusedxml
