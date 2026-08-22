@@ -1,0 +1,243 @@
+{
+  "schema_version": "mimosa-task-review/v2",
+  "run_id": "20260820T052211455Z-58328-a0d20351c9ae",
+  "run_status": "inconclusive",
+  "errors": [
+    {
+      "stage": "scan",
+      "target": "gateway.py",
+      "reason": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT"
+    },
+    {
+      "stage": "scan",
+      "target": "server.py",
+      "reason": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT"
+    }
+  ],
+  "coverage": {
+    "schema_version": "mimosa-hook-coverage/v1",
+    "status": "partial",
+    "scope": "hook_observed_diff",
+    "baseline": {
+      "complete": true,
+      "captured_files": 125,
+      "candidate_limit": 5000,
+      "truncated": false,
+      "enumeration_error_count": 0,
+      "snapshot_error_count": 0,
+      "compensated_target_count": 2
+    },
+    "change_tracking": {
+      "touched_observed": 2,
+      "touched_retained": 2,
+      "truncated": false,
+      "bash_mutation": true,
+      "bash_discovered": 2,
+      "bash_discovery_limit": 80,
+      "bash_discovery_truncated": false
+    },
+    "candidates": {
+      "eligible_files": 2,
+      "selected_files": 2,
+      "limit": 20,
+      "truncated": false
+    },
+    "scanning": {
+      "required_files": 2,
+      "scanned_files": 0,
+      "skipped_files": 0,
+      "failed_files": 2,
+      "project_checks_required": 0,
+      "project_checks_completed": 0
+    },
+    "notification": {
+      "eligible_findings": 0,
+      "detailed_findings": 0,
+      "detail_limit": 3,
+      "truncated": false
+    },
+    "reason_counts": {
+      "scanner_failed": 2,
+      "project_check_failed": 2
+    },
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "gateway.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "server.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "gateway.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "server.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affects_completion": true
+      }
+    ],
+    "reasons_truncated": false
+  },
+  "generated_at": "2026-08-20T05:22:11.455Z",
+  "session_id": "sess_fec56dfb-b329-45dd-89c5-f5e6fa5276d5",
+  "target": ".",
+  "revision": null,
+  "rules_version": "unavailable",
+  "diff_hash": "ba196eecde98063cabf0338f48fa1a3b938cfaf2cef350831d2293da669a6608",
+  "diff": {
+    "algorithm": "sha256",
+    "changed_file_count": 2,
+    "changed_files": [
+      {
+        "file": "gateway.py",
+        "ranges": [
+          {
+            "start": 2224,
+            "end": 2224
+          },
+          {
+            "start": 2227,
+            "end": 2227
+          },
+          {
+            "start": 2231,
+            "end": 2235
+          },
+          {
+            "start": 2238,
+            "end": 2239
+          }
+        ],
+        "before_hash": "c2841481d516d0abe74530e08b4cdbc3c33cfddc74e675503faa0ed9fea4d0c9",
+        "after_hash": "5d68dc87622ab5361bed14bfe70e396450c39fc4428b54199fabc4556b999218"
+      },
+      {
+        "file": "server.py",
+        "ranges": [
+          {
+            "start": 150,
+            "end": 150
+          },
+          {
+            "start": 152,
+            "end": 162
+          },
+          {
+            "start": 414,
+            "end": 417
+          },
+          {
+            "start": 420,
+            "end": 420
+          },
+          {
+            "start": 425,
+            "end": 427
+          },
+          {
+            "start": 434,
+            "end": 436
+          },
+          {
+            "start": 444,
+            "end": 447
+          },
+          {
+            "start": 1048,
+            "end": 1048
+          },
+          {
+            "start": 1050,
+            "end": 1054
+          }
+        ],
+        "before_hash": "d8666d84a4ed144cd139309a0c56ae7867e557fddf44d381cc119c1565dfe8bd",
+        "after_hash": "c7c6c8dd17be0672115c275aa09d467d2422f23ab4631f0f4aff0baff7aa85b2"
+      }
+    ]
+  },
+  "timing": {
+    "started_at": "2026-08-20T05:22:08.545Z",
+    "completed_at": "2026-08-20T05:22:11.455Z",
+    "duration_ms": 2910,
+    "measurement": "hook_wall_clock"
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "model_calls": 0,
+    "measurement": "known-zero"
+  },
+  "telemetry": {
+    "schemaVersion": "mimosa-gate-telemetry/v1",
+    "profile": "gate",
+    "operation": "Stop",
+    "outcome": "partial/INCONCLUSIVE",
+    "latencyMs": 2910,
+    "peakMemoryBytes": 106278912,
+    "memoryMeasurement": "max-observed-process-rss",
+    "scannedFiles": 0,
+    "cache": {
+      "hits": 0,
+      "misses": 0,
+      "measurement": "not-applicable"
+    },
+    "denyCount": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "total": 0,
+      "modelCalls": 0,
+      "measurement": "known-zero"
+    }
+  },
+  "finding_count": 0,
+  "rewake_finding_count": 0,
+  "evidence_boundary": {
+    "scan": "candidate",
+    "static_fix_verification": "observed_static_only",
+    "runtime_verification": "not_performed"
+  },
+  "finding_events": [
+    {
+      "finding_id": "mimosa-0c7649791dc202133bd1d151",
+      "file": "diag_memory.py",
+      "line": 52,
+      "rule_id": "security",
+      "severity": "high",
+      "category": "SSRF 服务端请求伪造",
+      "status": "blocked",
+      "decision": "deny",
+      "at": "2026-08-20T05:15:23.465Z",
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "source": "semgrep",
+        "evidence_hash": "cd2a3906673db7f19235e09e9cc926320aad5562c0c616e3c6645865c8936773",
+        "runtime_oracle": false
+      }
+    }
+  ],
+  "findings": [],
+  "artifacts": {
+    "immutable_report": ".mimosa/reports/task-review-sess_fec56dfb-b329-45dd-89c5-f5e6fa5276d5-20260820T052211455Z-58328-a0d20351c9ae.json",
+    "latest_report": ".mimosa/reports/task-review-sess_fec56dfb-b329-45dd-89c5-f5e6fa5276d5.json",
+    "history_summary": ".mimosa/history/run-20260820T052211455Z-58328-a0d20351c9ae.json"
+  }
+}

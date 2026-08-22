@@ -1,0 +1,133 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260817T044441214Z-33956-be60a4ec557a",
+  "runId": "20260817T044441214Z-33956-be60a4ec557a",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_search_keywords.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_search2.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_static_check.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tool_loop.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "heartbeat.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "gateway.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_search_keywords.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_search2.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_static_check.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tool_loop.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "heartbeat.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "gateway.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": null,
+  "diffHash": "6b09475f8f370f292da4b089bbd53fb98a2dfff8697a89a6f26de29cb22c8acc",
+  "rulesVersion": "unavailable",
+  "sessionHash": "fd27d5fade4e639ec850920b286090f7f001d1ed07dcb8dd47e7d6599cf69aed",
+  "reportRef": ".mimosa/reports/task-review-sess_2bdef0de-18b9-4bb4-8eaf-f0f241337a0f-20260817T044441214Z-33956-be60a4ec557a.json",
+  "events": [
+    {
+      "eventId": "hook-d6bcbb173d2a3f6dcd92f4d359943bd8",
+      "findingId": "mimosa-e76cd98d1ed7ed5b9fcb2f44",
+      "type": "finding_blocked",
+      "at": "2026-08-17T04:36:03.208Z",
+      "identity": {
+        "projectRelativeFile": "_extract_js.py",
+        "ruleId": "security",
+        "codeEvidenceHash": "30d160cdcd5cddf79b0463b6358b8aba8a36745f3dd23468ef64eb092627a9df",
+        "confidence": "stable"
+      },
+      "scope": "direct",
+      "line": 12,
+      "endLine": 12,
+      "reasonCode": "deny",
+      "reportedToAgent": true,
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "evidenceHash": "30d160cdcd5cddf79b0463b6358b8aba8a36745f3dd23468ef64eb092627a9df"
+      },
+      "sequence": 0
+    }
+  ],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-17T04:44:41.775Z"
+}

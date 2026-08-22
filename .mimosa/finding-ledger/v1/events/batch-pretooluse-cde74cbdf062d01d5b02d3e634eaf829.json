@@ -1,0 +1,48 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "pretooluse-cde74cbdf062d01d5b02d3e634eaf829",
+  "runId": null,
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "PreToolUse"
+  },
+  "revision": null,
+  "diffHash": null,
+  "rulesVersion": null,
+  "sessionHash": "cb7f6c22035e36cfb3feb7b5e61b08f5ca35d64d079a5fa8fe0b1f53d916f509",
+  "reportRef": null,
+  "events": [
+    {
+      "eventId": "hook-837ac17d9f6be630d3f5bf3f43f34e23",
+      "findingId": "mimosa-514bf9cc448c056bcb4b89f1",
+      "type": "finding_blocked",
+      "at": "2026-08-14T07:11:03.676Z",
+      "identity": {
+        "projectRelativeFile": "weather_tools.py",
+        "ruleId": "security",
+        "codeEvidenceHash": "2db764d101648d4df3819b5eca4de6e5b930c5724e4fea5cf9b0a3c2e780d22b",
+        "confidence": "stable"
+      },
+      "scope": "direct",
+      "line": 117,
+      "endLine": 117,
+      "reasonCode": "deny",
+      "reportedToAgent": true,
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "evidenceHash": "2db764d101648d4df3819b5eca4de6e5b930c5724e4fea5cf9b0a3c2e780d22b"
+      },
+      "sequence": 0
+    }
+  ],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-14T07:11:04.281Z"
+}

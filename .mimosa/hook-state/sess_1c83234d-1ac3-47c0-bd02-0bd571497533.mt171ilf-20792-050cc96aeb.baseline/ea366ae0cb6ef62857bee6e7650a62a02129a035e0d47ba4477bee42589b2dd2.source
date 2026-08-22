@@ -1,0 +1,36 @@
+# ============================================================
+# Ombre Brain Python 依赖
+# 安装: pip install -r requirements.txt
+# ============================================================
+
+# MCP 协议 SDK（Claude 通信核心）
+mcp>=1.0.0
+
+# 模糊匹配（记忆桶搜索）
+rapidfuzz>=3.0.0
+
+# OpenAI 兼容客户端（支持 DeepSeek/Ollama/LM Studio/vLLM/Gemini 等任意兼容 API）
+openai>=1.0.0
+
+# YAML 配置解析
+pyyaml>=6.0
+
+# Windows 上 zoneinfo 读取 Asia/Shanghai 等 IANA 时区需要 tzdata
+tzdata>=2024.1
+
+# Markdown frontmatter 解析（桶文件读写）
+python-frontmatter>=1.1.0
+
+# 中文分词
+jieba>=0.42.1
+
+# 异步 HTTP 客户端（应用层保活 ping）
+httpx>=0.27.0
+
+# HTTP gateway runtime
+starlette>=0.37.2
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+
+# 向量相似度计算 (导入模式/聚类)
+numpy>=1.24.0

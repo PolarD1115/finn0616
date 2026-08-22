@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-08-20T12:37:02.707Z",
+  "sessionId": "sess_c53e521c-e99b-4985-9ce7-cd57d3fc309a",
+  "event": "PostToolUse",
+  "toolName": "Write",
+  "file": "C:\\Users\\钟梓昕\\.zcode\\cli\\memories\\projects\\project-8643c80af47addde\\memory\\home-runtime-autonomy-intent.md",
+  "outcome": "clear",
+  "coverage": "complete",
+  "findingCount": 0,
+  "durationMs": 8,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}

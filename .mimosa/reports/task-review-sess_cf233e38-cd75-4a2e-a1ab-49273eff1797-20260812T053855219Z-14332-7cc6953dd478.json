@@ -1,0 +1,145 @@
+{
+  "schema_version": "mimosa-task-review/v2",
+  "run_id": "20260812T053855219Z-14332-7cc6953dd478",
+  "run_status": "completed",
+  "errors": [],
+  "coverage": {
+    "schema_version": "mimosa-hook-coverage/v1",
+    "status": "complete",
+    "scope": "hook_observed_diff",
+    "baseline": {
+      "complete": true,
+      "captured_files": 22,
+      "candidate_limit": 5000,
+      "truncated": false,
+      "enumeration_error_count": 0,
+      "snapshot_error_count": 0,
+      "compensated_target_count": 1
+    },
+    "change_tracking": {
+      "touched_observed": 1,
+      "touched_retained": 1,
+      "truncated": false,
+      "bash_mutation": false,
+      "bash_discovered": 0,
+      "bash_discovery_limit": 80,
+      "bash_discovery_truncated": false
+    },
+    "candidates": {
+      "eligible_files": 1,
+      "selected_files": 1,
+      "limit": 20,
+      "truncated": false
+    },
+    "scanning": {
+      "required_files": 1,
+      "scanned_files": 1,
+      "skipped_files": 0,
+      "failed_files": 0,
+      "project_checks_required": 0,
+      "project_checks_completed": 0
+    },
+    "notification": {
+      "eligible_findings": 0,
+      "detailed_findings": 0,
+      "detail_limit": 3,
+      "truncated": false
+    },
+    "reason_counts": {},
+    "reasons": [],
+    "reasons_truncated": false
+  },
+  "generated_at": "2026-08-12T05:38:55.219Z",
+  "session_id": "sess_cf233e38-cd75-4a2e-a1ab-49273eff1797",
+  "target": ".",
+  "revision": null,
+  "rules_version": "unavailable",
+  "diff_hash": "02e2bde1f420ab93927c9a98b916c27a2cc864bd90342c28b7edd574cba340df",
+  "diff": {
+    "algorithm": "sha256",
+    "changed_file_count": 1,
+    "changed_files": [
+      {
+        "file": "gateway.py",
+        "ranges": [
+          {
+            "start": 2503,
+            "end": 2503
+          },
+          {
+            "start": 2509,
+            "end": 2511
+          },
+          {
+            "start": 2521,
+            "end": 2521
+          },
+          {
+            "start": 2531,
+            "end": 2534
+          },
+          {
+            "start": 2539,
+            "end": 2540
+          },
+          {
+            "start": 2552,
+            "end": 2553
+          }
+        ],
+        "before_hash": "8b4fd6d8c13f276e32466f9abcb5e6d98da7033badabd374b50dbdc031972d5c",
+        "after_hash": "7c8b87e4085b80decf6506e17b1ffaa882125ba0453df4460e703677c2256fcc"
+      }
+    ]
+  },
+  "timing": {
+    "started_at": "2026-08-12T05:38:53.301Z",
+    "completed_at": "2026-08-12T05:38:55.219Z",
+    "duration_ms": 1918,
+    "measurement": "hook_wall_clock"
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "model_calls": 0,
+    "measurement": "known-zero"
+  },
+  "telemetry": {
+    "schemaVersion": "mimosa-gate-telemetry/v1",
+    "profile": "gate",
+    "operation": "Stop",
+    "outcome": "complete",
+    "latencyMs": 1918,
+    "peakMemoryBytes": 156164096,
+    "memoryMeasurement": "max-observed-process-rss",
+    "scannedFiles": 1,
+    "cache": {
+      "hits": 0,
+      "misses": 0,
+      "measurement": "not-applicable"
+    },
+    "denyCount": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "total": 0,
+      "modelCalls": 0,
+      "measurement": "known-zero"
+    }
+  },
+  "finding_count": 0,
+  "rewake_finding_count": 0,
+  "evidence_boundary": {
+    "scan": "candidate",
+    "static_fix_verification": "observed_static_only",
+    "runtime_verification": "not_performed"
+  },
+  "finding_events": [],
+  "findings": [],
+  "artifacts": {
+    "immutable_report": ".mimosa/reports/task-review-sess_cf233e38-cd75-4a2e-a1ab-49273eff1797-20260812T053855219Z-14332-7cc6953dd478.json",
+    "latest_report": ".mimosa/reports/task-review-sess_cf233e38-cd75-4a2e-a1ab-49273eff1797.json",
+    "history_summary": ".mimosa/history/run-20260812T053855219Z-14332-7cc6953dd478.json"
+  }
+}

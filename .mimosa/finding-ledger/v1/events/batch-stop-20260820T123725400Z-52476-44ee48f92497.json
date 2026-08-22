@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260820T123725400Z-52476-44ee48f92497",
+  "runId": "20260820T123725400Z-52476-44ee48f92497",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "tool_loop.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "scanner_failed",
+        "stage": "scan",
+        "target": "heartbeat.py",
+        "detail": "spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "tool_loop.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "scan",
+        "target": "heartbeat.py",
+        "detail": "scanner_failed: spawnSync D:\\node.exe ETIMEDOUT",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": null,
+  "diffHash": "d6f1cc8dffd2cdf0791f8a236a0555fe724729afe7495f9bd1abd074e11f774f",
+  "rulesVersion": "unavailable",
+  "sessionHash": "3759cfedfebd736aa8aa83d8a78a1d1215790ed9abfbba73b9fadb4676bf7636",
+  "reportRef": ".mimosa/reports/task-review-sess_c53e521c-e99b-4985-9ce7-cd57d3fc309a-20260820T123725400Z-52476-44ee48f92497.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [],
+  "recordedAt": "2026-08-20T12:37:26.063Z"
+}

@@ -1,0 +1,150 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260812T123030924Z-24904-9382e68ec551",
+  "runId": "20260812T123030924Z-24904-9382e68ec551",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_s2.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_probe_mcp.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_s3.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "changed_file_unreadable",
+        "stage": "candidate-select",
+        "target": "_smoke.py",
+        "detail": "observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_s2.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_probe_mcp.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_s3.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "_smoke.py",
+        "detail": "changed_file_unreadable: observed changed file no longer exists or cannot be read",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": null,
+  "diffHash": "0000cb991ddf94579d2f276fb099392bc946e90f04f4954c6e142b5c9585cbd1",
+  "rulesVersion": "unavailable",
+  "sessionHash": "49a0c2cfd8ab75462dfe8bf75349225473565749ded94293449fd633fcf89338",
+  "reportRef": ".mimosa/reports/task-review-sess_1c6228a2-04e6-4ef4-9dc0-c1e9d513c4b1-20260812T123030924Z-24904-9382e68ec551.json",
+  "events": [
+    {
+      "eventId": "hook-8596d2c5be79733050c6e578e76e8154",
+      "findingId": "mimosa-4d4fbfca98e9485d3d1f275e",
+      "type": "finding_observed",
+      "at": "2026-08-12T12:14:09.342Z",
+      "identity": {
+        "projectRelativeFile": "tool_loop.py",
+        "ruleId": "security",
+        "codeEvidenceHash": "ecf8f0d1dc6be2b3e2e29ccee06db049e58ddaaeb19aaad8aaa47b371c9676f9",
+        "confidence": "stable"
+      },
+      "scope": "direct",
+      "line": 487,
+      "endLine": 487,
+      "reasonCode": "advisory",
+      "reportedToAgent": true,
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "evidenceHash": "ecf8f0d1dc6be2b3e2e29ccee06db049e58ddaaeb19aaad8aaa47b371c9676f9"
+      },
+      "sequence": 0
+    },
+    {
+      "eventId": "hook-0bef8f7770bde7b1be5be1f5d3015578",
+      "findingId": "mimosa-4d4fbfca98e9485d3d1f275e",
+      "type": "finding_observed",
+      "at": "2026-08-12T12:30:30.924Z",
+      "identity": {
+        "projectRelativeFile": "tool_loop.py",
+        "ruleId": "security",
+        "codeEvidenceHash": "ecf8f0d1dc6be2b3e2e29ccee06db049e58ddaaeb19aaad8aaa47b371c9676f9",
+        "confidence": "stable"
+      },
+      "scope": "direct",
+      "line": 495,
+      "endLine": 495,
+      "reasonCode": "observe",
+      "reportedToAgent": false,
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "evidenceHash": "ecf8f0d1dc6be2b3e2e29ccee06db049e58ddaaeb19aaad8aaa47b371c9676f9"
+      },
+      "sequence": 1
+    }
+  ],
+  "observedFindingIds": [
+    "mimosa-4d4fbfca98e9485d3d1f275e",
+    "mimosa-15e0a72cd50bb66713199163",
+    "mimosa-60f0ff6866129afd2b96afba",
+    "mimosa-c2d0062cc985e1692ad3f30f"
+  ],
+  "verifiedFiles": [
+    {
+      "file": "tool_loop.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "heartbeat.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "test_tool_loop.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-08-12T12:30:31.692Z"
+}

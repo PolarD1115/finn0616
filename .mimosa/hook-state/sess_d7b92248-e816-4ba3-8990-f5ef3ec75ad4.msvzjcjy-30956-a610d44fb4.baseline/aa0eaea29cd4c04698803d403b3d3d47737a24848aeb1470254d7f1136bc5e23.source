@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+GENERIC_LEXICAL_STOPWORDS = frozenset(
+    {
+        "一个",
+        "一些",
+        "一下",
+        "不是",
+        "为了",
+        "他们",
+        "你们",
+        "我们",
+        "什么",
+        "今天",
+        "刚才",
+        "刚刚",
+        "这个",
+        "那个",
+        "这些",
+        "那些",
+        "然后",
+        "现在",
+        "自己",
+        "事情",
+        "东西",
+        "内容",
+        "相关",
+        "记忆",
+        "回忆",
+        "总结",
+        "记录",
+        "查询",
+        "搜索",
+        "最近",
+        "之前",
+        "过去",
+        "当前",
+        "安排",
+        "计划",
+        "问题",
+        "目标",
+        "时间",
+        "决定",
+        "嘿嘿",
+        "ai_name",
+        "assistant",
+        "display_name",
+        "human_name",
+        "user",
+        "user_alias",
+        "user_aliases",
+        "user_display_name",
+        "user_name",
+        "username",
+        "对方",
+        "用户",
+        "because",
+        "current",
+        "from",
+        "have",
+        "memory",
+        "memories",
+        "recent",
+        "related",
+        "search",
+        "status",
+        "that",
+        "this",
+        "thing",
+        "things",
+        "with",
+        "you",
+        "qq",
+        "q_q",
+        "qaq",
+        "qwq",
+        "qvq",
+        "tt",
+        "t_t",
+    }
+)
+
+
+DEFAULT_AI_ADDRESS_TERMS = (
+    "哥哥",
+    "老公",
+    "老婆",
+    "宝宝",
+    "宝贝",
+    "亲爱的",
+    "小乖",
+)
+
+LEGACY_AI_NAME_ALIASES = ("haven",)
+
+DATE_RECALL_QUERY_SHELL_TERMS = frozenset(
+    {
+        "大前天",
+        "前天",
+        "昨晚",
+        "昨天",
+        "昨日",
+        "今晚",
+        "今天",
+        "我们",
+        "咱们",
+        "我",
+        "你",
+        "还记得",
+        "记不记得",
+        "记得",
+        "想起",
+        "想起来",
+        "回忆",
+        "记忆",
+        "在聊什么",
+        "聊了什么",
+        "聊什么",
+        "聊过什么",
+        "说了什么",
+        "说什么",
+        "提到什么",
+        "讲了什么",
+        "讨论什么",
+        "做了什么",
+        "发生了什么",
+        "在聊",
+        "聊",
+        "说",
+        "提到",
+        "提",
+        "讲",
+        "讨论",
+        "发生",
+        "做",
+        "那次",
+        "这次",
+        "事情",
+        "事",
+        "什么",
+        "为什么",
+        "怎么回事",
+        "怎么说",
+        "有",
+        "没有",
+        "有没有",
+        "是",
+        "吗",
+        "么",
+        "嘛",
+        "呢",
+        "啊",
+        "呀",
+        "啦",
+        "吧",
+        "的",
+        "了",
+        "一下",
+        "再",
+        "一次",
+    }
+)
+
+MEMORY_SENTINEL_RESIDUE_STRIP_TERMS = frozenset(
+    {
+        *DEFAULT_AI_ADDRESS_TERMS,
+        "乖乖",
+        "想你了",
+        "想你",
+        "想我吗",
+        "想我",
+        "抱抱",
+        "抱我",
+        "抱一下",
+        "亲亲",
+        "亲一下",
+        "贴贴",
+        "蹭蹭",
+        "爱你",
+        "爱我吗",
+        "爱我",
+        "mua",
+        "muah",
+        "kiss",
+        "hug",
+        "missyou",
+        "loveyou",
+        "loveu",
+    }
+)
+
+LOW_SIGNAL_AFFECTION_TERMS = frozenset(
+    {
+        *DEFAULT_AI_ADDRESS_TERMS,
+        "乖乖",
+        "想你",
+        "爱你",
+        "抱抱",
+        "亲亲",
+        "贴贴",
+    }
+)
+
+LOW_SIGNAL_CHECKIN_TERMS = frozenset(
+    {
+        "ping",
+        "test",
+        "ok",
+        "hi",
+        "hello",
+        "哈哈",
+        "嗯嗯",
+        "测试",
+        "想你",
+        "想你了",
+        "想你了抱抱",
+        "抱抱",
+        "在吗",
+        *(f"{address}在吗" for address in DEFAULT_AI_ADDRESS_TERMS),
+    }
+)
+
+RECALL_SYSTEM_META_TERMS = frozenset(
+    {
+        "关键词",
+        "关键字",
+        "原文",
+        "原话",
+        "召回",
+        "检索",
+        "查记忆",
+        "记忆",
+        "长记忆",
+        "命中",
+        "注入",
+        "召回哨兵",
+        "主域判官",
+        "recalled",
+        "recall",
+        "retrieval",
+        "memory",
+        "injected",
+        "inject",
+        "diffused",
+        "diffusion",
+    }
+)
+
+QUERY_PLANNER_GENERIC_TERMS = frozenset(
+    {
+        *RECALL_SYSTEM_META_TERMS,
+        "recent",
+        "context",
+        "current",
+        "remember",
+        "emotion",
+        "status",
+        "thing",
+        "user",
+        "assistant",
+        "最近",
+        "记忆",
+        "上下文",
+        "当前",
+        "现在",
+        "记得",
+        "情绪",
+        "状态",
+        "事情",
+        "用户",
+        "助手",
+        "聊天",
+        "对话",
+    }
+)
+
+SOURCE_RECORD_FRAGMENT_TOPIC_STOPWORDS = QUERY_PLANNER_GENERIC_TERMS | frozenset(
+    {
+        "一下",
+        "一次",
+        "今天",
+        "昨天",
+        "明天",
+        "现在",
+        "当前",
+        "刚才",
+        "刚刚",
+        "每天",
+        "这次",
+        "那次",
+        "这个",
+        "那个",
+        "这条",
+        "那条",
+        "什么",
+        "为什么",
+        "怎么",
+        "知道",
+        "想起",
+        "想起来",
+        "可以",
+        "是不是",
+        "有没有",
+        "相关",
+        "相关联",
+        "里面",
+        "写着",
+        "提出",
+        "答应",
+        "爸爸",
+        "妈妈",
+        "爸爸妈妈",
+        "ai",
+        "模型",
+        "工具",
+        "记忆工具",
+        "亲密",
+        "承诺",
+        "关系",
+        "角色",
+        "扮演",
+        "身体",
+        "欲望",
+        "占有",
+        "归属",
+        "夜晚",
+        "这一幕",
+        "两人",
+    }
+) | frozenset(DEFAULT_AI_ADDRESS_TERMS)
+
+CHECKIN_TRAILING_PARTICLES = ("呢", "呀", "啊", "嘛", "吗", "么", "?", "？", "啦", "喔", "哦")
+LEADING_LOOKUP_ADDRESS_FOLLOWUPS = ("知道", "记得", "记不记得", "想起", "想起来", "问", "说")
+LEADING_LOOKUP_REASON_MARKERS = ("为什么", "怎么", "为何")
+
+
+def configured_identity_terms(identity: dict[str, Any] | None) -> tuple[str, ...]:
+    source = identity or {}
+    values = (
+        source.get("ai_name"),
+        source.get("user_name"),
+        source.get("user_display_name"),
+        *(source.get("user_aliases") or []),
+    )
+    return tuple(str(value).strip() for value in values if str(value or "").strip())
+
+
+def identity_address_terms(
+    identity: dict[str, Any] | None,
+    *,
+    include_legacy_ai: bool = False,
+) -> tuple[str, ...]:
+    values = [
+        *(LEGACY_AI_NAME_ALIASES if include_legacy_ai else ()),
+        *DEFAULT_AI_ADDRESS_TERMS,
+        *configured_identity_terms(identity),
+    ]
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value or "").strip()))
+
+
+def date_recall_shell_terms(identity: dict[str, Any] | None) -> set[str]:
+    return set(DATE_RECALL_QUERY_SHELL_TERMS) | set(identity_address_terms(identity))

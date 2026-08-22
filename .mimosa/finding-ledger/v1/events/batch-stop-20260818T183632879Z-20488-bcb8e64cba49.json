@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260818T183632879Z-20488-bcb8e64cba49",
+  "runId": "20260818T183632879Z-20488-bcb8e64cba49",
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": null,
+  "diffHash": "b0a10e02ef01536a646a44d79304ad2947ad1cb7bfeb1d0f8a9a3d61c1f58a0a",
+  "rulesVersion": "unavailable",
+  "sessionHash": "d3f8214d6c13af5810b8b99c8a81b817820c0ed5a127b3f684c494d0c5403673",
+  "reportRef": ".mimosa/reports/task-review-sess_2d477d42-3ca5-41db-85b7-dc05ca091e29-20260818T183632879Z-20488-bcb8e64cba49.json",
+  "events": [],
+  "observedFindingIds": [],
+  "verifiedFiles": [
+    {
+      "file": "test_money_earning.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-08-18T18:36:33.468Z"
+}

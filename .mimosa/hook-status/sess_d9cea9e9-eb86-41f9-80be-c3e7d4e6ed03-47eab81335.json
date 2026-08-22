@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-08-21T09:28:36.758Z",
+  "sessionId": "sess_d9cea9e9-eb86-41f9-80be-c3e7d4e6ed03",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "gateway.py",
+  "outcome": "clear",
+  "coverage": "complete",
+  "findingCount": 0,
+  "durationMs": 37,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}

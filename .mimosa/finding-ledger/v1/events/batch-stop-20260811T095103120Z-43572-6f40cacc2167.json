@@ -1,0 +1,59 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20260811T095103120Z-43572-6f40cacc2167",
+  "runId": "20260811T095103120Z-43572-6f40cacc2167",
+  "runStatus": "completed",
+  "coverage": {
+    "status": "complete",
+    "reasons": []
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": null,
+  "diffHash": "43af4f81cf7ea08f8f5b3b77f3c3583b09a4f7eb1d7f5c65df5f0a7d7822a2a8",
+  "rulesVersion": "unavailable",
+  "sessionHash": "04f96a1d511f87532fc91b34a32bbd94540b209bcdb1944f4f72f5db4bec21f2",
+  "reportRef": ".mimosa/reports/task-review-sess_c88ae5ae-d4c8-414b-8e9f-fc936db518d9-20260811T095103120Z-43572-6f40cacc2167.json",
+  "events": [
+    {
+      "eventId": "hook-881e2d5df8289b34c230bd937787a4bf",
+      "findingId": "mimosa-c2d0062cc985e1692ad3f30f",
+      "type": "finding_observed",
+      "at": "2026-08-11T09:51:03.120Z",
+      "identity": {
+        "projectRelativeFile": "heartbeat.py",
+        "ruleId": "security",
+        "codeEvidenceHash": "7be11e6c3392a79c675894814e92fdde75d39d4d7fec4fe08881cec471eb8496",
+        "confidence": "stable"
+      },
+      "scope": "direct",
+      "line": 1206,
+      "endLine": 1206,
+      "reasonCode": "observe",
+      "reportedToAgent": false,
+      "evidence": {
+        "kind": "source",
+        "boundary": "candidate",
+        "producer": "deterministic",
+        "evidenceHash": "7be11e6c3392a79c675894814e92fdde75d39d4d7fec4fe08881cec471eb8496"
+      },
+      "sequence": 0
+    }
+  ],
+  "observedFindingIds": [
+    "mimosa-15e0a72cd50bb66713199163",
+    "mimosa-60f0ff6866129afd2b96afba",
+    "mimosa-85aceaf28499e5ff47b5e3f9",
+    "mimosa-c2d0062cc985e1692ad3f30f"
+  ],
+  "verifiedFiles": [
+    {
+      "file": "heartbeat.py",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-08-11T09:51:03.779Z"
+}

@@ -1,0 +1,551 @@
+"""
+test_tool_loop.py — 自由活动工具循环单元测试
+================================================
+对齐项目惯例：unittest + mock，不触生产数据/数据库。
+覆盖：白名单拒绝、参数校验、固定身份注入、错误隔离、动态裁剪、
+      两阶段编排、上限保护、跨活动工具拒绝、灰度退化。
+"""
+
+import unittest
+import json
+import datetime
+from unittest.mock import AsyncMock, Mock, patch
+
+import tool_loop
+
+
+# ============================================================
+# 1. 纯函数辅助测试
+# ============================================================
+class TestHelpers(unittest.TestCase):
+    def test_type_ok(self):
+        self.assertTrue(tool_loop._type_ok("x", "string"))
+        self.assertFalse(tool_loop._type_ok(1, "string"))
+        self.assertTrue(tool_loop._type_ok(1, "number"))
+        self.assertTrue(tool_loop._type_ok(1.5, "number"))
+        self.assertFalse(tool_loop._type_ok(True, "number"))  # bool 不算 number
+        self.assertTrue(tool_loop._type_ok(1, "integer"))
+        self.assertFalse(tool_loop._type_ok(1.5, "integer"))
+        self.assertTrue(tool_loop._type_ok(True, "boolean"))
+        self.assertFalse(tool_loop._type_ok(1, "boolean"))
+        self.assertTrue(tool_loop._type_ok(None, "anything"))  # None 放行（required 另查）
+
+    def test_validate_args_missing_required(self):
+        schema = {"properties": {"a": {"type": "string"}}, "required": ["a"]}
+        ok, err = tool_loop._validate_args({}, schema)
+        self.assertFalse(ok)
+        self.assertIn("缺少必填参数", err)
+
+    def test_validate_args_wrong_type(self):
+        schema = {"properties": {"a": {"type": "number"}}, "required": ["a"]}
+        ok, err = tool_loop._validate_args({"a": "x"}, schema)
+        self.assertFalse(ok)
+        self.assertIn("类型应为", err)
+
+    def test_validate_args_enum_ok(self):
+        schema = {"properties": {"r": {"type": "string", "enum": ["a", "b"]}}, "required": ["r"]}
+        ok, _ = tool_loop._validate_args({"r": "a"}, schema)
+        self.assertTrue(ok)
+
+    def test_validate_args_enum_invalid(self):
+        schema = {"properties": {"r": {"type": "string", "enum": ["a", "b"]}}, "required": ["r"]}
+        ok, err = tool_loop._validate_args({"r": "c"}, schema)
+        self.assertFalse(ok)
+        self.assertIn("不在允许范围", err)
+
+    def test_validate_args_empty_string_required(self):
+        # 空白字符串视为缺失（与 home_system 的 strip 校验一致）
+        schema = {"properties": {"a": {"type": "string"}}, "required": ["a"]}
+        ok, _ = tool_loop._validate_args({"a": "  "}, schema)
+        self.assertFalse(ok)
+
+    def test_validate_args_non_dict(self):
+        ok, _ = tool_loop._validate_args("not a dict", {"properties": {}, "required": []})
+        self.assertFalse(ok)
+
+    def test_stringify_str(self):
+        self.assertEqual(tool_loop._stringify("hello"), "hello")
+
+    def test_stringify_dict_ok_with_data(self):
+        r = tool_loop._stringify({"ok": True, "message": "成功", "data": {"x": 1}})
+        self.assertIn("成功", r)
+        self.assertIn("x", r)
+
+    def test_stringify_dict_ok_no_data(self):
+        self.assertEqual(tool_loop._stringify({"ok": True, "message": "done"}), "done")
+
+    def test_stringify_dict_ok_empty_message(self):
+        # ok=True 且 message 空 + data 空 → 兜底返回 "成功"
+        self.assertEqual(tool_loop._stringify({"ok": True, "message": ""}), "成功")
+
+    def test_stringify_dict_fail(self):
+        r = tool_loop._stringify({"ok": False, "message": "失败", "error_code": "X"})
+        self.assertIn("❌", r)
+        self.assertIn("失败", r)
+
+    def test_stringify_other(self):
+        self.assertEqual(tool_loop._stringify(42), "42")
+
+    def test_stringify_truncates_long_data(self):
+        long_data = {"x": "a" * 500}
+        r = tool_loop._stringify({"ok": True, "message": "m", "data": long_data})
+        self.assertIn("...", r)
+        self.assertLess(len(r), 600)
+
+    def test_parse_json_block_plain(self):
+        d = tool_loop._parse_json_block('{"activity": "x", "log": "y"}')
+        self.assertEqual(d["activity"], "x")
+
+    def test_parse_json_block_fenced(self):
+        d = tool_loop._parse_json_block('```json\n{"a": 1}\n```')
+        self.assertEqual(d["a"], 1)
+
+    def test_parse_json_block_with_surrounding_text(self):
+        d = tool_loop._parse_json_block('前缀 {"a": 2} 后缀')
+        self.assertEqual(d["a"], 2)
+
+    def test_parse_json_block_empty_and_invalid(self):
+        self.assertEqual(tool_loop._parse_json_block(""), {})
+        self.assertEqual(tool_loop._parse_json_block("no json here"), {})
+
+    def test_parse_json_block_non_object_array(self):
+        # 数组不是 dict → 返回 {}
+        self.assertEqual(tool_loop._parse_json_block("[1, 2, 3]"), {})
+
+    def test_activity_tool_map_completeness(self):
+        """每个 _FREE_ACTIVITIES 的活动名都必须在 ACTIVITY_TOOL_MAP 里有映射。"""
+        for name, _ in tool_loop._FREE_ACTIVITIES:
+            self.assertIn(name, tool_loop.ACTIVITY_TOOL_MAP,
+                          f"活动 {name!r} 未在 ACTIVITY_TOOL_MAP")
+
+    def test_tool_registry_consistency(self):
+        """ACTIVITY_TOOL_MAP 里的每个工具名都必须在 TOOL_REGISTRY 登记。"""
+        for activity, tools in tool_loop.ACTIVITY_TOOL_MAP.items():
+            for t in tools:
+                self.assertIn(t, tool_loop.TOOL_REGISTRY,
+                              f"工具 {t!r}（活动 {activity!r}）未在 TOOL_REGISTRY")
+
+    def test_build_tool_schema_block_crops_wallet(self):
+        block = tool_loop._build_tool_schema_block("记点小账")
+        self.assertIn("wallet_check", block)
+        self.assertIn("wallet_spend", block)
+        self.assertIn("wallet_earn", block)
+        self.assertNotIn("house_look", block)
+        self.assertNotIn("cat_status", block)
+
+    def test_build_tool_schema_block_crops_house(self):
+        block = tool_loop._build_tool_schema_block("逛虚拟小屋")
+        self.assertIn("house_look", block)
+        self.assertIn("cat_status", block)
+        self.assertIn("house_do", block)
+        self.assertIn("cat_shop_buy", block)
+        self.assertNotIn("wallet_spend", block)
+
+    def test_build_tool_schema_block_empty_activity(self):
+        self.assertEqual(tool_loop._build_tool_schema_block("查天气"), "")
+
+    def test_build_tool_schema_block_unknown_activity(self):
+        self.assertEqual(tool_loop._build_tool_schema_block("不存在活动"), "")
+
+    def test_outgoing_activities_in_free_list(self):
+        # _OUTGOING_ACTIVITIES 必须是 _FREE_ACTIVITIES 的子集
+        names = {n for n, _ in tool_loop._FREE_ACTIVITIES}
+        for o in tool_loop._OUTGOING_ACTIVITIES:
+            self.assertIn(o, names)
+
+
+# ============================================================
+# 2. call_tool 进程内调用测试
+# ============================================================
+class TestCallTool(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # 快照 TOOL_REGISTRY 的 callable，tearDown 恢复
+        self._snapshot = {n: spec.get("callable") for n, spec in tool_loop.TOOL_REGISTRY.items()}
+
+    def tearDown(self):
+        for n, fn in self._snapshot.items():
+            tool_loop.TOOL_REGISTRY[n]["callable"] = fn
+
+    async def test_unknown_name_rejected(self):
+        r = await tool_loop.call_tool("nonexistent_tool", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("不在白名单", r["text"])
+
+    async def test_missing_required(self):
+        r = await tool_loop.call_tool("wallet_spend", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("缺少必填参数", r["text"])
+
+    async def test_wrong_type(self):
+        r = await tool_loop.call_tool("wallet_spend", {"amount": "abc", "reason": "x"})
+        self.assertFalse(r["ok"])
+        self.assertIn("类型应为", r["text"])
+
+    async def test_enum_invalid(self):
+        r = await tool_loop.call_tool("house_look", {"room_id": "garage"})
+        self.assertFalse(r["ok"])
+        self.assertIn("不在允许范围", r["text"])
+
+    async def test_exec_success_sync_fixed_args_injected(self):
+        m = Mock(return_value={"ok": True, "message": "余额 100", "data": {"balance": 100}})
+        tool_loop.TOOL_REGISTRY["wallet_check"]["callable"] = m
+        r = await tool_loop.call_tool("wallet_check", {})
+        self.assertTrue(r["ok"])
+        self.assertIn("余额", r["text"])
+        # 验证 fixed_args 注入了 wallet_id（不让 LLM 控制）
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs.get("wallet_id"), "finn_wallet")
+
+    async def test_exec_failure_isolated(self):
+        tool_loop.TOOL_REGISTRY["wallet_spend"]["callable"] = Mock(
+            side_effect=RuntimeError("DB down"))
+        r = await tool_loop.call_tool("wallet_spend", {"amount": 5, "reason": "test"})
+        self.assertFalse(r["ok"])
+        self.assertIn("执行失败", r["text"])
+        self.assertIn("DB down", r["text"])
+
+    async def test_exec_async_success(self):
+        # save_memory 的 callable=None + _server_name，延迟从 server 取
+        # mock _resolve_callable 返回一个 AsyncMock（模拟 @mcp.tool 装饰后的 async 函数）
+        inner = AsyncMock(return_value="✅ 记忆已保存: 标题")
+        with patch("tool_loop._resolve_callable", new=AsyncMock(return_value=inner)):
+            r = await tool_loop.call_tool("save_memory", {"title": "标题", "content": "内容"})
+            self.assertTrue(r["ok"])
+            self.assertIn("记忆已保存", r["text"])
+
+    async def test_exec_async_resolve_returns_none(self):
+        # _server_name 工具解析失败（server 无该属性）→ ok=False，不崩
+        with patch("tool_loop._resolve_callable", new=AsyncMock(return_value=None)):
+            r = await tool_loop.call_tool("save_memory", {"title": "t", "content": "c"})
+            self.assertFalse(r["ok"])
+            self.assertIn("不可用", r["text"])
+
+    async def test_cat_fixed_user_id_injected(self):
+        m = Mock(return_value={"ok": True, "message": "小满状态"})
+        tool_loop.TOOL_REGISTRY["cat_pet"]["callable"] = m
+        r = await tool_loop.call_tool("cat_pet", {})
+        self.assertTrue(r["ok"])
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs.get("user_id"), "user_finn")
+
+    async def test_cat_shop_buy_missing_item_id(self):
+        r = await tool_loop.call_tool("cat_shop_buy", {})
+        self.assertFalse(r["ok"])
+        self.assertIn("缺少必填参数", r["text"])
+
+    async def test_cat_shop_buy_invalid_enum(self):
+        r = await tool_loop.call_tool("cat_shop_buy", {"item_id": "diamond"})
+        self.assertFalse(r["ok"])
+        self.assertIn("不在允许范围", r["text"])
+
+    async def test_cat_shop_buy_fixed_args_injected(self):
+        m = Mock(return_value={"ok": True, "message": "购买成功"})
+        tool_loop.TOOL_REGISTRY["cat_shop_buy"]["callable"] = m
+        r = await tool_loop.call_tool("cat_shop_buy", {"item_id": "fish", "qty": 2})
+        self.assertTrue(r["ok"])
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs.get("user_id"), "user_finn")
+        self.assertEqual(kwargs.get("item_id"), "fish")
+        self.assertEqual(kwargs.get("qty"), 2)
+
+    async def test_args_none_treated_as_empty(self):
+        # args=None 不应崩
+        m = Mock(return_value={"ok": True, "message": "ok", "data": {}})
+        tool_loop.TOOL_REGISTRY["wallet_check"]["callable"] = m
+        r = await tool_loop.call_tool("wallet_check", None)
+        self.assertTrue(r["ok"])
+
+
+# ============================================================
+# 3. run_free_activity_tool_loop 两阶段编排测试
+# ============================================================
+class TestRunLoop(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._snapshot = {n: spec.get("callable") for n, spec in tool_loop.TOOL_REGISTRY.items()}
+        self._enabled = tool_loop.TOOL_LOOP_ENABLED
+        self._max = tool_loop.MAX_TOOL_CALLS
+
+    def tearDown(self):
+        for n, fn in self._snapshot.items():
+            tool_loop.TOOL_REGISTRY[n]["callable"] = fn
+        tool_loop.TOOL_LOOP_ENABLED = self._enabled
+        tool_loop.MAX_TOOL_CALLS = self._max
+
+    @staticmethod
+    def _client():
+        return object()  # ask_llm 是 mock，不关心 client
+
+    async def test_disabled_degrades_single_call(self):
+        """灰度关：只调 1 次 ask_llm，返回草稿（等价改造前轻量版）。"""
+        tool_loop.TOOL_LOOP_ENABLED = False
+        ask = AsyncMock(return_value='{"activity": "查天气", "log": "今天晴"}')
+        result = await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+        )
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(result, ("查天气", "今天晴"))
+
+    async def test_disabled_with_tool_activity_still_single_call(self):
+        """灰度关 + 有工具活动（记点小账）：仍只调 1 次（退化）。"""
+        tool_loop.TOOL_LOOP_ENABLED = False
+        ask = AsyncMock(return_value='{"activity": "记点小账", "log": "存了10块"}')
+        result = await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+        )
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(result, ("记点小账", "存了10块"))
+
+    async def test_enabled_no_tools_activity_single_call(self):
+        """灰度开 + 无工具活动（查天气）：仍只调 1 次。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(return_value='{"activity": "查天气", "log": "晴朗"}')
+        result = await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+        )
+        self.assertEqual(ask.call_count, 1)
+        self.assertEqual(result, ("查天气", "晴朗"))
+
+    async def test_enabled_with_tools_three_stage(self):
+        """灰度开 + 有工具活动：调 3 次 ask_llm，执行工具，返回阶段3 log。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿"}',                    # 阶段1
+            '{"tool_calls": [{"name": "wallet_check", "args": {}}]}',     # 阶段2
+            '最终log基于余额结果',                                          # 阶段3
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "余额 100"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(ask.call_count, 3)
+        self.assertEqual(m_ct.call_count, 1)  # 只调了 wallet_check
+        self.assertEqual(result, ("记点小账", "最终log基于余额结果"))
+
+    async def test_max_calls_cap(self):
+        """tool_calls 超过 MAX_TOOL_CALLS 时只执行上限个。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        tool_loop.MAX_TOOL_CALLS = 2
+        tc = [{"name": "wallet_check", "args": {}} for _ in range(7)]
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿"}',
+            json.dumps({"tool_calls": tc}),
+            'final',
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "ok"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(m_ct.call_count, 2)  # 被 cap 到 2
+        self.assertEqual(result, ("记点小账", "final"))
+
+    async def test_cross_activity_tool_rejected(self):
+        """活动 A 的 tool_calls 里混入活动 B 的工具 → 被拒，不调 call_tool。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿"}',
+            # wallet_check 允许，house_look 不在"记点小账"范围 → 拒
+            '{"tool_calls": [{"name": "wallet_check", "args": {}}, '
+            '{"name": "house_look", "args": {"room_id": "kitchen"}}]}',
+            'final',
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "ok"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(m_ct.call_count, 1)  # house_look 被拒，只调 wallet_check
+        self.assertEqual(result, ("记点小账", "final"))
+
+    async def test_empty_draft_no_tools_returns_none(self):
+        """草稿 log 为空 + 无工具活动 → 本轮跳过（None）。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(return_value='{"activity": "查天气", "log": ""}')
+        result = await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+        )
+        self.assertIsNone(result)
+
+    async def test_stage3_empty_uses_draft(self):
+        """阶段3 LLM 返回空 → 用阶段1 草稿兜底。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿log"}',
+            '{"tool_calls": [{"name": "wallet_check", "args": {}}]}',
+            '',  # 阶段3 空返回
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "ok"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(result, ("记点小账", "草稿log"))
+
+    async def test_invalid_activity_fallback_random(self):
+        """模型乱编 activity → 兜底随机选一个合法名。"""
+        tool_loop.TOOL_LOOP_ENABLED = False
+        ask = AsyncMock(return_value='{"activity": "瞎编的活动", "log": "内容"}')
+        result = await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result[1], "内容")
+        self.assertIn(result[0], tool_loop._VALID_ACTIVITY_NAMES)
+
+    async def test_empty_tool_calls_uses_draft_via_stage3(self):
+        """灰度开 + 有工具活动，但模型返回空 tool_calls → 阶段3 基于草稿生成。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿"}',
+            '{"tool_calls": []}',  # 模型决定不调工具
+            '基于草稿的最终log',
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "x"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(m_ct.call_count, 0)  # 没调任何工具
+        self.assertEqual(result, ("记点小账", "基于草稿的最终log"))
+
+    async def test_tool_failure_does_not_break_loop(self):
+        """工具执行失败（ok=False）不中断循环，阶段3 仍正常生成。"""
+        tool_loop.TOOL_LOOP_ENABLED = True
+        ask = AsyncMock(side_effect=[
+            '{"activity": "记点小账", "log": "草稿"}',
+            '{"tool_calls": [{"name": "wallet_check", "args": {}}]}',
+            '虽然查余额失败但我记了账',
+        ])
+        m_ct = AsyncMock(return_value={"ok": False, "text": "❌ 数据库未连接 (DB_UNAVAILABLE)"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_free_activity_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 12, 10, 0), avoid="", desire_hint="",
+            )
+        self.assertEqual(m_ct.call_count, 1)
+        self.assertEqual(result, ("记点小账", "虽然查余额失败但我记了账"))
+
+    async def test_avout_hint_passed_to_stage1(self):
+        """avoid 非空时 stage1 prompt 应包含防重复提示。"""
+        tool_loop.TOOL_LOOP_ENABLED = False
+        ask = AsyncMock(return_value='{"activity": "查天气", "log": "晴"}')
+        await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="记点小账", desire_hint="",
+        )
+        # ask_llm(client, prompt, system_prompt=, temperature=) → prompt 是第 2 个位置参数
+        args, _ = ask.call_args
+        prompt = args[1] if len(args) > 1 else ""
+        self.assertIn("记点小账", prompt)
+        self.assertIn("换点别的", prompt)
+
+    async def test_desire_hint_passed_to_stage1(self):
+        """desire_hint 应注入 stage1 prompt。"""
+        tool_loop.TOOL_LOOP_ENABLED = False
+        ask = AsyncMock(return_value='{"activity": "发呆放空", "log": "x"}')
+        await tool_loop.run_free_activity_tool_loop(
+            self._client(), ask, "sys_ctx",
+            datetime.datetime(2026, 8, 12, 10, 0), avoid="",
+            desire_hint="\n（你此刻内心最想做的：想念 若合适，优先考虑「想对方了」。）",
+        )
+        args, _ = ask.call_args
+        prompt = args[1] if len(args) > 1 else ""
+        self.assertIn("想对方了", prompt)
+
+
+# ============================================================
+# 4. run_pet_care_tool_loop 状态驱动照料测试
+# ============================================================
+class TestPetCareLoop(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._snapshot = {n: spec.get("callable") for n, spec in tool_loop.TOOL_REGISTRY.items()}
+
+    def tearDown(self):
+        for n, fn in self._snapshot.items():
+            tool_loop.TOOL_REGISTRY[n]["callable"] = fn
+
+    @staticmethod
+    def _client():
+        return object()
+
+    async def test_llm_failure_returns_none(self):
+        """LLM 决策阶段异常 → 返回 None。"""
+        ask = AsyncMock(side_effect=RuntimeError("LLM down"))
+        m_ct = AsyncMock(return_value={"ok": True, "text": "小满状态ok"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_pet_care_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 15, 10, 0), event_type="hungry_cat",
+            )
+        self.assertIsNone(result)
+
+    async def test_normal_flow_three_calls(self):
+        """正常流程：cat_status 查状态 → LLM 出 tool_calls → 执行 → 生成日记。"""
+        ask = AsyncMock(side_effect=[
+            '{"tool_calls": [{"name": "cat_feed", "args": {"item_id": "fish"}}]}',  # 阶段2
+            '给小满喂了鱼，它吃得很开心',                                          # 阶段3
+        ])
+        m_ct = AsyncMock(side_effect=[
+            {"ok": True, "text": "饱食度 28，状态 idle"},   # cat_status
+            {"ok": True, "text": "喂食 fish 成功，饱食度 +15"},  # cat_feed
+        ])
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_pet_care_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 15, 10, 0), event_type="hungry_cat",
+            )
+        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(m_ct.call_count, 2)  # cat_status + cat_feed
+        self.assertEqual(result[0], "hungry_cat")
+        self.assertIn("喂了鱼", result[1])
+
+    async def test_cross_tool_whitelist_rejected(self):
+        """照料循环里调 wallet_* → 被拒。"""
+        ask = AsyncMock(side_effect=[
+            '{"tool_calls": [{"name": "wallet_check", "args": {}}, {"name": "cat_feed", "args": {"item_id": "fish"}}]}',
+            '照料完成',
+        ])
+        m_ct = AsyncMock(side_effect=[
+            {"ok": True, "text": "状态ok"},
+            {"ok": True, "text": "喂食成功"},
+        ])
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_pet_care_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 15, 10, 0), event_type="dirty_cat",
+            )
+        # wallet_check 不在 _PET_CARE_TOOLS，不应被 call_tool 调用
+        called_names = [c.args[0] for c in m_ct.call_args_list]
+        self.assertNotIn("wallet_check", called_names)
+        self.assertIn("cat_feed", called_names)
+        self.assertIsNotNone(result)
+
+    async def test_empty_tool_calls_uses_fallback_log(self):
+        """模型返回空 tool_calls → 生成日志时用兜底文案。"""
+        ask = AsyncMock(side_effect=[
+            '{"tool_calls": []}',
+            '',  # 阶段3 空返回
+        ])
+        m_ct = AsyncMock(return_value={"ok": True, "text": "状态ok"})
+        with patch.object(tool_loop, "call_tool", m_ct):
+            result = await tool_loop.run_pet_care_tool_loop(
+                self._client(), ask, "sys_ctx",
+                datetime.datetime(2026, 8, 15, 10, 0), event_type="tired_cat",
+            )
+        self.assertEqual(result[0], "tired_cat")
+        self.assertIn("tired_cat", result[1])  # 兜底日志含事件名
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
