@@ -30,6 +30,58 @@
 
 ## 📦 变更日志
 
+### Phase 3.8 — 多模态记忆文本提取修复（2026-08-24）
+**性质**：修复生产环境中多模态消息导致 embedding 失败的问题。
+
+**生产现象**：
+- 多模态消息（含图片 Base64）的 `content` 数组被 `str()` 转为巨型字符串
+- user_msg 膨胀至 1454247 字 / 27532 字
+- 超过 embedding API 输入限制，返回空向量
+- Pinecone 写入返回 False
+
+**已确认根因**：
+`gateway.py:1520` 使用 `str(m.get("content", ""))` 提取最后一条 user 消息，当 content 为 OpenAI 多模态数组时，会把图片 Base64、URL 等媒体对象全部转为文本
+
+**实际修改**：
+
+| 文件 | 修改 | 解决的问题 |
+|------|------|----------|
+| `gateway.py` | 新增 `_extract_message_text(content)` 函数：字符串原样返回；数组只提取 type=text/input_text 的文本 part；图片/音频/视频/文件/未知 part 全部忽略；非法结构返回空字符串；不修改输入 | 多模态 content 不再膨胀为巨型文本 |
+| `gateway.py:1520` | `str(m.get("content", ""))` → `_extract_message_text(m.get("content", ""))` | user_msg 只包含纯文本 |
+| `server.py` | `_get_embedding` 新增空值检查（空/空白不调用 API）+ 长度保护（`_MAX_EMBED_TEXT_CHARS = 6000`，超长截断并记录日志） | 防止超长文本超过 embedding API 限制 |
+
+**纯文本提取规则**：
+- 字符串 content → 原样返回
+- 数组 content → 只提取 `type=text` 和 `type=input_text` 的 `text` 字段，按顺序用换行合并
+- image_url/input_image/input_audio/audio/video_url/input_video/file/input_file → 忽略
+- 未知 part 类型 → 忽略（不执行 str() 或 json.dumps()）
+- None/数字/布尔/dict/空 list → 返回空字符串
+
+**嵌入长度保护**：
+- 常量 `_MAX_EMBED_TEXT_CHARS = 6000`（BAAI/bge-m3 最大 8192 tokens，中文单字符≈1 token，留出前缀和分词余量）
+- 空文本/纯空白不调用 embedding API
+- 超长文本在 `_get_embedding` 内统一截断，不影响上游聊天请求
+- 截断日志只记录原字符数和截断后字符数，不打印正文
+
+**各下游路径结果**：
+
+| 路径 | 修改前 | 修改后 |
+|---|---|---|
+| 上游聊天 | 完整多模态 | 完整多模态（不变） |
+| Pinecone 查询 | 整个 content 字符串 | 纯文本 |
+| Pinecone 写入 | 整个 content 字符串 | 纯文本 |
+| Supabase 用户流水 | 含媒体对象字符串 | 纯文本 |
+| 欲望/情绪分类 | 含媒体对象字符串 | 纯文本 |
+
+**兼容性**：普通纯文本行为完全不变；原始 req_data.messages 不修改，完整转发上游；纯图片消息不调用文本 embedding/Pinecone，但上游多模态请求正常执行
+
+**测试结果**：多模态专项测试 28/28 通过；Phase 3 测试 33/33 通过；安全测试 17/17 通过；全量 788 tests / 38 failures（与基线相同，无新增失败）
+
+**已知限制**：纯图片无文本消息不会进入文本记忆（不伪造占位文本）；旧含 Base64/assistant 向量仍未清理；正式相似度阈值尚未确定
+
+**Supabase 操作声明**：未修改 Supabase schema 或数据
+**Pinecone 操作声明**：未操作真实 Pinecone，未删除旧向量
+
 ### Phase 3 — 阻断旧回复与 reasoning 污染，建立 v2 记忆写入基础（2026-08-22）
 **性质**：记忆系统改造第 3 阶段，正式代码修改。
 

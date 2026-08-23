@@ -439,9 +439,21 @@ def _save_memory_to_db(title: str, content: str, category: str = "流水", mood:
 _embedding_warned = {"config": False, "api": False}
 
 
+# 嵌入输入安全上限（BAAI/bge-m3 最大 8192 tokens；中文单字符≈1 token，留出前缀和分词余量）
+_MAX_EMBED_TEXT_CHARS = 6000
+
+
 def _get_embedding(text: str):
     """调用向量嵌入 API 生成文本向量 (供 Pinecone 记忆检索用)。变量名兼容 DOUBAO_API_KEY。"""
     global _embedding_warned
+    # 空文本/纯空白不调用 embedding API
+    if not text or not text.strip():
+        return []
+    # 长度保护：超过上限时安全截断（不影响上游聊天请求，仅限 embedding 输入）
+    if len(text) > _MAX_EMBED_TEXT_CHARS:
+        _orig_len = len(text)
+        text = text[:_MAX_EMBED_TEXT_CHARS]
+        print(f"⚠️ 向量嵌入文本过长，已从 {_orig_len} 字截断为 {_MAX_EMBED_TEXT_CHARS} 字")
     try:
         api_key = os.environ.get("DOUBAO_API_KEY", "").strip()
         embed_endpoint = os.environ.get("DOUBAO_EMBEDDING_EP", "").strip()

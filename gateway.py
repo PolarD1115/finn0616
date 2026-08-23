@@ -1215,6 +1215,32 @@ def _weather_keyword_hit(text: str) -> bool:
     return any(k in text or k in t for k in _WEATHER_KEYWORDS)
 
 
+def _extract_message_text(content) -> str:
+    """从 OpenAI 兼容的 message content 中提取纯文本。
+    - 字符串 content 原样返回；
+    - 数组 content 只提取 type=text/input_text 的文本 part，按顺序用换行合并；
+    - 图片/音频/视频/文件/Base64/URL 等媒体 part 全部忽略；
+    - 未知 part 类型忽略，不执行 str() 或 json.dumps()；
+    - 非法结构（None/数字/布尔/dict 等）返回空字符串；
+    - 不修改输入。
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type", "")
+        if ptype in ("text", "input_text"):
+            text_val = part.get("text", "")
+            if isinstance(text_val, str):
+                parts.append(text_val)
+        # 其他 type（image_url/input_image/input_audio/audio/video_url/input_video/file/input_file 等）忽略
+    return "\n".join(parts)
+
+
 def _strip_incoming_reasoning(messages):
     """从 incoming messages 中移除客户端回传的历史 reasoning_content 字段。
     最小逻辑：遍历 list，对每个 dict message 删除 reasoning_content，其他字段原样保留。
@@ -1517,7 +1543,7 @@ class HostFixMiddleware:
         user_msg = ""
         for m in reversed(req_data.get("messages", [])):
             if m.get("role") == "user":
-                user_msg = str(m.get("content", ""))
+                user_msg = _extract_message_text(m.get("content", ""))
                 break
 
         if sb and user_msg:
