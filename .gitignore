@@ -25,10 +25,6 @@ server_output.txt
 .haven_ombre_ref/
 _refs/
 
-# ========== 生成的 HTML 页面（如果是构建产物） ==========
-miniapp.html
-console.html
-
 # ========== 临时脚本（可能包含测试密钥） ==========
 tmp_get_secret.py
 
@@ -54,3 +50,13 @@ test_*.py
 tmp_*.py
 -p/
 1700
+
+_scan*.py
+_scan_out*.txt
+_tmp_*.py
+server_output.txt
+files.txt
+钱包.txt
+# 如果除了 requirements.txt 之外都不想追踪 txt 文件
+*.txt
+!requirements.txt

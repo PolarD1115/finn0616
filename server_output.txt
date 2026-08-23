@@ -1,6 +1,0 @@
-C:\Users\钟梓昕\AppData\Local\Programs\Python\Python311\Lib\site-packages\pydantic_settings\sources\utils.py:47: IncompleteFieldDefinitionWarning: Field 'lifespan' has an incomplete definition: its annotation contains an unresolved forward reference, so settings sources may fail to correctly resolve its value. Call `model_rebuild()` on the model where the field is defined, once all the referenced types are defined.
-  warnings.warn(
-INFO:     Started server process [17356]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:18765 (Press CTRL+C to quit)
