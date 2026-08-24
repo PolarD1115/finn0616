@@ -1241,6 +1241,76 @@ def _extract_message_text(content) -> str:
     return "\n".join(parts)
 
 
+def _sanitize_outgoing_messages(messages):
+    """清洗发送给上游模型的消息列表，移除会导致 400 的空消息。
+    - 不修改输入列表（返回新列表）；
+    - 删除 content 为空/纯空白的 user/assistant 消息（除非含 tool_calls）；
+    - 保留带 tool_calls 的 assistant 消息（即使 content 为空）；
+    - 保留带 tool_call_id 的 tool 消息（即使 content 为空）；
+    - 不删除 system 消息；
+    - 对数组 content，删除空白 text part，保留媒体 part；
+    - 如果数组清洗后全部为空且无 tool_calls，删除该消息。
+    """
+    if not isinstance(messages, list):
+        return messages
+    import copy
+    result = []
+    for m in messages:
+        if not isinstance(m, dict):
+            result.append(m)
+            continue
+        role = m.get("role", "")
+        content = m.get("content", "")
+        has_tool_calls = bool(m.get("tool_calls"))
+        has_tool_call_id = bool(m.get("tool_call_id"))
+        # system 消息不删除
+        if role == "system":
+            result.append(m)
+            continue
+        # 带 tool_calls 的 assistant 消息保留
+        if role == "assistant" and has_tool_calls:
+            result.append(m)
+            continue
+        # 带 tool_call_id 的 tool 消息保留
+        if role == "tool" and has_tool_call_id:
+            result.append(m)
+            continue
+        # 字符串 content
+        if isinstance(content, str):
+            if content.strip():
+                result.append(m)
+            # else: 空字符串/纯空白 → 删除
+            continue
+        # 数组 content（多模态）
+        if isinstance(content, list):
+            cleaned_parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    cleaned_parts.append(part)
+                    continue
+                ptype = part.get("type", "")
+                if ptype in ("text", "input_text"):
+                    text_val = part.get("text", "")
+                    if isinstance(text_val, str) and text_val.strip():
+                        cleaned_parts.append(part)
+                    # else: 空 text part → 删除
+                else:
+                    # 非文本 part（image_url/file/audio/video 等）保留
+                    cleaned_parts.append(part)
+            if cleaned_parts:
+                m_copy = dict(m)
+                m_copy["content"] = cleaned_parts
+                result.append(m_copy)
+            # else: 数组全空 → 删除
+            continue
+        # content 为 None 且无 tool_calls/tool_call_id → 删除
+        # content 为其他类型（数字/布尔等）→ 保留（不常见但安全）
+        if content is not None and not isinstance(content, (str, list)):
+            result.append(m)
+        # None content 无结构 → 删除
+    return result
+
+
 def _strip_incoming_reasoning(messages):
     """从 incoming messages 中移除客户端回传的历史 reasoning_content 字段。
     最小逻辑：遍历 list，对每个 dict message 删除 reasoning_content，其他字段原样保留。
@@ -1630,6 +1700,8 @@ class HostFixMiddleware:
         def _stream_forward():
             try:
                 fwd_headers["Connection"] = "keep-alive"
+                # 🧹 发送前清洗空消息，防止上游 400（不修改原始 req_data 的其他字段）
+                req_data["messages"] = _sanitize_outgoing_messages(req_data.get("messages", []))
                 with requests.post(upstream_url, headers=fwd_headers, json=req_data, stream=True, timeout=300) as resp:
                     if resp.status_code != 200:
                         q.put({"error": f"HTTP {resp.status_code}: {resp.text[:500]}"})
@@ -2081,7 +2153,7 @@ class HostFixMiddleware:
 
         for round_i in range(max_rounds):
             payload = copy.deepcopy(base_payload)
-            payload["messages"] = messages
+            payload["messages"] = _sanitize_outgoing_messages(messages)
             payload["stream"] = False
             if payload.get("tools") and "tool_choice" not in payload:
                 payload["tool_choice"] = "auto"

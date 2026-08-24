@@ -30,6 +30,50 @@
 
 ## 📦 变更日志
 
+### Phase 4.1 — 修复记忆正文日志泄露与空消息上游 400（2026-08-24）
+**性质**：修复生产日志确认的两个问题。
+
+**生产现象**：
+1. `search_memory` 工具结果完整正文（含用户记忆、旧 AI 回复）被打印到 Zeabur 日志
+2. 上游拒绝空 assistant/空文本块，返回 400 错误（客户端带 79/81 条历史时触发）
+
+**已确认根因**：
+- `tool_loop.py:1494/1681/1879` 使用 `print(f"... {res['text'][:60]}")` 打印工具结果，`search_memory` 返回值含记忆正文
+- 客户端历史消息中存在空 assistant 消息（content 为空/纯空白），上游 API 拒绝
+
+**实际修改**：
+
+| 文件 | 修改 | 解决的问题 |
+|------|------|----------|
+| `tool_loop.py` | 新增 `_safe_tool_log_text()` 函数，对 `search_memory` 工具只返回"OK（返回 N 条记忆，正文已隐藏）"，其他工具保留原截断行为；替换 3 个日志打印点 | 记忆正文日志泄露 |
+| `gateway.py` | 新增 `_sanitize_outgoing_messages()` 函数：删除空 user/assistant 消息（保留带 tool_calls 的 assistant 和带 tool_call_id 的 tool）；删除多模态数组中的空白 text part；不删除 system 消息；不原地修改输入 | 上游 400 空消息错误 |
+| `gateway.py` | 流式路径和 tool loop 路径在上游 `requests.post` 前调用 `_sanitize_outgoing_messages()` | 覆盖所有上游发送路径 |
+| `test_sanitize_phase41.py` | 新增 20 个专项测试 | 日志脱敏、空消息清洗、tool_calls 保留、多模态、不原地修改、回归 |
+
+**日志脱敏规则**：
+- search_memory 成功 → `OK（返回 N 条记忆，正文已隐藏）`
+- search_memory 失败 → `FAIL（错误正文已隐藏）`
+- 其他工具 → 保留原有 60 字符截断行为
+- 日志不包含：用户正文、记忆正文、Base64、user_id、vector ID、API Key
+
+**空消息清洗规则**：
+- 删除：content 为空/纯空白的 user/assistant 消息（无 tool_calls）
+- 保留：带 tool_calls 的 assistant 消息（即使 content 为空）
+- 保留：带 tool_call_id 的 tool 消息（即使 content 为空）
+- 保留：system 消息（即使 content 为空）
+- 删除：多模态数组中的空白 text part
+- 保留：有效 image_url/file/audio/video 等媒体 part
+- 不原地修改输入列表（返回新列表）
+
+**上游请求兼容性**：普通文本行为不变；多模态请求保留完整 image_url；tool loop 每轮清洗自己的 outgoing messages；原始 req_data 不被原地修改（清洗在发送前对 messages 做替换）
+
+**DeepSeek 402 余额不足**：本阶段明确不处理（不充值、不换模型、不修改情绪引擎）
+
+**测试结果**：专项 20/20 通过；Phase 3 33/33 通过；Phase 3.8 28/28 通过；Phase 4 20/20 通过；安全 17/17 通过；全量 828 tests / 39 failures（与基线相同，无本阶段新增失败）
+
+**Supabase 操作声明**：未修改 Supabase schema 或数据
+**Pinecone 操作声明**：未操作真实 Pinecone，未改变召回阈值和旧向量处理策略
+
 ### Phase 4 — 召回观测增强与分层统计（2026-08-24）
 **性质**：增加 Pinecone 召回的脱敏结构化统计日志，不改变召回行为。
 

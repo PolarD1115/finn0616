@@ -31,6 +31,30 @@ import inspect
 import random
 from typing import Any, Callable, Awaitable
 
+# 日志中需要脱敏的工具：这些工具的返回值可能包含用户记忆正文，
+# 只记录数量或"正文已隐藏"，不打印任何返回内容。
+_REDACTED_LOG_TOOLS = frozenset({"search_memory"})
+
+
+def _safe_tool_log_text(name: str, ok: bool, text: str) -> str:
+    """生成工具日志的安全摘要。
+    对 search_memory 等含记忆正文的工具，只返回数量或"正文已隐藏"。
+    其他工具保留原有截断行为（60 字符）。
+    """
+    if name in _REDACTED_LOG_TOOLS:
+        if ok:
+            # 尝试从结果文本中安全提取记忆条数
+            count = 0
+            for line in text.split("\n"):
+                if line.strip().startswith("- "):
+                    count += 1
+            if count > 0:
+                return f"OK（返回 {count} 条记忆，正文已隐藏）"
+            return "OK（结果正文已隐藏）"
+        else:
+            return "FAIL（错误正文已隐藏）"
+    return f"{'OK' if ok else 'FAIL'} {text[:60]}"
+
 import home_system as _hs
 
 # 🌤️ 天气工具（软导入）
@@ -1491,7 +1515,7 @@ log 就是你要发的那句话本身。短。像平时发的。可以有触发�
             continue
         res = await call_tool(name, args)
         results.append({"name": name, "ok": res["ok"], "text": res["text"]})
-        print(f"{log_prefix} 工具 {name}: {'OK' if res['ok'] else 'FAIL'} {res['text'][:60]}")
+        print(f"{log_prefix} 工具 {name}: {_safe_tool_log_text(name, res['ok'], res['text'])}")
 
     # ── 阶段 3：基于真实工具结果生成最终 log ──
     if results:
@@ -1678,7 +1702,7 @@ async def run_pet_care_tool_loop(
             continue
         res = await call_tool(name, args)
         results.append({"name": name, "ok": res["ok"], "text": res["text"]})
-        print(f"{log_prefix} 工具 {name}: {'OK' if res['ok'] else 'FAIL'} {res['text'][:60]}")
+        print(f"{log_prefix} 工具 {name}: {_safe_tool_log_text(name, res['ok'], res['text'])}")
 
     # ── 阶段 4：基于真实工具结果生成照料日记 ──
     if results:
@@ -1876,7 +1900,7 @@ async def run_home_autonomy_tool_loop(
 
         res = await call_tool(name, args)
         results.append({"name": name, "ok": res["ok"], "text": res["text"]})
-        print(f"{log_prefix} 工具 {name}: {'OK' if res['ok'] else 'FAIL'} {res['text'][:60]}")
+        print(f"{log_prefix} 工具 {name}: {_safe_tool_log_text(name, res['ok'], res['text'])}")
 
         # 更新限频/熔断状态（仅写工具）
         if name in _HOME_WRITE_TOOLS:
