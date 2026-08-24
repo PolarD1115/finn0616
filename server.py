@@ -155,7 +155,14 @@ class PineconeMemoryClient:
         self.index_name = os.environ.get("PINECONE_INDEX_NAME", "notion-brain-v2")
         self.index = self.pc.Index(self.index_name) if self.pc else None
 
-    def search(self, query, user_id=None, filters=None, limit=3):
+    # source 白名单（只用于日志分类，不进入 filter/prompt/ Pinecone）
+    _VALID_SOURCES = frozenset({
+        "web_user", "tg_user", "qq_user",
+        "background_heartbeat", "home_autonomy", "free_activity",
+        "mcp", "unknown",
+    })
+
+    def search(self, query, user_id=None, filters=None, limit=3, source="unknown"):
         user_id = user_id or _resolve_pinecone_user_id()
         if not self.index:
             return []
@@ -175,8 +182,11 @@ class PineconeMemoryClient:
             results = [{"memory": m.metadata.get("text", ""),
                         "id": m.id,
                         "tags": m.metadata.get("tags", ""),
-                        "score": getattr(m, "score", None)}
+                        "score": getattr(m, "score", None),
+                        "schema_version": m.metadata.get("schema_version", ""),
+                        "source_role": m.metadata.get("source_role", "")}
                        for m in r.matches if m.metadata]
+            _log_pinecone_recall(results, source if source in self._VALID_SOURCES else "unknown")
             return {"results": results} if results else []
         except Exception as e:
             print(f"❌ Pinecone 搜索失败: {e}")
@@ -241,6 +251,68 @@ class PineconeMemoryClient:
 
 
 pinecone_memory = PineconeMemoryClient()
+
+# 候选观察线（不是阈值，只是统计分桶）
+_RECALL_SCORE_LINES = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.90)
+
+
+def _log_pinecone_recall(results, source="unknown"):
+    """生成 Pinecone 召回的脱敏结构化统计日志。
+    只记录数量、score 统计和 metadata 分类计数。
+    绝不记录：查询正文、记忆正文、user_id、vector ID、API Key。
+    """
+    if not isinstance(results, list):
+        print(f"🧠 Pinecone观测 source={source} results=0")
+        return
+    rc = len(results)
+    valid_scores = []
+    missing_score = 0
+    legacy = 0
+    v2 = 0
+    assistant_format = 0
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        # score 统计
+        raw_score = r.get("score")
+        try:
+            s = float(raw_score) if raw_score is not None else None
+            if s is not None and s == s and s != float('inf') and s != float('-inf'):  # NaN/Inf 排除
+                valid_scores.append(s)
+            else:
+                missing_score += 1
+        except (TypeError, ValueError):
+            missing_score += 1
+        # legacy/v2
+        sv = r.get("schema_version", "")
+        if sv == "v2":
+            v2 += 1
+        else:
+            legacy += 1
+        # assistant_format (旧格式 text 含 "assistant:")
+        mem_text = r.get("memory", "")
+        if isinstance(mem_text, str) and "assistant:" in mem_text:
+            assistant_format += 1
+    sc = len(valid_scores)
+    # Top1/Top2/gap（按 Pinecone 返回顺序，不重新排序）
+    top1 = valid_scores[0] if sc >= 1 else None
+    top2 = valid_scores[1] if sc >= 2 else None
+    gap = round(top1 - top2, 4) if sc >= 2 and top1 is not None and top2 is not None else "na"
+    smin = round(min(valid_scores), 2) if sc > 0 else "na"
+    smax = round(max(valid_scores), 2) if sc > 0 else "na"
+    top1_str = f"{top1:.2f}" if top1 is not None else "na"
+    top2_str = f"{top2:.2f}" if top2 is not None else "na"
+    # 候选观察线计数
+    ge_parts = []
+    for line in _RECALL_SCORE_LINES:
+        cnt = sum(1 for s in valid_scores if s >= line)
+        ge_parts.append(f"ge{int(line * 100)}={cnt}")
+    print(
+        f"🧠 Pinecone观测 source={source} results={rc} scored={sc} "
+        f"range={smin}~{smax} top1={top1_str} top2={top2_str} gap={gap} "
+        f"{' '.join(ge_parts)} "
+        f"legacy={legacy} v2={v2} assistant_format={assistant_format} missing_score={missing_score}"
+    )
 
 # ---------- HTTP 会话 (连接池加速) ----------
 http_session = requests.Session()
@@ -673,7 +745,7 @@ def _home_build_context_safe() -> str:
         return ""
 
 
-async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", inject_device: Optional[bool] = None) -> str:
+async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", inject_device: Optional[bool] = None, source: str = "unknown") -> str:
     """
     🧠 全渠道智能体上下文（TG / QQ 渠道注入用）
     与网页渠道 /v1/chat/completions 的 _inject_context 对齐，统一注入：
@@ -732,7 +804,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
             vec_enabled = True
         if vec_enabled:
             tasks["pinecone"] = _safe(lambda: pinecone_memory.search(query=str(query),
-                                     user_id=_resolve_pinecone_user_id(), limit=5))
+                                     user_id=_resolve_pinecone_user_id(), limit=5, source=source))
 
     # 6. 设备状态快照（复用 gateway 渲染，可开关）
     #    inject_device=None（后台自主活动调用）→ 沿用环境变量 DEVICE_CONTEXT_ENABLED，保持后台行为不变；
@@ -775,12 +847,8 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
             pinecone_context = "\n".join(
                 [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl]
             )
-            # 脱敏召回日志：只记录条数和 score 范围，不记录正文/user_id/vector_id
-            scores = [m.get("score") for m in rl if isinstance(m, dict) and m.get("score") is not None]
-            if scores:
-                print(f"🧠 Pinecone 召回 {len(rl)} 条，score 范围 {min(scores):.2f}~{max(scores):.2f}")
-            else:
-                print(f"🧠 Pinecone 召回 {len(rl)} 条，score 缺失")
+            # 脱敏召回观测日志由 search() 内部 _log_pinecone_recall() 统一生成
+            # 此处不再重复记录简单 score 范围
 
     history_text = ""
     hr = r.get("history")
@@ -1122,7 +1190,7 @@ async def search_memory(query: str):
     ans_parts = []
     # 1. 向量语义搜索
     try:
-        vec_results = await asyncio.to_thread(pinecone_memory.search, query)
+        vec_results = await asyncio.to_thread(pinecone_memory.search, query, source="mcp")
         if vec_results:
             res_list = vec_results.get("results", vec_results) if isinstance(vec_results, dict) else vec_results
             if isinstance(res_list, list) and res_list:

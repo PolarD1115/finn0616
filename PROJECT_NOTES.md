@@ -30,6 +30,41 @@
 
 ## 📦 变更日志
 
+### Phase 4 — 召回观测增强与分层统计（2026-08-24）
+**性质**：增加 Pinecone 召回的脱敏结构化统计日志，不改变召回行为。
+
+**已有 score 摘要处理**：之前 AI 整理的 score 分布属于未核验线索，本阶段从新的结构化日志重新开始统计。
+
+**实际修改**：
+
+| 文件 | 修改 | 目的 |
+|------|------|------|
+| `server.py` | `PineconeMemoryClient.search()` 增加 `source` 参数（白名单），返回结果新增 `schema_version`/`source_role` 字段 | 按来源分类观测 + legacy/v2 统计 |
+| `server.py` | 新增 `_log_pinecone_recall(results, source)` 函数 | 统一脱敏统计日志 |
+| `server.py` | `_build_channel_context()` 增加 `source` 参数 | 传递来源标识 |
+| `server.py` | `search_memory` MCP 工具传 `source="mcp"` | 区分工具调用来源 |
+| `server.py` | 替换旧 score 范围日志为结构化观测日志 | 统一观测格式 |
+| `gateway.py` | 网页 `_inject_context` Pinecone search 传 `source="web_user"` | 区分网页用户来源 |
+| `gateway.py` | 替换旧 score 范围日志 | 统一观测格式 |
+| `heartbeat.py` | 5 个 `_build_channel_context` 调用点传入 source | 区分后台来源 |
+| `test_recall_observability_phase4.py` | 新增 20 个观测专项测试 | 统计/脱敏/行为不变/回归 |
+
+**来源分类**：`web_user` / `tg_user` / `qq_user` / `background_heartbeat` / `home_autonomy` / `free_activity` / `mcp` / `unknown`
+
+**观测字段**：`source` / `results` / `scored` / `range` / `top1` / `top2` / `gap` / `ge50`~`ge90`（候选观察线）/ `legacy` / `v2` / `assistant_format` / `missing_score`
+
+**日志示例**：
+```
+🧠 Pinecone观测 source=web_user results=5 scored=5 range=0.48~0.71 top1=0.71 top2=0.70 gap=0.01 ge50=4 ge55=4 ge60=4 ge65=3 ge70=2 ge75=0 ge80=0 ge90=0 legacy=3 v2=2 assistant_format=1 missing_score=0
+```
+
+**召回行为不变**：top_k 不变、filter 不变、namespace 不变、结果顺序不变、score 不参与过滤、旧向量仍可返回、没有新增 Pinecone 请求。本阶段只增加观测，不改变召回结果。score 分桶只是观察指标，不代表相关性阈值。
+
+**测试结果**：观测专项 20/20 通过；Phase 3 33/33 通过；多模态 28/28 通过；安全 17/17 通过；全量 808 tests / 38 failures（与基线相同，无新增失败）
+
+**Supabase 操作声明**：未修改 Supabase schema 或数据
+**Pinecone 操作声明**：未操作真实 Pinecone，未删除旧向量，未新增 Pinecone 请求
+
 ### Phase 3.8 — 多模态记忆文本提取修复（2026-08-24）
 **性质**：修复生产环境中多模态消息导致 embedding 失败的问题。
 

@@ -1858,20 +1858,16 @@ class HostFixMiddleware:
             try:
                 import server as _srv_uid
                 def _s():
-                    return mc.search(query=str(current_query), user_id=_srv_uid._resolve_pinecone_user_id(), limit=5)
+                    return mc.search(query=str(current_query), user_id=_srv_uid._resolve_pinecone_user_id(), limit=5, source="web_user")
                 mr = await asyncio.to_thread(_s)
                 if mr:
                     rl = mr.get("results", mr) if isinstance(mr, dict) else mr
                     if isinstance(rl, list) and rl:
                         pinecone_context = "\n".join([f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl])
-                        # 脱敏召回日志：只记录条数和 score 范围
-                        scores = [m.get("score") for m in rl if isinstance(m, dict) and m.get("score") is not None]
-                        if scores:
-                            _log(f"🧠 Pinecone 召回 {len(rl)} 条，score 范围 {min(scores):.2f}~{max(scores):.2f}")
-                        else:
-                            _log(f"🧠 Pinecone 召回 {len(rl)} 条，score 缺失")
                     else:
                         _log("🧠 Pinecone 召回 0 条")
+                else:
+                    _log("🧠 Pinecone 召回 0 条")
             except Exception as e:
                 _log(f"Pinecone 检索失败（跳过）: {e}")
 

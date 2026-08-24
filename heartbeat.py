@@ -156,7 +156,7 @@ async def async_autonomous_life():
 
             # 🧠 复用与平时聊天完全相同的上下文：人设 + 画像 + 阶段总结 + Pinecone 向量记忆
             #    + 跨渠道近期对话 + 设备状态快照。让主动消息和平时聊天一样"有记忆、有温度"。
-            system_ctx = await _build_channel_context("最近发生的事、对方的近况", channel_tag="TG_MSG")
+            system_ctx = await _build_channel_context("最近发生的事、对方的近况", channel_tag="TG_MSG", source="background_heartbeat")
 
             # ── 关卡：先判断"该不该主动发" ──
             decide_prompt = f"""
@@ -527,7 +527,7 @@ async def async_free_activity():
 
             # 🧠 注入与平时聊天相同的上下文（人设+画像+记忆+设备），
             #    让"想对方了"这类外向活动结合近况、有温度。
-            system_ctx = await _build_channel_context("最近的近况、想对她说的话", channel_tag="TG_MSG")
+            system_ctx = await _build_channel_context("最近的近况、想对她说的话", channel_tag="TG_MSG", source="background_heartbeat")
 
             # 🛠️ 自由活动工具调用循环（v3.3 口子落地）：
             # - FREE_ACTIVITY_TOOL_LOOP=false（默认）：内部只走阶段1（单次 LLM 出
@@ -712,7 +712,7 @@ async def async_telegram_polling():
 
         try:
             import gateway as _gw
-            system_ctx = await _build_channel_context(text, channel_tag="TG_MSG", inject_device=_gw._device_context_enabled())
+            system_ctx = await _build_channel_context(text, channel_tag="TG_MSG", inject_device=_gw._device_context_enabled(), source="tg_user")
             _tg_log(f"准备调用主模型 chat={chat_label} system上下文={len(system_ctx)}字")
             prompt = f"""
             用户发来消息: {text}
@@ -1257,7 +1257,7 @@ async def _try_pet_care(event_type: str, now_bj):
             return {"ran": False, "care_effective": False, "cat_status_ok": False,
                     "skipped_cooldown": False}
 
-        system_ctx = await _build_channel_context("小满需要照顾，去看看它", channel_tag="TG_MSG")
+        system_ctx = await _build_channel_context("小满需要照顾，去看看它", channel_tag="TG_MSG", source="background_heartbeat")
         care_result = await tool_loop.run_pet_care_tool_loop(
             client=client,
             ask_llm=_ask_llm_async,
@@ -1471,7 +1471,7 @@ async def async_home_autonomy_tick():
 
             now_bj = _get_now_bj()
             system_ctx = await _build_channel_context(
-                "家庭自主生活观察", channel_tag="TG_MSG"
+                "家庭自主生活观察", channel_tag="TG_MSG", source="home_autonomy"
             )
 
             result = await tool_loop.run_home_autonomy_tool_loop(
