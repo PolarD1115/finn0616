@@ -30,6 +30,42 @@
 
 ## 📦 变更日志
 
+### Phase 5 — 旧 Pinecone assistant 混合向量隔离（2026-08-25）
+**性质**：召回结果隔离，不是数据删除。旧向量仍保留在 Pinecone 中。
+
+**生产现象**：日志显示 `legacy=4 v2=1 assistant_format=4` 和 `legacy=5 v2=0 assistant_format=5`，旧 assistant 混合向量仍大量进入模型上下文。
+
+**实际修改**：
+
+| 文件 | 修改 | 目的 |
+|------|------|------|
+| `server.py` | 新增 `_is_assistant_format()` 判断函数：检测 memory 文本中的旧角色分隔格式（`assistant:` 行首或 `\| assistant:`） | 识别旧混合向量 |
+| `server.py` | 新增 `_filter_recalled_memories()` 过滤函数：过滤含 `assistant:` 格式的结果，保留 v2 安全结果和 legacy user-only 结果 | 召回结果隔离 |
+| `server.py` | `search()` 在日志统计后、返回前调用 `_filter_recalled_memories()` | 所有调用方统一覆盖 |
+| `test_memory_phase3.py` | 更新 `test_k_old_mixed_vector_returned` → `test_k_old_mixed_vector_filtered`：旧混合向量现在被过滤而非返回 | Phase 5 兼容 |
+| `test_legacy_isolation_phase5.py` | 新增 25 个专项测试 | 过滤/保留/顺序/脱敏/回归 |
+
+**过滤规则**：
+- 过滤：memory 文本含 `assistant:` 角色分隔格式的结果（无论 v2 还是 legacy）
+- 保留：v2 user 结果、legacy user-only 结果、curated memory（不含 `assistant:` 格式）
+- 不匹配普通包含 "assistant" 单词的文本
+- 不修改原始 result 列表
+
+**过滤位置**：`search()` 内部，在 `_log_pinecone_recall()` 统计后、返回前。所有调用方（网页/TG/QQ/search_memory MCP 工具）自动覆盖。
+
+**统计日志**：`🧠 记忆隔离 source=web_user input=5 kept=1 filtered_legacy_assistant=4 v2=1 legacy=4`
+
+**空结果降级**：过滤后无安全结果时返回 `[]`，上下文使用现有"无相关深层记忆"占位，不暴露过滤机制。
+
+**召回行为保护**：没有增加 query，没有改变 top_k、filter、namespace。结果相对顺序保持。不设置 score 阈值。
+
+**本阶段是召回隔离，不是数据删除。旧向量仍保留在 Pinecone 中。**
+
+**测试结果**：专项 25/25 通过；Phase 3 33/33 通过；Phase 4 20/20 通过；Phase 3.8 28/28 通过；Phase 4.1 20/20 通过；安全 17/17 通过
+
+**Supabase 操作声明**：未修改 Supabase schema 或数据
+**Pinecone 操作声明**：未操作真实 Pinecone，未删除旧向量，未修改 Pinecone query 参数
+
 ### Phase 4.1 — 修复记忆正文日志泄露与空消息上游 400（2026-08-24）
 **性质**：修复生产日志确认的两个问题。
 

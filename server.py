@@ -187,7 +187,10 @@ class PineconeMemoryClient:
                         "source_role": m.metadata.get("source_role", "")}
                        for m in r.matches if m.metadata]
             _log_pinecone_recall(results, source if source in self._VALID_SOURCES else "unknown")
-            return {"results": results} if results else []
+            # 召回结果隔离：过滤旧 assistant 混合格式向量
+            _safe_source = source if source in self._VALID_SOURCES else "unknown"
+            filtered, _fstats = _filter_recalled_memories(results, _safe_source)
+            return {"results": filtered} if filtered else []
         except Exception as e:
             print(f"❌ Pinecone 搜索失败: {e}")
             return []
@@ -254,6 +257,61 @@ pinecone_memory = PineconeMemoryClient()
 
 # 候选观察线（不是阈值，只是统计分桶）
 _RECALL_SCORE_LINES = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.90)
+
+
+def _is_assistant_format(memory_text):
+    """判断 memory 文本是否包含旧 assistant 对话格式。
+    只匹配明确的角色分隔格式，不匹配普通包含 "assistant" 单词的文本。
+    """
+    if not isinstance(memory_text, str):
+        return False
+    # 明确的旧格式标记：行首 assistant: 或 | assistant:
+    for line in memory_text.split("\n"):
+        stripped = line.strip().lower()
+        if stripped.startswith("assistant:") or "| assistant:" in stripped:
+            return True
+    return False
+
+
+def _filter_recalled_memories(results, source="unknown"):
+    """过滤 Pinecone 召回结果，隔离旧 assistant 混合格式向量。
+    - 不修改原始 result 列表（返回新列表）；
+    - 过滤 assistant_format 旧混合结果（含 "assistant:" 角色段）；
+    - 保留 v2 安全结果、legacy user-only 结果、curated memory；
+    - 返回 (filtered_results, stats)，stats 只含脱敏计数。
+    """
+    if not isinstance(results, list):
+        return [], {"input_count": 0, "kept_count": 0, "filtered_legacy_assistant_count": 0,
+                    "v2_count": 0, "legacy_count": 0}
+    kept = []
+    filtered_assistant = 0
+    v2 = 0
+    legacy = 0
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        mem = r.get("memory", "")
+        sv = r.get("schema_version", "")
+        if sv == "v2":
+            v2 += 1
+        else:
+            legacy += 1
+        # 检查旧 assistant 格式
+        if _is_assistant_format(mem):
+            filtered_assistant += 1
+            continue  # 过滤，不进入上下文
+        kept.append(r)
+    stats = {
+        "input_count": len(results),
+        "kept_count": len(kept),
+        "filtered_legacy_assistant_count": filtered_assistant,
+        "v2_count": v2,
+        "legacy_count": legacy,
+    }
+    print(f"🧠 记忆隔离 source={source} input={stats['input_count']} kept={stats['kept_count']} "
+          f"filtered_legacy_assistant={stats['filtered_legacy_assistant_count']} "
+          f"v2={stats['v2_count']} legacy={stats['legacy_count']}")
+    return kept, stats
 
 
 def _log_pinecone_recall(results, source="unknown"):

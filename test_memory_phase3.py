@@ -360,8 +360,8 @@ class TestLegacyDataCompat(unittest.TestCase):
         return client
 
     @patch("server._get_embedding", return_value=[0.1] * 10)
-    def test_k_old_mixed_vector_returned(self, _mock_emb):
-        """旧格式向量（user+assistant 拼接）仍可被 search 返回，不崩溃。"""
+    def test_k_old_mixed_vector_filtered(self, _mock_emb):
+        """Phase 5: 旧格式向量（user+assistant 拼接）被过滤，不再进入上下文。"""
         client = self._make_client()
         old_match = Mock(
             id="old_id",
@@ -369,11 +369,11 @@ class TestLegacyDataCompat(unittest.TestCase):
             metadata={"text": "user: old question | assistant: old reply with tone"}
         )
         client.index.query.return_value = Mock(matches=[old_match])
-        result = client.search(query="test", user_id="uid", limit=5)
-        self.assertEqual(len(result["results"]), 1)
-        # 旧向量 text 含 assistant 段
-        self.assertIn("assistant:", result["results"][0]["memory"])
-        # 不删除、不改写
+        with patch("builtins.print"):
+            result = client.search(query="test", user_id="uid", limit=5)
+        # 旧混合向量被过滤，返回空
+        self.assertEqual(result, [])
+        # 不删除、不改写原始 Pinecone 数据
         self.assertEqual(old_match.metadata["text"], "user: old question | assistant: old reply with tone")
 
     @patch("server._get_embedding", return_value=[0.1] * 10)
