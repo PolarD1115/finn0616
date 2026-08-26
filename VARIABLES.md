@@ -152,6 +152,36 @@
 | `BACKGROUND_BASE_URL` | ❌ | 空 |
 | `BACKGROUND_MODEL_NAME` | ❌ | 空 |
 
+### 3.2d 多端点轮询 + 故障转移 🆕
+
+> **chat / compression / background 三个角色都支持多端点池。** 在控制台 / Mini App 的模型页
+> 给角色勾选多条模型（每条各自带 base_url + api_key），网关会自动轮询 + 故障转移。
+
+**工作原理：**
+- **轮询**：每次调用按 round-robin 取下一个端点，不同 key 分摊流量 → 避免单 key 触发安全过滤。
+- **故障转移**：同一次请求内，如果当前端点返回连接错误 / 5xx / 429 / 401 / 403 / 安全过滤拦截，
+  自动标记冷却并换下一个端点重试 → 避免断连。
+- **冷却**：失败端点冷却 60s × 连续失败次数（封顶 30 分钟），成功即清零。冷却期会被跳过，
+  全部冷却时兜底取最早到期的端点（不饿死）。
+- **安全过滤检测**：覆盖 Gemini（`sensitive words` / `finish_reason: SAFETY`）、
+  Claude（`stop_reason: refusal` / `content[].type: refusal`）、OpenAI（`content_filter`）
+  以及文本级拒答（"I can't help" / "抱歉，我不能" 等中英文短语）。
+  检测到安全过滤即换 key 重试（不同 provider 安全策略不同，换一个很可能放行）。
+
+**使用方法：**
+1. 在模型页为每个上游各建一条模型（base_url + api_key 各自不同）。
+2. 给 `compression` / `background` / `chat` 角色勾选多条。
+3. 保存后自动生效，无需重启。
+
+**健康状态查看：** 控制台 / Mini App 概览页会显示每个角色的端点池数量、冷却中的端点数、
+每个端点的失败次数和剩余冷却时间。`/api/status` 的 `model_roles.<role>.pool` 字段返回完整数据。
+
+**环境变量兼容：** 未在注册表里配端点池时，仍按原逻辑回退到 `COMPRESS_*` / `BACKGROUND_*` /
+`CHAT_*` / `OPENAI_*` 环境变量（单端点，无轮询）。
+
+**进程内健康：** 端点健康状态存储在进程内存中，重启清零（仅重置冷却，无副作用）。
+`background.py` 是独立进程，各有自己的健康视图。
+
 ### 3.3 硅基流动 SILICON1 (便宜模型)
 
 | 变量名 | 必填 | 默认值 |

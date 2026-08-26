@@ -705,10 +705,21 @@ async function loadOverview(force){
     let rh="";
     const mr=st.model_roles||{};
     ["chat","compression","background"].forEach(r=>{
-      const x=mr[r]||{};rh+=`<div class="dim-row"><span class="name">${r}</span>
+      const x=mr[r]||{};
+      const pool=x.pool||[];
+      const downN=pool.filter(e=>e.down).length;
+      const poolTag = pool.length>1 ? `<span class="tag ${downN>0?"warn":"ok"}" style="margin-left:6px">${pool.length}端点${downN>0?("·"+downN+"冷却"):""}</span>` : "";
+      rh+=`<div class="dim-row"><span class="name">${r}</span>
         <span class="code">${esc(x.model||"-")}</span>
         <span class="tag ${x.enabled?"ok":"no"}" style="margin-left:auto">${x.enabled?"可用":"未配置"}</span>
-        <span class="tag mute">${esc(x.source||"")}${x.fallback?"·回退":""}</span></div>`;
+        <span class="tag mute">${esc(x.source||"")}${x.fallback?"·回退":""}</span>${poolTag}</div>`;
+      // 展示每个端点的健康状态（仅多端点时）
+      if(pool.length>1){
+        pool.forEach(ep=>{
+          const st2=ep.down?`冷却${ep.cooldown_remaining}s(${ep.fails}次失败)`:"正常";
+          rh+=`<div class="dim-row" style="margin-left:20px;opacity:.8"><span class="name" style="font-size:11px">└</span><span class="code" style="font-size:12px">${esc(ep.model||ep.registry_id||"env")}</span><span class="tag ${ep.down?"warn":"ok"}" style="margin-left:auto;font-size:11px">${st2}</span></div>`;
+        });
+      }
     });
     if(mr.error)rh+='<div class="empty">'+esc(mr.error)+'</div>';
     document.getElementById("ovRoles").innerHTML=rh;
@@ -776,9 +787,11 @@ function renderRoles(){
   h+='<div style="margin-left:18px;margin-bottom:8px">'+enabled.map(m=>`<label style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:13px"><input type="checkbox" ${chatIds.includes(m.id)?"checked":""} onchange="updateRoleCheckbox(this,'${esc(m.id)}')" style="width:auto"/> ${esc(m.label)}</label>`).join("")+"</div>";
   // chat_default
   h+='<div class="dim-row"><span class="name">默认聊天</span><select id="roleChatDefault" onchange="setRole(\'chat_default\',this.value)" style="width:auto;flex:0 0 220px">'+chatIds.map(id=>`<option value="${esc(id)}" ${id===_roles.chat_default?"selected":""}>${esc(id)}</option>`).join("")+"</select></div>";
-  // compression / background 单选
+  // compression / background 多选（端点轮询池）
   ["compression","background"].forEach(r=>{
-    h+=`<div class="dim-row"><span class="name">${r}</span><select onchange="setRole('${r}',this.value)" style="width:auto;flex:0 0 220px"><option value="">（不指定）</option>${enabled.map(m=>`<option value="${esc(m.id)}" ${m.id===_roles[r]?"selected":""}>${esc(m.label)} (${esc(m.id)})</option>`).join("")}</select></div>`;
+    const poolIds=_roles[r]||[];
+    h+=`<div class="toggle-row"><div class="info"><div class="t">${r} 模型池</div><div class="d">可多选；多端点自动轮询 + 故障转移（断连/安全过滤时自动换 key）</div></div></div>`;
+    h+='<div style="margin-left:18px;margin-bottom:8px">'+(enabled.length?enabled.map(m=>`<label style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:13px"><input type="checkbox" data-role="${r}" ${poolIds.includes(m.id)?"checked":""} onchange="updateMultiRoleCheckbox('${r}',this)" value="${esc(m.id)}" style="width:auto"/> ${esc(m.label)}</label>`).join(""):'<div class="empty">无可用模型</div>')+"</div>";
   });
   document.getElementById("rolesEditor").innerHTML=h;
 }
@@ -792,10 +805,18 @@ async function updateRoleCheckbox(cb,id){
 }
 async function setRole(role,val){
   try{
-    const body=role==="chat"?{action:"set_role",role:"chat",ids:val}:{action:"set_role",role:role,id:val};
+    // chat / compression / background 现在都是多选 ids[]；chat_default 是单值
+    const body=(role==="chat_default")?{action:"set_role",role:"chat_default",id:val}
+      :{action:"set_role",role:role,ids:val};
     const d=await api("/api/models",{method:"POST",body});
     if(d){toast("身份已保存","ok");loadModels();}
   }catch(e){toast(e.message,"err");}
+}
+async function updateMultiRoleCheckbox(role,cb){
+  const boxes=[...document.querySelectorAll(`#rolesEditor input[type=checkbox][data-role="${role}"]`)];
+  const ids=boxes.filter(b=>b.checked).map(b=>b.value);
+  // 允许清空（回退到默认聊天模型），不强制至少一个
+  await setRole(role,ids);
 }
 function openModelModal(id){
   const m=id?_models.find(x=>x.id===id):null;

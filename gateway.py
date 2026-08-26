@@ -23,6 +23,7 @@ import json
 import asyncio
 import time
 import datetime
+import threading
 import requests
 
 # ---------- 日志静音：屏蔽 httpx 的 "HTTP Request: ..." 请求噪音 ----------
@@ -128,12 +129,15 @@ def _normalize_registry(reg: dict) -> dict:
         # 旧版无 chat 列表：用 chat_default（若仍是有效模型）作为唯一聊天模型
         cd = roles.get("chat_default")
         roles["chat"] = [cd] if cd else []
-    # compression / background 是单值（可为空字符串）
+    # compression / background 支持多值（端点轮询池）；旧的单值字符串兼容为单元素列表
     for r in ("compression", "background"):
-        if r in roles and isinstance(roles[r], list):
-            roles[r] = roles[r][0] if roles[r] else ""
-        if r not in roles:
-            roles[r] = ""
+        v = roles.get(r)
+        if isinstance(v, list):
+            roles[r] = [str(x).strip() for x in v if str(x).strip()]
+        elif isinstance(v, str) and v.strip():
+            roles[r] = [v.strip()]
+        else:
+            roles[r] = []
 
     # 补 chat_default 进 chat 列表（保证默认聊天模型在列表里）
     cd = roles.get("chat_default")
@@ -149,8 +153,8 @@ def _normalize_registry(reg: dict) -> dict:
         "roles": {
             "chat": roles["chat"],
             "chat_default": roles.get("chat_default") or default,
-            "compression": roles.get("compression") or "",
-            "background": roles.get("background") or "",
+            "compression": roles.get("compression") or [],
+            "background": roles.get("background") or [],
         },
     }
 
@@ -309,9 +313,9 @@ def _model_role_usage(reg: dict, model_id: str) -> list:
         used.append("chat")
     if model_id == roles.get("chat_default"):
         used.append("chat_default")
-    if model_id == roles.get("compression"):
+    if model_id in (roles.get("compression") or []):
         used.append("compression")
-    if model_id == roles.get("background"):
+    if model_id in (roles.get("background") or []):
         used.append("background")
     return used
 
@@ -405,7 +409,14 @@ def resolve_llm_role(role: str):
         if cd and cd not in cand_ids:
             cand_ids = [cd] + cand_ids
     else:
-        cand_ids = [roles.get(role, "")] if roles.get(role, "") else []
+        # compression / background 现为列表（端点池）；取全部候选，命中第一个即返回
+        _v = roles.get(role, [])
+        if isinstance(_v, list):
+            cand_ids = [str(x).strip() for x in _v if str(x).strip()]
+        elif _v:
+            cand_ids = [str(_v).strip()]
+        else:
+            cand_ids = []
 
     for rid in cand_ids:
         m = _find_enabled_model(reg, rid)
@@ -488,30 +499,325 @@ def resolve_llm_role(role: str):
     }
 
 
+# ==========================================
+# 🔁 多端点轮询 + 故障转移（chat / compression / background）
+# ==========================================
+# 注册表 roles.<role> 为模型 id 列表（端点池），每条模型自带 base_url+api_key。
+# 调用层（server.ask_role）按 round-robin 取下一个健康端点：
+#   - 连接错误 / 5xx / 429 / 401 / 403 / 安全过滤拦截 → 标记冷却，换下一个
+#   - 冷却时长线性增长（60s × 连续失败次数，封顶 30 分钟），成功即清零
+# 这样不同 key 分摊流量（防单 key 触发安全过滤），某个 key 断了即时切换（防断连）。
+_EP_HEALTH = {}          # model_id -> {"fails":int, "cooldown_until":float, "last_ts":float}
+_EP_CURSOR = {}           # role -> int（round-robin 游标）
+_EP_LOCK = threading.Lock()
+_EP_COOLDOWN_BASE = 60.0  # 单次失败基础冷却秒数
+_EP_COOLDOWN_MAX = 1800.0  # 冷却封顶 30 分钟
+_SSRF_SAFE_HOSTS = set()  # 已确认安全的主机缓存，避免每次建客户端都做 DNS 解析
+
+# Gemini / Claude 安全过滤错误关键词（出现在异常 message 里 → 端点级故障，换 key 重试）
+_SAFETY_ERROR_KEYWORDS = (
+    "content_filter", "content policy", "content_policy", "usage policy",
+    "sensitive word", "sensitive content", "prohibited use",
+    "could not be submitted", "may violate", "not allowed",
+    "violat", "safety", "refusal", "blocked",
+    "敏感词", "敏感内容", "违反", "安全策略", "内容政策", "不允许", "违规",
+)
+
+# 文本级拒答开头短语（仅当整段回复 < 400 字且短语出现在开头 80 字内才判定为拒答，
+# 避免把"先道歉后正常作答"的长回答误判为拒答）。英文 + 中文。
+_REFUSAL_PHRASES = (
+    # —— 英文 ——
+    "i can't help", "i cannot help", "i can't assist", "i cannot assist",
+    "i'm unable to", "i am unable to", "i'm not able to", "i am not able to",
+    "i can't create", "i cannot create", "i can't generate", "i cannot generate",
+    "i can't provide", "i cannot provide", "i can't write", "i cannot write",
+    "i won't help", "i will not help", "i won't provide", "i won't generate",
+    "i'm sorry, but i can't", "i'm sorry, but i cannot", "i'm sorry, but i am unable",
+    "i'm sorry, i can't", "i'm sorry, i cannot", "sorry, i can't", "sorry, i cannot",
+    "sorry, i'm unable", "i'm unable to fulfill", "i cannot fulfill",
+    "i don't think i can", "i do not think i can",
+    "the prompt could not be submitted", "sensitive words that violate",
+    "violates google", "prohibited use policy", "generative ai prohibited",
+    "against our content policy", "violates our usage policy", "violates our content policy",
+    "as an ai", "as a language model", "as an ai language model",
+    # —— 中文 ——
+    "抱歉，我不能", "对不起，我不能", "抱歉，我无法", "对不起，我无法",
+    "抱歉，我帮不了", "对不起，我帮不了", "抱歉，我不能帮", "对不起，我不能帮",
+    "我无法协助", "我不能协助", "我无法提供", "我不能提供",
+    "我无法生成", "我不能生成", "我无法创建", "我不能创建",
+    "我无法回答", "我不能回答", "我无法完成", "我不能完成",
+    "作为ai", "作为一个ai", "作为人工智能", "作为一个人工智能",
+    "这违反了", "违反了使用政策", "违反了内容政策", "违反政策", "违反了政策",
+    "涉及敏感", "包含敏感词", "包含敏感内容", "敏感内容",
+    "为了您的安全", "为了安全起见", "出于安全",
+)
+
+
+def _ep_health(mid: str) -> dict:
+    """返回某端点的健康记录（无记录或非 registry 端点返回零值）。"""
+    if not mid:
+        return {"fails": 0, "cooldown_until": 0.0, "last_ts": 0.0}
+    return _EP_HEALTH.get(mid, {"fails": 0, "cooldown_until": 0.0, "last_ts": 0.0})
+
+
+def _ep_is_down(mid: str) -> bool:
+    """该端点当前是否处于冷却期。"""
+    if not mid:
+        return False
+    return time.time() < _ep_health(mid)["cooldown_until"]
+
+
+def _ep_mark_fail(mid: str):
+    """标记端点失败：连续失败计数 +1，冷却时长线性增长（封顶 30 分钟）。"""
+    if not mid:
+        return
+    with _EP_LOCK:
+        h = _EP_HEALTH.setdefault(mid, {"fails": 0, "cooldown_until": 0.0, "last_ts": 0.0})
+        h["fails"] += 1
+        h["cooldown_until"] = time.time() + min(_EP_COOLDOWN_BASE * h["fails"], _EP_COOLDOWN_MAX)
+        h["last_ts"] = time.time()
+
+
+def _ep_mark_ok(mid: str):
+    """标记端点成功：清零失败计数与冷却。"""
+    if not mid:
+        return
+    with _EP_LOCK:
+        _EP_HEALTH[mid] = {"fails": 0, "cooldown_until": 0.0, "last_ts": time.time()}
+
+
+def _assert_safe_base_url(base_url: str) -> bool:
+    """SSRF 防护：校验 base_url 的协议与主机是否安全可请求。缓存已知安全主机。"""
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    if host and host in _SSRF_SAFE_HOSTS:
+        return True
+    if _check_ssrf(base_url):
+        return False
+    if host:
+        with _EP_LOCK:
+            _SSRF_SAFE_HOSTS.add(host)
+    return True
+
+
+def _build_openai_client_from_ep(ep: dict):
+    """按端点 dict 构造 OpenAI 客户端：补 /v1、SSRF 校验。返回 client 或 None。"""
+    try:
+        from openai import OpenAI
+        base_url = (ep.get("base_url") or "").strip() or None
+        if base_url:
+            if not _assert_safe_base_url(base_url):
+                _log(f"⚠️ 端点 base_url {base_url} 被 SSRF 防护拦截，跳过该端点")
+                return None
+            base = base_url.rstrip("/")
+            # 裸域名（不以 /vN 结尾、非完整 /chat/completions）自动补 /v1，
+            # 与 _handle_chat / 旧 _role_client 保持一致。
+            if not re.search(r"/chat/completions$", base) and not re.search(r"/v\d+[a-zA-Z]*$", base):
+                base_url = f"{base}/v1"
+        return OpenAI(api_key=ep["api_key"], base_url=base_url, timeout=60.0)
+    except Exception as e:
+        _log(f"⚠️ 构造 OpenAI 客户端失败: {e}")
+        return None
+
+
+def resolve_llm_pool(role: str) -> list:
+    """返回该角色的有序端点池（每项含 api_key/base_url/model/registry_id/source/fallback/enabled）。
+    回退链与 resolve_llm_role 一致；注册表命中时返回多条（端点池），非注册表回退时长度为 1（或 0）。
+    """
+    role = (role or "chat").strip()
+    if role not in _LLM_ROLES:
+        role = "chat"
+    reg = _load_llm_registry()
+    roles = reg.get("roles", {})
+
+    if role == "chat":
+        cand_ids = [rid for rid in (roles.get("chat") or []) if rid]
+        cd = roles.get("chat_default")
+        if cd and cd not in cand_ids:
+            cand_ids = [cd] + cand_ids
+    else:
+        _v = roles.get(role, [])
+        if isinstance(_v, list):
+            cand_ids = [str(x).strip() for x in _v if str(x).strip()]
+        elif _v:
+            cand_ids = [str(_v).strip()]
+        else:
+            cand_ids = []
+
+    pool = []
+    for rid in cand_ids:
+        m = _find_enabled_model(reg, rid)
+        if m:
+            pool.append({
+                "api_key": str(m.get("api_key", "")).strip(),
+                "base_url": str(m.get("base_url", "")).strip(),
+                "model": str(m.get("model", "")).strip() or m.get("id", ""),
+                "registry_id": m.get("id", ""),
+                "source": "registry",
+                "fallback": False,
+                "enabled": True,
+            })
+    if pool:
+        return pool
+
+    # 2) 默认聊天模型回退（注册表）
+    cd = roles.get("chat_default") or reg.get("default")
+    m = _find_enabled_model(reg, cd) if cd else None
+    if m:
+        return [{
+            "api_key": str(m.get("api_key", "")).strip(),
+            "base_url": str(m.get("base_url", "")).strip(),
+            "model": str(m.get("model", "")).strip() or m.get("id", ""),
+            "registry_id": m.get("id", ""),
+            "source": "registry",
+            "fallback": True,
+            "enabled": True,
+        }]
+
+    # 3-5) 复用 resolve_llm_role 的 llm_settings / env / default 回退（单元素池）
+    r = resolve_llm_role(role)
+    return [r] if (r.get("enabled") and r.get("api_key")) else []
+
+
+def pick_role_endpoint(role: str) -> dict | None:
+    """round-robin 挑下一个健康端点（跳过冷却中的）；全部冷却时返回最早到期的（兜底，避免饿死）。"""
+    pool = resolve_llm_pool(role)
+    if not pool:
+        return None
+    n = len(pool)
+    with _EP_LOCK:
+        start = _EP_CURSOR.get(role, 0) % n
+        _EP_CURSOR[role] = (start + 1) % n
+    order = [(start + i) % n for i in range(n)]
+    healthy = [pool[i] for i in order
+               if not (pool[i].get("registry_id") and _ep_is_down(pool[i]["registry_id"]))]
+    if healthy:
+        return healthy[0]
+    # 全冷却：返回最早到期的
+    return min(pool, key=lambda e: _ep_health(e.get("registry_id", ""))["cooldown_until"])
+
+
+def _extract_response_text(resp) -> str:
+    """从 OpenAI/Gemini/Claude 响应对象里尽量取出文本（跨 SDK 形态兜底）。"""
+    try:
+        if getattr(resp, "choices", None):
+            return (resp.choices[0].message.content or "")
+    except Exception:
+        pass
+    try:
+        cands = getattr(resp, "candidates", None)
+        if cands:
+            c0 = cands[0]
+            content = getattr(c0, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if parts:
+                return "".join(getattr(p, "text", "") or "" for p in parts)
+    except Exception:
+        pass
+    try:
+        contents = getattr(resp, "content", None)
+        if isinstance(contents, list):
+            return "".join(getattr(b, "text", "") or "" for b in contents
+                           if getattr(b, "type", "") == "text")
+    except Exception:
+        pass
+    return ""
+
+
+def _looks_like_refusal_text(text: str) -> bool:
+    """判断一段文本是否是纯拒答/安全过滤回复。
+    规则：整段 < 400 字 且 拒答短语出现在前 80 字内 —— 这样能放过"先道歉后正常作答"的长回答。
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) >= 400:
+        return False
+    head = t[:120].lower()
+    for p in _REFUSAL_PHRASES:
+        idx = head.find(p)
+        if idx >= 0 and idx < 80:
+            return True
+    return False
+
+
+def _is_refusal_response(resp) -> bool:
+    """检测一次 200 响应是否属于安全过滤/拒答（应触发端点转移）。
+    三层：API 级 block 字段 → finish_reason 枚举 → 文本拒答短语。
+    """
+    if resp is None:
+        return False
+    try:
+        # 1) OpenAI content_filter / Gemini 经适配器的 finish_reason
+        try:
+            ch = resp.choices[0]
+            fr = str(getattr(ch, "finish_reason", "") or "").lower()
+            if fr in ("content_filter", "safety", "blocked", "recitation",
+                      "blocklist", "prohibited_content"):
+                return True
+        except Exception:
+            pass
+        # 2) Gemini 原生 prompt_feedback.block_reason
+        fb = getattr(resp, "prompt_feedback", None)
+        if fb is not None and getattr(fb, "block_reason", None):
+            return True
+        # 3) Claude refusal stop_reason / content block
+        try:
+            stop = str(getattr(resp, "stop_reason", "") or getattr(resp, "stop", "") or "").lower()
+            if stop == "refusal":
+                return True
+            contents = getattr(resp, "content", None)
+            if isinstance(contents, list):
+                for blk in contents:
+                    if getattr(blk, "type", "") == "refusal":
+                        return True
+        except Exception:
+            pass
+        # 4) 文本级拒答（最兜底）
+        return _looks_like_refusal_text(_extract_response_text(resp))
+    except Exception:
+        return False
+
+
+def _classify_llm_error(e) -> tuple:
+    """分类一次 LLM 异常。返回 (reason:str, mark_fail:bool)。
+    - 安全过滤 / 连接超时 / 401 / 403 / 429 / 5xx → mark_fail=True（端点级，换下个）
+    - 400 非安全类（多为我们请求体问题）→ mark_fail=False（重试但不惩罚，避免把全池标冷却）
+    """
+    msg = str(e).lower()
+    if any(k in msg for k in _SAFETY_ERROR_KEYWORDS):
+        return ("safety_filter", True)
+    sc = getattr(e, "status_code", None)
+    if sc is None:
+        return ("connection", True)
+    if sc in (401, 403, 429) or sc >= 500:
+        return (f"http_{sc}", True)
+    if sc == 400:
+        return ("bad_request", False)
+    return (f"http_{sc}", True)
+
+
 def _role_client(role: str):
     """构造一个 OpenAI 客户端用于给定角色（供 server._get_llm_client 复用）。
     返回 (client, model_name)；client 可能为 None（角色未配置）。
+    多端点池时按 round-robin 挑下一个健康端点（跳过冷却中的）。
     """
-    r = resolve_llm_role(role)
-    if not r["enabled"] or not r["api_key"]:
-        return (None, r["model"])
-    try:
-        from openai import OpenAI
-        base_url = r["base_url"] or None
-        # 和 _handle_chat 保持一致的 URL 拼接逻辑：
-        # 当 base_url 是裸域名（不以 /vN 结尾）时，自动补 /v1，
-        # 避免 TG 等直接走 OpenAI 客户端的调用请求到错误的 /chat/completions 路径。
-        if base_url:
-            base = base_url.rstrip("/")
-            if not re.search(r"/chat/completions$", base) and not re.search(r"/v\d+[a-zA-Z]*$", base):
-                base_url = f"{base}/v1"
-        client = OpenAI(api_key=r["api_key"], base_url=base_url, timeout=60.0)
-        client.custom_model_name = r["model"]
-        client.role_source = r["source"]   # 便于日志/调试
-        return (client, r["model"])
-    except Exception as e:
-        _log(f"⚠️ _role_client({role}) 构造失败: {e}")
-        return (None, r["model"])
+    ep = pick_role_endpoint(role)
+    if not ep or not ep.get("api_key"):
+        return (None, (ep or {}).get("model", ""))
+    client = _build_openai_client_from_ep(ep)
+    if client is None:
+        return (None, ep.get("model", ""))
+    client.custom_model_name = ep["model"]
+    client.role_source = ep["source"]        # 便于日志/调试
+    client.ep_id = ep.get("registry_id", "")  # 调用方上报健康用
+    client.ep_role = role
+    return (client, ep["model"])
 
 
 def _mask_key(k: str) -> str:
@@ -2564,12 +2870,21 @@ class HostFixMiddleware:
                     if roles.get("chat_default") not in ids:
                         roles["chat_default"] = ids[0]
                 else:
-                    # compression / background：单选
-                    mid = str(payload.get("id", "")).strip()
-                    if mid and mid not in enabled_ids:
-                        await _send_json_resp(send, 400, {"error": f"模型 {mid} 不存在或未启用"})
+                    # compression / background：多选（端点轮询池）；兼容旧的单选 id
+                    ids = payload.get("ids", None)
+                    if ids is None:
+                        mid = str(payload.get("id", "")).strip()
+                        ids = [mid] if mid else []
+                    if not isinstance(ids, list):
+                        await _send_json_resp(send, 400, {"error": "ids 必须是数组"})
                         return
-                    roles[role] = mid
+                    ids = [str(x).strip() for x in ids if str(x).strip()]
+                    bad = [i for i in ids if i not in enabled_ids]
+                    if bad:
+                        await _send_json_resp(send, 400, {"error": f"以下模型不存在或未启用: {', '.join(bad)}"})
+                        return
+                    # 允许空（清空该角色池，回退到默认聊天模型）
+                    roles[role] = ids
                 reg["roles"] = roles
                 reg["default"] = roles.get("chat_default") or reg.get("default", "")
                 ok = _save_llm_registry(reg)
@@ -2952,6 +3267,23 @@ class HostFixMiddleware:
                     "enabled": r["enabled"],
                     "has_key": bool(r["api_key"]),
                 }
+                # 多端点池 + 每个端点的健康状态（冷却/失败计数）
+                pool = resolve_llm_pool(role)
+                ep_list = []
+                for ep in pool:
+                    mid = ep.get("registry_id", "")
+                    h = _ep_health(mid)
+                    ep_list.append({
+                        "model": ep.get("model", ""),
+                        "registry_id": mid,
+                        "source": ep.get("source", ""),
+                        "fallback": ep.get("fallback", False),
+                        "fails": h["fails"],
+                        "cooldown_remaining": max(0, int(h["cooldown_until"] - time.time())),
+                        "down": _ep_is_down(mid),
+                    })
+                roles_status[role]["pool"] = ep_list
+                roles_status[role]["pool_size"] = len(ep_list)
         except Exception as e:
             roles_status["error"] = str(e)
 

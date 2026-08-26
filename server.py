@@ -512,11 +512,95 @@ async def _ask_llm_async(client, prompt: str, system_prompt: str = "", temperatu
         if not resp.choices:
             return ""
         raw_text = resp.choices[0].message.content.strip()
-        # 剥离深度思考模型的 <think>...</think> 内部推理块
-        return re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        # 剥离深度思考模型的 <thinking>...</thinking> 内部推理块
+        return re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
     except Exception as e:
         print(f"❌ LLM 调用失败: {e}")
         return ""
+
+
+async def ask_role(role: str, prompt: str, system_prompt: str = "", temperature: float = 0.7) -> str:
+    """带端点轮询 + 故障转移的角色调用（chat / compression / background 通用）。
+
+    每次调用从端点池里 round-robin 取下一个健康端点；遇连接错误 / 5xx / 429 / 401 / 403
+    / 安全过滤拦截时标记冷却并换下一个端点重试（同一次请求内逐个尝试）。
+    这样不同 key 分摊流量（防单 key 触发安全过滤），某个 key 断了即时切换（防断连）。
+    返回干净的纯文本（已剥离 <thinking>）；全部端点失败则返回 ""。
+    """
+    import gateway as _gw
+    pool = _gw.resolve_llm_pool(role)
+    if not pool:
+        return ""
+    n = len(pool)
+    start = _gw._EP_CURSOR.get(role, 0) % n
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    for i in range(n):
+        ep = pool[(start + i) % n]
+        mid = ep.get("registry_id", "")
+        # 跳过冷却中的（最后一次兜底尝试除外 —— 全冷却时仍试最早到期的）
+        if i < n - 1 and mid and _gw._ep_is_down(mid):
+            continue
+        client = _gw._build_openai_client_from_ep(ep)
+        if client is None:
+            continue
+        model_name = ep.get("model", "")
+
+        def _call():
+            return client.chat.completions.create(model=model_name, messages=messages, temperature=temperature)
+
+        try:
+            resp = await asyncio.to_thread(_call)
+            # 安全过滤拦截（Gemini sensitive words / Claude refusal / OpenAI content_filter）→ 换 key 重试
+            if _gw._is_refusal_response(resp):
+                if mid:
+                    _gw._ep_mark_fail(mid)
+                    print(f"⚠️ 角色 {role} 端点 {mid} 安全过滤拦截，切换下一个端点")
+                continue
+            if mid:
+                _gw._ep_mark_ok(mid)
+            try:
+                if not resp.choices:
+                    return ""
+                raw_text = resp.choices[0].message.content.strip()
+            except Exception:
+                raw_text = _gw._extract_response_text(resp)
+            return re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        except Exception as e:
+            reason, mark = _gw._classify_llm_error(e)
+            if mid and mark:
+                _gw._ep_mark_fail(mid)
+            print(f"⚠️ 角色 {role} 端点 {mid or ep.get('source', '?')} 失败 [{reason}]: {e}")
+            continue
+
+    print(f"❌ 角色 {role} 全部端点均失败")
+    return ""
+
+
+def ask_role_sync(role: str, prompt: str, system_prompt: str = "", temperature: float = 0.7) -> str:
+    """ask_role 的同步包装（供非 async 上下文如 napcat 直接调用）。"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 已在事件循环里（如 napcat 的 ws 回调），用 run_until_complete 会报错；
+            # 起新线程跑完再取结果。
+            import threading as _th
+            box = {}
+            def _runner():
+                _l = asyncio.new_event_loop()
+                try:
+                    box["r"] = _l.run_until_complete(ask_role(role, prompt, system_prompt, temperature))
+                finally:
+                    _l.close()
+            t = _th.Thread(target=_runner)
+            t.start(); t.join()
+            return box.get("r", "")
+    except RuntimeError:
+        pass
+    return asyncio.run(ask_role(role, prompt, system_prompt, temperature))
 
 
 def _get_now_bj() -> datetime.datetime:
