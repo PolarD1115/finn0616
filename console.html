@@ -639,11 +639,13 @@ async function loadOverview(force){
         <span class="code">${esc(x.model||"-")}</span>
         <span class="tag ${x.enabled?"ok":"no"}" style="margin-left:auto">${x.enabled?"可用":"未配置"}</span>
         <span class="tag mute">${esc(x.source||"")}${x.fallback?"·回退":""}</span>${poolTag}</div>`;
-      // 展示每个端点的健康状态（仅多端点时）
+      // 展示每个端点的健康状态（仅多端点时），标注全局轮询序号
       if(pool.length>1){
-        pool.forEach(ep=>{
+        pool.forEach((ep,pi)=>{
           const st2=ep.down?`冷却${ep.cooldown_remaining}s(${ep.fails}次失败)`:"正常";
-          rh+=`<div class="dim-row" style="margin-left:20px;opacity:.8"><span class="name" style="font-size:11px">└</span><span class="code" style="font-size:12px">${esc(ep.model||ep.registry_id||"env")}</span><span class="tag ${ep.down?"warn":"ok"}" style="margin-left:auto;font-size:11px">${st2}</span></div>`;
+          const lbl=ep.label?esc(ep.label):esc(ep.model||ep.registry_id||"env");
+          const epIdx=ep.ep_index||1;
+          rh+=`<div class="dim-row" style="margin-left:20px;opacity:.8"><span class="name" style="font-size:11px">#${pi+1}</span><span class="code" style="font-size:12px">${lbl}</span><span class="tag mute" style="font-size:10px">key${epIdx}</span><span class="tag ${ep.down?"warn":"ok"}" style="margin-left:auto;font-size:11px">${st2}</span></div>`;
         });
       }
     });
@@ -716,8 +718,17 @@ function renderRoles(){
   // compression / background 多选（端点轮询池）
   ["compression","background"].forEach(r=>{
     const poolIds=_roles[r]||[];
-    h+=`<div class="toggle-row"><div class="info"><div class="t">${r} 模型池</div><div class="d">可多选；多端点自动轮询 + 故障转移（断连/安全过滤时自动换 key）</div></div></div>`;
-    h+='<div style="margin-left:18px;margin-bottom:8px">'+(enabled.length?enabled.map(m=>`<label style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:13px"><input type="checkbox" data-role="${r}" ${poolIds.includes(m.id)?"checked":""} onchange="updateMultiRoleCheckbox('${r}',this)" value="${esc(m.id)}" style="width:auto"/> ${esc(m.label)}</label>`).join(""):'<div class="empty">无可用模型</div>')+"</div>";
+    h+=`<div class="toggle-row"><div class="info"><div class="t">${r} 模型池</div><div class="d">勾选顺序 = 轮询顺序；多端点自动轮询 + 故障转移（断连/安全过滤时自动换 key）</div></div></div>`;
+    h+='<div style="margin-left:18px;margin-bottom:8px">'+(enabled.length?enabled.map(m=>{
+      const checked=poolIds.includes(m.id);
+      // 显示该模型在池中的轮询序号（从1开始）；未勾选不显示序号
+      const seqNum=checked?(poolIds.indexOf(m.id)+1):0;
+      const seqBadge=seqNum?`<span class="tag blue" style="font-size:10px;padding:0 5px">#${seqNum}</span>`:'';
+      // 显示 key 数量（主 key + 额外 key）
+      const keyN=1+(m.extra_keys_count||0);
+      const keyBadge=keyN>1?`<span class="tag mute" style="font-size:10px;padding:0 5px">${keyN}key</span>`:'';
+      return `<label style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:13px"><input type="checkbox" data-role="${r}" ${checked?"checked":""} onchange="updateMultiRoleCheckbox('${r}',this)" value="${esc(m.id)}" style="width:auto"/> ${esc(m.label)} ${seqBadge}${keyBadge}</label>`;
+    }).join(""):'<div class="empty">无可用模型</div>')+"</div>";
   });
   document.getElementById("rolesEditor").innerHTML=h;
 }
@@ -753,6 +764,8 @@ function openModelModal(id){
     <label>上游真实模型名</label><input id="mModel" value="${esc(m?m.model:"")}"/>
     <label>Base URL</label><input id="mBase" value="${esc(m?m.base_url:"")}" placeholder="https://api.example.com/v1"/>
     <label>API Key ${m?'（留空=保留旧值）':''}</label><input id="mKey" type="password" placeholder="${m?'已配置（'+esc(m.api_key_masked)+'），留空保留':'sk-...' }"/>
+    <label>额外密钥（同一 Base URL，每行一个 key，自动轮询） ${m&&m.extra_keys_count?'（已配置 '+m.extra_keys_count+' 个，留空=保留旧值）':''}</label>
+    <textarea id="mExtraKeys" rows="3" style="font-family:monospace;font-size:12px" placeholder="${m&&m.extra_keys_count?('已配置 '+m.extra_keys_count+' 个：'+esc((m.extra_keys_masked||[]).join('  '))+'\n留空保留，输入新值会覆盖'):'每行一个 API Key，与上方主 Key 共享 Base URL\n轮询顺序：主Key → 额外Key1 → 额外Key2 …'}"></textarea>
     <label>深度思考 (thinking)</label>
     <div style="display:flex;gap:14px;margin-bottom:4px">
       <label style="display:inline-flex;align-items:center;gap:5px;font-size:13px"><input type="radio" name="mThinking" value="auto" ${(!m||m.thinking==="auto"||!m.thinking)?"checked":""} style="width:auto"/> auto 跟随默认</label>
@@ -768,12 +781,15 @@ function openModelModal(id){
 async function saveModel(id){
   const mid=document.getElementById("mId").value.trim();
   if(!mid){toast("缺少模型 ID","err");return;}
+  const ekRaw=document.getElementById("mExtraKeys").value.trim();
   const body={id:mid,label:document.getElementById("mLabel").value.trim(),
     model:document.getElementById("mModel").value.trim(),
     base_url:document.getElementById("mBase").value.trim(),
     api_key:document.getElementById("mKey").value.trim(),
     enabled:document.getElementById("mEnabled").checked,
     thinking:(document.querySelector('input[name=mThinking]:checked')||{}).value||"auto"};
+  // 额外密钥：文本框有内容时才提交（按行分割），留空=保留旧值
+  if(ekRaw) body.extra_keys=ekRaw.split(/\n/).map(s=>s.trim()).filter(s=>s);
   try{
     const d=await api("/api/models",{method:"POST",body});
     if(d){toast(d.saved?"模型已保存":"保存失败","ok");closeModal();loadModels();}
