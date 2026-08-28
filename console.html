@@ -1257,7 +1257,7 @@ async function walletAllowance(){
   if(amount <= 0){ toast("金额必须大于 0","err"); return; }
   try{
     const r = await fetch(ORIGIN+"/api/wallet/allowance", {
-      method:"POST", headers:headers(true), body:JSON.stringify({amount})
+      method:"POST", headers:authHeaders(true), body:JSON.stringify({amount})
     });
     const d = await r.json();
     if(d.ok){ toast("✅ " + (d.message || "零花钱已发"), "ok"); loadWallet(getSb()); }
@@ -1270,7 +1270,7 @@ async function walletTip(){
   if(amount <= 0){ toast("金额必须大于 0","err"); return; }
   try{
     const r = await fetch(ORIGIN+"/api/wallet/tip", {
-      method:"POST", headers:headers(true), body:JSON.stringify({amount, reason:"打赏"})
+      method:"POST", headers:authHeaders(true), body:JSON.stringify({amount, reason:"打赏"})
     });
     const d = await r.json();
     if(d.ok){ toast("✅ " + (d.message || "打赏已发"), "ok"); loadWallet(getSb()); }
