@@ -478,38 +478,28 @@ async def check_and_summarize_all():
                     f"2. 绝对禁止以'今天'开头！因为这些聊天记录可能跨越了好几天。请扔掉日记格式，直接开门见山地叙述事情"
                     f"（例如直接说：'{user_name}最近在忙...' 或 '我们刚才聊了...'）。"
                 )
-                # 用户要求：总结类一律用聊天模型（main_chat），不用便宜/默认模型
-                client = dep._get_llm_client("compression")  # 总结属压缩类任务
-                if client:
-                    try:
-                        model_name = getattr(client, 'custom_model_name', "abab6.5s-chat")
-                        summary = client.chat.completions.create(
-                            model=model_name,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.7
-                        ).choices[0].message.content.strip()
-                        if hasattr(dep, "_save_memory_to_db"):
-                            dep._save_memory_to_db(
-                                f"📚 全渠道阶段总结", summary, "记事", "温情", "Core_Cognition"
-                            )
-                        # 归档所有旧记录，彻底防止下次重复拉取
-                        dep.supabase.table("memories").update(
-                            {"tags": "Archived_Chat", "importance": 1}
-                        ).in_("id", all_ids_to_archive).execute()
-                        _naplog(f"✅ 全渠道对话总结完成，已归档 {len(all_ids_to_archive)} 条流水")
-                    except Exception as llm_err:
-                        _naplog(f"❌ 统一总结LLM调用失败: {llm_err}")
-                        # 即使LLM调用失败，也把旧记录归档，防止无限重试堆积
-                        dep.supabase.table("memories").update(
-                            {"tags": "Archived_Chat", "importance": 1}
-                        ).in_("id", all_ids_to_archive).execute()
-                        _naplog(f"✅ 虽然总结失败，但已将 {len(all_ids_to_archive)} 条旧记录归档，防止下次继续堆积")
-                else:
-                    _naplog("⚠️ 未配置 CHAT_API_KEY，跳过总结（仅归档旧记录）")
+                # 用户要求：总结类一律走 compression 角色池（带 failover），不用便宜/默认模型
+                try:
+                    summary = dep.ask_role_sync("compression", prompt, temperature=0.7)
+                    if summary and hasattr(dep, "_save_memory_to_db"):
+                        dep._save_memory_to_db(
+                            f"📚 全渠道阶段总结", summary, "记事", "温情", "Core_Cognition"
+                        )
+                    # 归档所有旧记录，彻底防止下次重复拉取
                     dep.supabase.table("memories").update(
                         {"tags": "Archived_Chat", "importance": 1}
                     ).in_("id", all_ids_to_archive).execute()
-                    _naplog(f"✅ 已将 {len(all_ids_to_archive)} 条旧记录归档")
+                    if summary:
+                        _naplog(f"✅ 全渠道对话总结完成，已归档 {len(all_ids_to_archive)} 条流水")
+                    else:
+                        _naplog("⚠️ 总结未产出内容（LLM 未配置或全部端点失败），仅归档旧记录")
+                except Exception as llm_err:
+                    _naplog(f"❌ 统一总结LLM调用失败: {llm_err}")
+                    # 即使LLM调用失败，也把旧记录归档，防止无限重试堆积
+                    dep.supabase.table("memories").update(
+                        {"tags": "Archived_Chat", "importance": 1}
+                    ).in_("id", all_ids_to_archive).execute()
+                    _naplog(f"✅ 虽然总结失败，但已将 {len(all_ids_to_archive)} 条旧记录归档，防止下次继续堆积")
             else:
                 total_count = len(all_chats.data) if all_chats and all_chats.data else 0
                 _naplog(f"📦 全渠道当前对话流水 {total_count} 条，未达{threshold}条总结阈值")

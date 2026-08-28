@@ -110,9 +110,15 @@ def _normalize_registry(reg: dict) -> dict:
     roles = reg.get("roles") if isinstance(reg.get("roles"), dict) else {}
 
     # 归一化每个模型项的 thinking 字段为 auto/on/off（向后兼容旧数据）
+    # 归一化 extra_keys：同一 base_url 下的额外密钥列表（多 key 轮询）
     for _m in models:
         if isinstance(_m, dict):
             _m["thinking"] = _normalize_thinking(_m.get("thinking"))
+            ek = _m.get("extra_keys")
+            if isinstance(ek, list):
+                _m["extra_keys"] = [str(k).strip() for k in ek if str(k).strip()]
+            else:
+                _m["extra_keys"] = []
 
     # 旧 assignments 字段迁移到 roles（仅当 roles.background 未设置时）
     assignments = reg.get("assignments") if isinstance(reg.get("assignments"), dict) else {}
@@ -626,7 +632,13 @@ def _build_openai_client_from_ep(ep: dict):
 
 
 def resolve_llm_pool(role: str) -> list:
-    """返回该角色的有序端点池（每项含 api_key/base_url/model/registry_id/source/fallback/enabled）。
+    """返回该角色的有序端点池（每项含 api_key/base_url/model/registry_id/source/fallback/enabled
+    + ep_key/ep_index/label）。
+
+    多 key 展开：一个模型条目有 api_key + extra_keys[] 时，按 key 顺序展开为多个端点，
+    每个端点共享同一 base_url/model 但用不同 key。ep_key = "model_id#key序号"，
+    健康跟踪按 ep_key 粒度（单个 key 挂了只冷却那一个）。
+
     回退链与 resolve_llm_role 一致；注册表命中时返回多条（端点池），非注册表回退时长度为 1（或 0）。
     """
     role = (role or "chat").strip()
@@ -649,19 +661,38 @@ def resolve_llm_pool(role: str) -> list:
         else:
             cand_ids = []
 
+    def _expand_model(m, fallback=False):
+        """把一个注册表模型条目展开为端点列表（主 key + extra_keys）。"""
+        rid = m.get("id", "")
+        model = str(m.get("model", "")).strip() or rid
+        base_url = str(m.get("base_url", "")).strip()
+        label = m.get("label", rid)
+        # 收集该模型的所有 key：主 key 在前，extra_keys 在后
+        keys = [str(m.get("api_key", "")).strip()]
+        keys += [str(k).strip() for k in (m.get("extra_keys") or []) if str(k).strip()]
+        eps = []
+        for ki, k in enumerate(keys):
+            if not k:
+                continue
+            eps.append({
+                "api_key": k,
+                "base_url": base_url,
+                "model": model,
+                "registry_id": rid,
+                "source": "registry",
+                "fallback": fallback,
+                "enabled": True,
+                "ep_key": f"{rid}#{ki+1}",       # 健康跟踪键（模型#key序号）
+                "ep_index": ki + 1,               # 该模型内的 key 序号（1 起）
+                "label": label,
+            })
+        return eps
+
     pool = []
     for rid in cand_ids:
         m = _find_enabled_model(reg, rid)
         if m:
-            pool.append({
-                "api_key": str(m.get("api_key", "")).strip(),
-                "base_url": str(m.get("base_url", "")).strip(),
-                "model": str(m.get("model", "")).strip() or m.get("id", ""),
-                "registry_id": m.get("id", ""),
-                "source": "registry",
-                "fallback": False,
-                "enabled": True,
-            })
+            pool.extend(_expand_model(m))
     if pool:
         return pool
 
@@ -669,23 +700,22 @@ def resolve_llm_pool(role: str) -> list:
     cd = roles.get("chat_default") or reg.get("default")
     m = _find_enabled_model(reg, cd) if cd else None
     if m:
-        return [{
-            "api_key": str(m.get("api_key", "")).strip(),
-            "base_url": str(m.get("base_url", "")).strip(),
-            "model": str(m.get("model", "")).strip() or m.get("id", ""),
-            "registry_id": m.get("id", ""),
-            "source": "registry",
-            "fallback": True,
-            "enabled": True,
-        }]
+        return _expand_model(m, fallback=True)
 
-    # 3-5) 复用 resolve_llm_role 的 llm_settings / env / default 回退（单元素池）
+    # 3-5) 复用 resolve_llm_role 的 llm_settings / env / default 回退（单元素池，无 ep_key）
     r = resolve_llm_role(role)
-    return [r] if (r.get("enabled") and r.get("api_key")) else []
+    if r.get("enabled") and r.get("api_key"):
+        r["ep_key"] = ""
+        r["ep_index"] = 1
+        r["label"] = ""
+        return [r]
+    return []
 
 
 def pick_role_endpoint(role: str) -> dict | None:
-    """round-robin 挑下一个健康端点（跳过冷却中的）；全部冷却时返回最早到期的（兜底，避免饿死）。"""
+    """round-robin 挑下一个健康端点（跳过冷却中的）；全部冷却时返回最早到期的（兜底，避免饿死）。
+    健康跟踪按 ep_key（模型#key序号）粒度：单个 key 挂了只冷却那一个。
+    """
     pool = resolve_llm_pool(role)
     if not pool:
         return None
@@ -695,11 +725,11 @@ def pick_role_endpoint(role: str) -> dict | None:
         _EP_CURSOR[role] = (start + 1) % n
     order = [(start + i) % n for i in range(n)]
     healthy = [pool[i] for i in order
-               if not (pool[i].get("registry_id") and _ep_is_down(pool[i]["registry_id"]))]
+               if not (pool[i].get("ep_key") and _ep_is_down(pool[i]["ep_key"]))]
     if healthy:
         return healthy[0]
     # 全冷却：返回最早到期的
-    return min(pool, key=lambda e: _ep_health(e.get("registry_id", ""))["cooldown_until"])
+    return min(pool, key=lambda e: _ep_health(e.get("ep_key", ""))["cooldown_until"])
 
 
 def _extract_response_text(resp) -> str:
@@ -815,7 +845,7 @@ def _role_client(role: str):
         return (None, ep.get("model", ""))
     client.custom_model_name = ep["model"]
     client.role_source = ep["source"]        # 便于日志/调试
-    client.ep_id = ep.get("registry_id", "")  # 调用方上报健康用
+    client.ep_id = ep.get("ep_key", "")      # 健康跟踪键（模型#key序号），调用方上报健康用
     client.ep_role = role
     return (client, ep["model"])
 
@@ -2745,6 +2775,9 @@ class HostFixMiddleware:
                     "model": m.get("model", ""),
                     "enabled": m.get("enabled", True),
                     "thinking": m.get("thinking", "auto"),
+                    # 额外密钥（脱敏）：同一 base_url 下的多 key 轮询
+                    "extra_keys_masked": [_mask_key(k) for k in (m.get("extra_keys") or [])],
+                    "extra_keys_count": len(m.get("extra_keys") or []),
                     # 当前承担的身份（便于前端展示"当前身份"列）
                     "roles": [r for r, v in {
                         "chat": mid in (roles.get("chat") or []),
@@ -2913,6 +2946,18 @@ class HostFixMiddleware:
 
             reg = _load_llm_registry()
             existing = next((m for m in reg["models"] if m.get("id") == mid), None)
+            # extra_keys：同一 base_url 下的额外密钥列表（每行一个 key）
+            raw_ek = payload.get("extra_keys")
+            if raw_ek is not None:
+                if isinstance(raw_ek, list):
+                    extra_keys = [str(k).strip() for k in raw_ek if str(k).strip()]
+                elif isinstance(raw_ek, str):
+                    # 前端可能用换行分隔的文本框传
+                    extra_keys = [k.strip() for k in raw_ek.splitlines() if k.strip()]
+                else:
+                    extra_keys = []
+            else:
+                extra_keys = (existing.get("extra_keys", []) if existing else [])
             entry = {
                 "id": mid,
                 "label": str(payload.get("label", "")).strip() or (existing.get("label") if existing else mid),
@@ -2920,6 +2965,7 @@ class HostFixMiddleware:
                 "model": real_model,
                 "enabled": bool(payload.get("enabled", existing.get("enabled", True) if existing else True)),
                 "thinking": _normalize_thinking(payload.get("thinking", existing.get("thinking", "auto") if existing else "auto")),
+                "extra_keys": extra_keys,
             }
             # 禁用模型时检查角色占用：禁止禁用仍被角色使用的模型
             if existing and existing.get("enabled", True) and not entry["enabled"]:
@@ -2957,7 +3003,8 @@ class HostFixMiddleware:
             ok = _save_llm_registry(reg)
             await _send_json_resp(send, 200 if ok else 500, {
                 "ok": ok,
-                "saved": {**entry, "api_key": _mask_key(entry["api_key"])},
+                "saved": {**entry, "api_key": _mask_key(entry["api_key"]),
+                          "extra_keys_masked": [_mask_key(k) for k in entry.get("extra_keys", [])]},
                 "default": reg.get("default", ""),
             })
             return
@@ -3268,19 +3315,23 @@ class HostFixMiddleware:
                     "has_key": bool(r["api_key"]),
                 }
                 # 多端点池 + 每个端点的健康状态（冷却/失败计数）
+                # 按 ep_key（模型#key序号）粒度跟踪健康：单个 key 挂了只冷却那一个
                 pool = resolve_llm_pool(role)
                 ep_list = []
                 for ep in pool:
-                    mid = ep.get("registry_id", "")
-                    h = _ep_health(mid)
+                    ek = ep.get("ep_key", "")
+                    h = _ep_health(ek)
                     ep_list.append({
                         "model": ep.get("model", ""),
-                        "registry_id": mid,
+                        "registry_id": ep.get("registry_id", ""),
+                        "label": ep.get("label", ""),
+                        "ep_index": ep.get("ep_index", 1),  # 该模型内的 key 序号（1 起）
+                        "ep_key": ek,                       # 健康跟踪键
                         "source": ep.get("source", ""),
                         "fallback": ep.get("fallback", False),
                         "fails": h["fails"],
                         "cooldown_remaining": max(0, int(h["cooldown_until"] - time.time())),
-                        "down": _ep_is_down(mid),
+                        "down": _ep_is_down(ek),
                     })
                 roles_status[role]["pool"] = ep_list
                 roles_status[role]["pool_size"] = len(ep_list)

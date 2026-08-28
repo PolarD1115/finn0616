@@ -91,6 +91,16 @@ def _split_telegram_bubbles(text: str) -> list[str]:
     return bubbles
 
 
+async def _ask_bg_role(_client, prompt, **kwargs):
+    """tool_loop ask_llm 适配器：忽略旧 client 参数，改走 background 角色池 failover。
+
+    旧版工具循环把 LLM 客户端作为第一个参数传给 ask_llm；迁移到 ask_role 后，
+    客户端由角色池内部解析，这里丢弃旧 client，统一用 background 角色调用。
+    """
+    from server import ask_role
+    return await ask_role("background", prompt, **kwargs)
+
+
 # ==========================================
 # 1. 自主生命循环 (主动问候)
 # ==========================================
@@ -103,7 +113,7 @@ async def async_autonomous_life():
     """
     # 延迟导入，避免循环依赖
     from server import (
-        _get_llm_client, _ask_llm_async, _push_wechat,
+        _get_llm_client, _ask_llm_async, ask_role, _push_wechat,
         _save_memory_to_db, _get_now_bj,
         supabase, _build_channel_context
     )
@@ -139,10 +149,6 @@ async def async_autonomous_life():
         await asyncio.sleep(interval + wake_jitter)
 
         try:
-            client = _get_llm_client("background")  # 主动问候属后台活动角色
-            if not client:
-                continue
-
             now_bj = _get_now_bj()
             idle_hours = await asyncio.to_thread(_hours_since_last_interaction)
             idle_desc = f"距上次聊天约 {idle_hours} 小时" if idle_hours is not None else "最近互动时间未知"
@@ -175,7 +181,7 @@ async def async_autonomous_life():
             只输出一行 JSON，不要多余文字：
             {{"send": true 或 false, "reason": "简短理由", "message": "若send为true，这里是要发的原话；否则留空"}}
             """
-            raw = await _ask_llm_async(client, decide_prompt, system_prompt=system_ctx, temperature=0.85)
+            raw = await ask_role("background", decide_prompt, system_prompt=system_ctx, temperature=0.85)
 
             decision = _parse_decision_json(raw)
             if not decision.get("send"):
@@ -211,7 +217,7 @@ async def _perform_deep_dreaming():
     全程异常隔离，失败只记日志，不影响主流程。
     """
     from server import (
-        _get_llm_client, _ask_llm_async, _save_memory_to_db,
+        _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
         _send_email_helper, _get_now_bj, supabase, MemoryType
     )
 
@@ -248,12 +254,6 @@ async def _perform_deep_dreaming():
         if len(context) > 80000:
             context = context[-80000:]
 
-        # 获取压缩角色模型客户端（日记属压缩类任务：阶段总结/历史压缩/日记压缩）
-        client = _get_llm_client("compression")
-        if not client:
-            print("⚠️ 未配置 CHAT_API_KEY，日记生成跳过（LLM 客户端缺失）。")
-            return
-
         # 步骤1：生成每日日记（第一人称视角）
         prompt_summary = (
             f"{context}\n\n"
@@ -261,7 +261,7 @@ async def _perform_deep_dreaming():
             f"⚠️严重警告：必须严格区分清楚【{AI_NAME}(我)】和【{USER_NAME}(对方)】各自说了什么、做了什么，"
             f"绝对不能张冠李戴搞混主语！直接输出纯文本，勿加前言后语及格式符号。"
         )
-        summary = await _ask_llm_async(client, prompt_summary, temperature=0.7)
+        summary = await ask_role("compression", prompt_summary, temperature=0.7)
 
         if summary:
             await asyncio.to_thread(
@@ -295,8 +295,8 @@ async def _perform_deep_dreaming():
                 )
                 if week_res.data and len(week_res.data) >= 3:
                     week_context = "\n".join([f"- {w['content']}" for w in week_res.data])
-                    week_summary = await _ask_llm_async(
-                        client,
+                    week_summary = await ask_role(
+                        "compression",
                         f"【本周每日日记】:\n{week_context}\n\n请将这周的日记提炼成一篇深度的周度长期记忆总结。纯文本输出。",
                         temperature=0.7
                     )
@@ -320,8 +320,8 @@ async def _perform_deep_dreaming():
                 )
                 if month_res.data:
                     month_context = "\n".join([f"- {m['content']}" for m in month_res.data])
-                    month_summary = await _ask_llm_async(
-                        client,
+                    month_summary = await ask_role(
+                        "compression",
                         f"【本月周度记忆】:\n{month_context}\n\n请以【{AI_NAME}】的第一人称视角，提炼本月的核心大事件与情感走向，生成一篇月度回忆录。纯文本输出。",
                         temperature=0.7
                     )
@@ -347,8 +347,8 @@ async def _perform_deep_dreaming():
                 )
                 if year_res.data:
                     year_context = "\n".join([f"- {y['content']}" for y in year_res.data])
-                    year_summary = await _ask_llm_async(
-                        client,
+                    year_summary = await ask_role(
+                        "compression",
                         f"【本年度月度记忆】:\n{year_context}\n\n请总结这一年的点点滴滴，写一篇年度回忆录。纯文本输出。",
                         temperature=0.7
                     )
@@ -401,7 +401,7 @@ async def async_free_activity():
     做完写一条行动日志留档。带防连续重复机制（连续两轮做同一件事会被强制换）。
     """
     from server import (
-        _get_llm_client, _ask_llm_async, _save_memory_to_db,
+        _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
         _get_now_bj, supabase, _push_wechat,
         _build_channel_context
     )
@@ -456,10 +456,6 @@ async def async_free_activity():
         await asyncio.sleep(sleep_secs)
 
         try:
-            client = _get_llm_client("background")
-            if not client:
-                continue
-
             now_bj = _get_now_bj()
 
             # 🐱 自由活动猫状态检查（3 轮规则）：
@@ -538,8 +534,8 @@ async def async_free_activity():
             #   + JSON Schema 参数校验 + 单轮上限 + 错误隔离 + 固定身份注入。
             import tool_loop
             _fa_result = await tool_loop.run_free_activity_tool_loop(
-                client=client,
-                ask_llm=_ask_llm_async,
+                client=None,
+                ask_llm=_ask_bg_role,
                 system_ctx=system_ctx,
                 now_bj=now_bj,
                 avoid=avoid,
@@ -863,7 +859,7 @@ async def async_telegram_polling():
 
 async def async_message_summarizer():
     """定期汇总数据库中未处理的消息，避免打扰用户。"""
-    from server import _get_llm_client, _ask_llm_async, _push_wechat, _save_memory_to_db, supabase
+    from server import _get_llm_client, _ask_llm_async, ask_role, _push_wechat, _save_memory_to_db, supabase
 
     print("📋 消息总结器已上线...")
     # 总结间隔（秒），默认半小时
@@ -874,9 +870,6 @@ async def async_message_summarizer():
         if not supabase:
             continue
         # 消息总结属压缩类任务，统一走 compression 角色
-        client = _get_llm_client("compression")
-        if not client:
-            continue
         try:
             # 查出所有未总结的消息
             res = await asyncio.to_thread(
@@ -901,7 +894,7 @@ async def async_message_summarizer():
 
                 请用简洁的口吻总结重点 (150 字以内)。如果没有重要的事，告诉用户一切正常。
                 """
-                summary = await _ask_llm_async(client, prompt, temperature=0.7)
+                summary = await ask_role("compression", prompt, temperature=0.7)
 
                 if summary:
                     await asyncio.to_thread(_push_wechat, summary, "📋 消息总结")
@@ -924,7 +917,7 @@ async def async_message_summarizer():
 async def async_reminder_worker():
     """每分钟巡视数据库 reminders 表，到点就触发。"""
     from server import (
-        _get_llm_client, _ask_llm_async, _push_wechat, _save_memory_to_db,
+        _get_llm_client, _ask_llm_async, ask_role, _push_wechat, _save_memory_to_db,
         _get_now_bj, _get_current_persona, get_latest_diary, where_is_user, supabase
     )
 
@@ -952,23 +945,21 @@ async def async_reminder_worker():
                             final_push_text = raw_msg
 
                             # 尝试用 LLM 生成更自然的提醒文案（提醒属后台活动角色）
-                            client = _get_llm_client("background")
-                            if client:
-                                try:
-                                    curr_persona = _get_current_persona()
-                                    prompt = f"""
-                                    时间: {t_str}
-                                    需提醒内容: 【{raw_msg}】
-                                    当前人设: {curr_persona}
+                            try:
+                                curr_persona = _get_current_persona()
+                                prompt = f"""
+                                时间: {t_str}
+                                需提醒内容: 【{raw_msg}】
+                                当前人设: {curr_persona}
 
-                                    请用符合人设的口吻发一条提醒。自然真诚，不要提"闹钟/定时"。
-                                    纯文本输出。
-                                    """
-                                    ai_msg = await _ask_llm_async(client, prompt, temperature=0.85)
-                                    if ai_msg:
-                                        final_push_text = ai_msg
-                                except Exception as ai_e:
-                                    print(f"❌ 提醒 AI 生成失败，使用兜底文案: {ai_e}")
+                                请用符合人设的口吻发一条提醒。自然真诚，不要提"闹钟/定时"。
+                                纯文本输出。
+                                """
+                                ai_msg = await ask_role("background", prompt, temperature=0.85)
+                                if ai_msg:
+                                    final_push_text = ai_msg
+                            except Exception as ai_e:
+                                print(f"❌ 提醒 AI 生成失败，使用兜底文案: {ai_e}")
 
                             await asyncio.to_thread(_push_wechat, final_push_text, "🔔 提醒")
                             await asyncio.to_thread(
@@ -1248,19 +1239,13 @@ async def _try_pet_care(event_type: str, now_bj):
                 "skipped_cooldown": True}
 
     try:
-        from server import _get_llm_client, _ask_llm_async, _save_memory_to_db, _build_channel_context
+        from server import _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db, _build_channel_context
         import tool_loop
-
-        client = _get_llm_client("background")
-        if not client:
-            print(f"🐱 [宠物照料] 无 LLM 客户端，跳过")
-            return {"ran": False, "care_effective": False, "cat_status_ok": False,
-                    "skipped_cooldown": False}
 
         system_ctx = await _build_channel_context("小满需要照顾，去看看它", channel_tag="TG_MSG", source="background_heartbeat")
         care_result = await tool_loop.run_pet_care_tool_loop(
-            client=client,
-            ask_llm=_ask_llm_async,
+            client=None,
+            ask_llm=_ask_bg_role,
             system_ctx=system_ctx,
             now_bj=now_bj,
             event_type=event_type,
@@ -1450,7 +1435,7 @@ async def async_home_autonomy_tick():
       0=关 1=只读 2=+信件便利贴 3=+种植烹饪 4=+基础生活
     """
     from server import (
-        _get_llm_client, _ask_llm_async, _save_memory_to_db,
+        _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
         _get_now_bj, _build_channel_context
     )
     import tool_loop
@@ -1465,18 +1450,14 @@ async def async_home_autonomy_tick():
     while True:
         await asyncio.sleep(interval)
         try:
-            client = _get_llm_client("background")
-            if not client:
-                continue
-
             now_bj = _get_now_bj()
             system_ctx = await _build_channel_context(
                 "家庭自主生活观察", channel_tag="TG_MSG", source="home_autonomy"
             )
 
             result = await tool_loop.run_home_autonomy_tool_loop(
-                client=client,
-                ask_llm=_ask_llm_async,
+                client=None,
+                ask_llm=_ask_bg_role,
                 system_ctx=system_ctx,
                 now_bj=now_bj,
             )

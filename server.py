@@ -540,14 +540,16 @@ async def ask_role(role: str, prompt: str, system_prompt: str = "", temperature:
 
     for i in range(n):
         ep = pool[(start + i) % n]
-        mid = ep.get("registry_id", "")
+        epk = ep.get("ep_key", "")
         # 跳过冷却中的（最后一次兜底尝试除外 —— 全冷却时仍试最早到期的）
-        if i < n - 1 and mid and _gw._ep_is_down(mid):
+        if i < n - 1 and epk and _gw._ep_is_down(epk):
             continue
         client = _gw._build_openai_client_from_ep(ep)
         if client is None:
             continue
         model_name = ep.get("model", "")
+        ep_label = ep.get("label", "") or ep.get("registry_id", "")
+        ep_idx = ep.get("ep_index", 1)
 
         def _call():
             return client.chat.completions.create(model=model_name, messages=messages, temperature=temperature)
@@ -556,12 +558,12 @@ async def ask_role(role: str, prompt: str, system_prompt: str = "", temperature:
             resp = await asyncio.to_thread(_call)
             # 安全过滤拦截（Gemini sensitive words / Claude refusal / OpenAI content_filter）→ 换 key 重试
             if _gw._is_refusal_response(resp):
-                if mid:
-                    _gw._ep_mark_fail(mid)
-                    print(f"⚠️ 角色 {role} 端点 {mid} 安全过滤拦截，切换下一个端点")
+                if epk:
+                    _gw._ep_mark_fail(epk)
+                    print(f"⚠️ 角色 {role} 端点 {ep_label}#{ep_idx} 安全过滤拦截，切换下一个端点")
                 continue
-            if mid:
-                _gw._ep_mark_ok(mid)
+            if epk:
+                _gw._ep_mark_ok(epk)
             try:
                 if not resp.choices:
                     return ""
@@ -571,9 +573,9 @@ async def ask_role(role: str, prompt: str, system_prompt: str = "", temperature:
             return re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
         except Exception as e:
             reason, mark = _gw._classify_llm_error(e)
-            if mid and mark:
-                _gw._ep_mark_fail(mid)
-            print(f"⚠️ 角色 {role} 端点 {mid or ep.get('source', '?')} 失败 [{reason}]: {e}")
+            if epk and mark:
+                _gw._ep_mark_fail(epk)
+            print(f"⚠️ 角色 {role} 端点 {ep_label}#{ep_idx} 失败 [{reason}]: {e}")
             continue
 
     print(f"❌ 角色 {role} 全部端点均失败")
