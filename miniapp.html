@@ -337,6 +337,7 @@ th,td{padding:10px 9px;}
       <a data-p="profile"><i data-lucide="user"></i>用户画像</a>
       <a data-p="storage"><i data-lucide="save"></i>上下文与存储</a>
       <a data-p="ticks"><i data-lucide="paw-print"></i>状态面板</a>
+      <a data-p="prompts"><i data-lucide="scroll-text"></i>注入提示词</a>
     </nav>
     <div class="foot">v5.0 · Mini App</div>
   </aside>
@@ -571,6 +572,15 @@ th,td{padding:10px 9px;}
           <div id="houseDiary"></div>
         </div>
       </section>
+
+      <!-- ===== 注入提示词（最新5条） ===== -->
+      <section class="page" id="p-prompts">
+        <div class="card">
+          <h3><i data-lucide="scroll-text" style="width:16px;height:16px"></i>注入提示词快照 <span class="sub">最近5轮 · volatile_block</span>
+            <button class="ghost" style="float:right" onclick="loadPrompts()"><i data-lucide="refresh-cw"></i>刷新</button></h3>
+          <div id="promptList"></div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -585,7 +595,7 @@ th,td{padding:10px 9px;}
  * ============================================================ */
 const IS_FILE_PROTOCOL = location.protocol === "file:";
 const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
-const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板"};
+const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
@@ -650,7 +660,7 @@ function showPage(name){
   document.querySelector(".topbar").classList.remove("config-open");
   const sbWrap=document.getElementById("sbConfigWrap");
   if(sbWrap)sbWrap.classList.toggle("mobile-visible",name==="ticks");
-  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus};
+  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts};
   if(loaders[name])loaders[name]();
   // 自动刷新
   if(name==="ticks"){
@@ -1089,6 +1099,34 @@ async function loadDiary(force){
        <span class="info">${(diaryPage-1)*diarySize+1}-${Math.min(diaryPage*diarySize,d.total)} / ${d.total}</span>`;
     refreshIcons();
   }catch(e){document.getElementById("diaryList").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+}
+
+/* ============ 注入提示词快照（最近5轮 volatile_block） ============ */
+async function loadPrompts(){
+  const box=document.getElementById("promptList");
+  box.innerHTML='<div class="empty">加载中…</div>';
+  try{
+    const d=await api("/api/prompts");
+    if(!d)return;
+    const list=d.items||[];
+    if(!list.length){box.innerHTML='<div class="empty"><i data-lucide="scroll-text"></i><br>暂无注入记录<br><span style="font-size:12px">发起一次对话后点刷新查看</span></div>';refreshIcons();return;}
+    box.innerHTML=list.map((p,idx)=>{
+      const st=p.stats||{};
+      const chips=[
+        "volatile "+(st.volatile_total||0)+"字",
+        "Pinecone "+(st.pinecone||0)+"字",
+        "设备快照 "+(st.device_snapshot||0)+"字",
+        "上文 "+(st.history_msgs||0)+"条",
+      ].map(c=>`<span class="tag mute" style="margin:2px">${esc(c)}</span>`).join("");
+      return `<div class="item">
+        <div class="meta"><span>#${idx+1} · ${esc(p.channel||"—")} · ${esc(p.model||"—")}</span><span>${esc(p.ts||"—")}</span></div>
+        <div class="body" style="margin-top:4px"><b>用户消息：</b>${esc(p.user_preview||"（空）")}</div>
+        <div style="margin:6px 0">${chips}</div>
+        <pre style="white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:12px;line-height:1.5;max-height:420px;overflow:auto;background:rgba(128,128,128,.1);padding:10px;border-radius:6px;margin-top:6px">${esc(p.volatile_block||"")}</pre>
+      </div>`;
+    }).join("");
+    refreshIcons();
+  }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
 }
 async function openDiaryModal(id){
   let m;

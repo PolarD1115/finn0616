@@ -39,6 +39,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 _supabase_client = None
 _system_logs_buffer = []   # 简易日志缓存（用于 /api/logs）
 _MAX_LOGS = 200
+_injected_prompts_buffer = []   # 最近注入的 volatile_block 快照（供 /api/prompts，只留最新5条）
+_MAX_INJECTED_PROMPTS = 5
 
 
 def _log(msg: str):
@@ -48,6 +50,16 @@ def _log(msg: str):
     _system_logs_buffer.append(line)
     if len(_system_logs_buffer) > _MAX_LOGS:
         del _system_logs_buffer[: len(_system_logs_buffer) - _MAX_LOGS]
+
+
+def _capture_injected_prompt(rec: dict):
+    """记录最近一次注入的 volatile_block 快照（只留最新 N 条，供 /api/prompts 调试面板查看）。"""
+    try:
+        _injected_prompts_buffer.append(rec)
+        if len(_injected_prompts_buffer) > _MAX_INJECTED_PROMPTS:
+            del _injected_prompts_buffer[: len(_injected_prompts_buffer) - _MAX_INJECTED_PROMPTS]
+    except Exception:
+        pass
 
 
 def _get_supabase():
@@ -1720,6 +1732,11 @@ class HostFixMiddleware:
             await self._handle_logs(send)
             return
 
+        # ---------- 📝 注入提示词快照（最近5条，调试用） ----------
+        if scope["path"] == "/api/prompts":
+            await self._handle_prompts_api(send)
+            return
+
         # ---------- 🎛️ 多模型管理接口 ----------
         if scope["path"] == "/api/models":
             await self._handle_models_api(scope, receive, send)
@@ -2465,6 +2482,24 @@ class HostFixMiddleware:
         _summ_tag = "跳过" if _skip_core_summaries else f"{len(core_summaries)}字"
         _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{_summ_tag} + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
 
+        # 📝 记录本轮注入的 volatile_block 快照（供 /api/prompts 调试面板查看，只留最新5条）
+        try:
+            _capture_injected_prompt({
+                "ts": now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+                "channel": channel_display,
+                "model": str(req_data.get("model", "")),
+                "user_preview": (current_query or "")[:300],
+                "volatile_block": volatile_block,
+                "stats": {
+                    "volatile_total": len(volatile_block),
+                    "pinecone": len(pinecone_context or ""),
+                    "device_snapshot": len(device_snapshot or ""),
+                    "history_msgs": len(history_msgs),
+                },
+            })
+        except Exception:
+            pass
+
     # ------------------------------------------
     # 🌤️ 天气 tools 循环（OpenAI function calling，可选）
     # ------------------------------------------
@@ -2759,6 +2794,14 @@ class HostFixMiddleware:
     async def _handle_logs(self, send):
         try:
             await _send_json_resp(send, 200, {"logs": "\n".join(_system_logs_buffer[-100:])})
+        except Exception as e:
+            await _send_json_resp(send, 500, {"error": str(e)})
+
+    async def _handle_prompts_api(self, send):
+        """返回最近注入的 volatile_block 快照（只读，最新在前，最多5条）。"""
+        try:
+            items = list(reversed(_injected_prompts_buffer))  # 最新在前
+            await _send_json_resp(send, 200, {"items": items, "total": len(items)})
         except Exception as e:
             await _send_json_resp(send, 500, {"error": str(e)})
 
