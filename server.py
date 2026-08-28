@@ -1058,6 +1058,15 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
+    # 📅 日程注入：QQ/TG 渠道也注入近期日历
+    try:
+        if os.environ.get("CALENDAR_INJECT", "true").strip().lower() == "true":
+            _sched = await asyncio.wait_for(fetch_schedule_for_injection(), timeout=8)
+            if _sched:
+                volatile_parts.append(_sched)
+    except Exception:
+        pass
+
     parts = stable_parts + volatile_parts
 
     # Feed injection statistics into the shared gateway buffer without logging private context.
@@ -1747,6 +1756,111 @@ async def modify_calendar_event(event_id: str, action: str, new_summary: str = "
         return await asyncio.to_thread(_mod)
     except Exception as e:
         return f"❌ 操作失败: {e}"
+
+
+# ==========================================
+# 📅 日程 Prompt 注入（供 gateway._inject_context / _build_channel_context 调用）
+#    查询 [now - N天, now + M天] 范围的日历事件，格式化后注入 volatile_block，
+#    让 LLM 在事件前后持续感知到日程存在。默认窗口 7+7=14 天。
+# ==========================================
+_sched_cache = {"text": None, "ts": 0}
+_SCHED_CACHE_TTL = 300  # 5 分钟内存缓存，避免每次请求都调 Google API
+
+
+async def fetch_schedule_for_injection():
+    """查询 [now-before, now+after] 范围的日历事件，返回格式化文本供 prompt 注入。
+    无事件 / 未配置 / 查询失败时返回 None（静默降级，不影响正常聊天）。"""
+    if not os.environ.get("GOOGLE_USER_TOKEN_JSON"):
+        return None
+
+    if os.environ.get("CALENDAR_INJECT", "true").strip().lower() != "true":
+        return None
+
+    # 缓存命中
+    now_ts = time.time()
+    if _sched_cache["text"] is not None and (now_ts - _sched_cache["ts"]) < _SCHED_CACHE_TTL:
+        return _sched_cache["text"]
+
+    days_before = int(os.environ.get("CALENDAR_INJECT_DAYS_BEFORE", "7"))
+    days_after = int(os.environ.get("CALENDAR_INJECT_DAYS_AFTER", "7"))
+
+    now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    time_min = (now_bj - datetime.timedelta(days=days_before)).replace(
+        hour=0, minute=0, second=0, microsecond=0).isoformat() + "+08:00"
+    time_max = (now_bj + datetime.timedelta(days=days_after)).replace(
+        hour=23, minute=59, second=59, microsecond=0).isoformat() + "+08:00"
+
+    try:
+        def _fetch():
+            service = _get_calendar_service()
+            return service.events().list(
+                calendarId=TARGET_CALENDAR_ID,
+                timeMin=time_min, timeMax=time_max,
+                singleEvents=True, orderBy='startTime',
+                timeZone='Asia/Shanghai'
+            ).execute().get('items', [])
+
+        events = await asyncio.to_thread(_fetch)
+    except Exception:
+        return None  # 查询失败静默降级
+
+    if not events:
+        _sched_cache["text"] = None
+        _sched_cache["ts"] = now_ts
+        return None
+
+    # 格式化
+    today_date = now_bj.date()
+    lines = ["📅 近期日程提醒（请适时关心/提醒用户）："]
+    for e in events:
+        raw_dt = e['start'].get('dateTime')
+        is_all_day = False
+        if raw_dt:
+            dt_start = datetime.datetime.fromisoformat(raw_dt.replace('Z', '+00:00'))
+            if dt_start.tzinfo is None:
+                dt_start = dt_start.replace(tzinfo=datetime.timezone.utc)
+            dt_bj = dt_start.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+        else:
+            # 全天事件（date 字段，格式 YYYY-MM-DD）
+            raw_date = e['start'].get('date')
+            if not raw_date:
+                continue
+            dt_bj = datetime.datetime.strptime(raw_date, '%Y-%m-%d').replace(
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+            is_all_day = True
+
+        event_date = dt_bj.date()
+        delta_days = (event_date - today_date).days
+        if delta_days == 0:
+            day_label = "今天"
+        elif delta_days == 1:
+            day_label = "明天"
+        elif delta_days == 2:
+            day_label = "后天"
+        elif delta_days > 2:
+            day_label = f"{delta_days}天后"
+        elif delta_days == -1:
+            day_label = "昨天"
+        elif delta_days == -2:
+            day_label = "前天"
+        else:
+            day_label = f"{abs(delta_days)}天前"
+
+        date_str = dt_bj.strftime('%m-%d')
+        time_str = "全天" if is_all_day else dt_bj.strftime('%H:%M')
+        suffix = ""
+        if not is_all_day and dt_bj < now_bj:
+            suffix = "（已结束）"
+        elif is_all_day and delta_days < 0:
+            suffix = "（已结束）"
+
+        summary = e.get('summary', '未知')
+        lines.append(f"🔹 {date_str} ({day_label}) {time_str} - {summary}{suffix}")
+
+    result = "\n".join(lines)
+    _sched_cache["text"] = result
+    _sched_cache["ts"] = now_ts
+    return result
 
 
 # ==========================================

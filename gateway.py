@@ -2411,6 +2411,17 @@ class HostFixMiddleware:
             except Exception as e:
                 _log(f"⚠️ [Weather] 关键词天气注入失败: {e}")
 
+        # 📅 日程注入：查询 [now-7d, now+7d] 的日历事件，注入 volatile_block
+        if os.environ.get("CALENDAR_INJECT", "true").strip().lower() == "true":
+            try:
+                from server import fetch_schedule_for_injection
+                _sched = await asyncio.wait_for(fetch_schedule_for_injection(), timeout=8)
+                if _sched:
+                    volatile_block += f"\n{_sched}"
+                    _log(f"📅 [Calendar] 日程已注入上下文")
+            except Exception as e:
+                _log(f"⚠️ [Calendar] 日程注入失败: {e}")
+
         # ① 注入稳定前缀到 system：已有 system 就「前置」拼接（保证稳定内容仍在最前，
         #    维持缓存前缀不被前端自带 system 内容顶开），没有就插入到最前。
         has_system = False
