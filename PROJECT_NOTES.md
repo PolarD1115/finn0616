@@ -2625,3 +2625,86 @@ PROJECT_NOTES.md, VARIABLES.md, README.md, AGENT_HANDOFF_HOME_SYSTEM.md, home/mo
 ### 16. 最终验收结论
 Home Runtime Phase 1–8 的数据模型、显式生活工具和主要数据库事务已经实现，既有规则完成了静态审计及相关单元测试，旧聊天、宠物、钱包与后台系统保持兼容。新 Home Runtime 尚未接入旧后台自由活动，因此当前属于"显式工具可用"，不是"AI 已在后台自主使用新生活系统"。种植、收获、库存、烹饪、食用、喂食及异步表达等真实数据库写链因缺少隔离测试环境，尚未完成端到端验收。完整测试套件仍存在已知失败，项目不能表述为全部测试通过或生产闭环全部验证。
 
+---
+
+# Phase 6 — 低成本共同经历与 AI 行为记忆
+
+共同经历是结构化事实摘要，不是历史回复样本。
+AI 回复只作为事实提取来源，不作为风格样本。
+
+### 1. 为什么新增该阶段
+Phase 3–5 已隔离旧 assistant 混合向量、清洗 reasoning、统一 user-only 写入，但缺少"AI 和用户共同经历过什么 / AI 帮过什么 / 约定过什么 / 还有什么没做完"这类结构化长期记忆。用户额度紧张，需用尽可能少的 LLM 调用把对话提炼成短事实，只把提炼后的事实写入长期记忆，不把 AI 原始回复写入 Pinecone。
+
+### 2. 成本策略：批量而非每轮
+- 不允许每轮聊天额外调用 LLM 做记忆提取 → 本阶段不每轮调用。
+- 不允许每条消息调用 embedding 以外的新模型 → 本阶段无新模型。
+- 复用现有 `napcat.check_and_summarize_all()` 的 30 条批量总结触发点（网页渠道 `gateway.py` + QQ 渠道 `napcat.py` 都会触发）。
+- 采用方案 A：在既有 compression 总结调用中追加结构化提取指令，**同一次调用**同时产出 Core_Cognition 正文 + `<shared_experiences>` JSON，0 额外 LLM 调用。
+- 无标签 / 解析失败 / 空数组 → 静默跳过，退化为现有行为（零回归），不影响主聊天或 Core_Cognition。
+
+### 3. 每批新增 LLM 调用
+- 每轮新增调用：0
+- 每批（30 条）新增 LLM 调用：0（复用既有 compression 调用）
+- 复用的现有模型角色：`compression`（带端点轮询 + 故障转移）
+- 新增 embedding 调用：仅当提取出共同经历时，每条 1 次（`pinecone_memory.add` 内部复用 `_get_embedding`），每批最多 3 次，不新增 embedding 模型 / 端点。
+- 新增外部服务费用：无（不引入 Mem0 / Twig / Graphiti 等第三方记忆服务）。
+
+### 4. shared_experience 数据结构
+Pinecone metadata：`schema_version=v2, source_role=system, memory_type=shared_experience, channel=summary, tags=Shared_Experience, style_sample=false, created_at`。Pinecone text 只写短 summary（形如 `memory: <summary>`）。
+Supabase `memories` 行：`title="🤝 共同经历"`，`content=结构化 JSON 字符串`，`category="事件"`，`mood="平静"`，`tags="Shared_Experience"`。
+
+结构化 JSON 字段：
+- `summary`：≤120 字的事实摘要（用户与 AI 共同完成 / 讨论了什么）。
+- `user_events`：≤3 项，每项 ≤80 字 —— 用户发生了什么。
+- `ai_actions`：≤3 项 —— AI 在这段共同经历中做过的具体行为（事实，不是语气）。
+- `commitments`：≤3 项 —— AI 或用户明确答应之后要做什么。
+- `open_threads`：≤3 项 —— 共同经历中尚未结束的计划或问题。
+- `confidence`：0~1，证据不足时归 0。
+- `evidence`：`{"source":"conversation_batch"}`（只存安全批次标识，不放原文）。
+- `style_sample`：永远固定为 `false`（AI 回复不是风格样本）。
+
+### 5. 提取流程
+聊天流水 → 累计达 30 条触发 `check_and_summarize_all` → 一次 compression 调用同时产出 Core_Cognition 正文 + `<shared_experiences>` JSON → `split_summary_and_shared` 切分（core_text 存 Core_Cognition，JSON 交解析）→ `parse_shared_experiences` 校验 / 脱敏 / 截断 → `persist_shared_experiences` 写 Supabase + Pinecone → 召回时按 `tags=Shared_Experience` 分区，只注入短 summary。
+
+### 6. AI 人格隔离
+- 没有学习 AI 旧口吻；不实现 persona_profile / persona_candidates / drift_audit。
+- 没有保存旧 assistant 原文到 Pinecone；Pinecone 只写短事实 summary。
+- `style_sample` 在 `sanitize_item` 中强制为 `false`（即使模型输出 true）。
+- 摘要含旧 `assistant:` 角色标记 → 整条丢弃（`_is_assistant_format` 校验）。
+- 提取提示词明确："你是共同经历提取模块，不是回复生成模块；AI 原始回复不是风格样本；不得复制任何原始回复句子。"
+- shared_experience 仍需经过 Phase 5 的 `_filter_recalled_memories`（assistant_format 隔离不绕过）。
+
+### 7. Pinecone 行为
+- 新写入：只写短 summary，metadata v2 + `memory_type=shared_experience` + `style_sample=false`。
+- 未改变 query 的 top_k / filter / namespace / user_id 隔离。
+- 旧向量：不删除、不更新、不迁移；旧 assistant_format 混合向量仍被 Phase 5 过滤。
+- 普通 user-only 自动写入（chat_user_raw）不受影响。
+
+### 8. Supabase 行为
+- 复用 `memories` 表已核验字段（title / content / category / mood / tags / importance / created_at），未新增表、未新增字段、未执行迁移 / DDL。
+- 测试阶段未写入生产数据；代码上线后的正常业务写入属于应用原有运行路径（`_save_memory_to_db`）。
+
+### 9. 测试结果
+- `py_compile`：`shared_experience.py / napcat.py / gateway.py / server.py / test_shared_experience_phase6.py` 全部通过。
+- 第 6 阶段专项测试 `test_shared_experience_phase6.py`：49 项全通过（A 结构化解析 / B 低价值过滤 / C 有价值经历 / D 批处理触发 / E Supabase mock / F Pinecone mock / G 召回 / H 人格隔离 / I 成本统计 / split 切分）。
+- Phase 3 / 3.8 / 4 / 4.1 / 5 / 3.6 + gateway_routes 回归：192 项全通过。
+- 全量 `unittest discover`：902 项，38 失败 / 2 跳过。**38 个失败全部为基线问题**（test_cat / test_home* / test_house / test_wallet / test_tool_loop 的 mock-DB "NoSupabase" 路径 + tool_loop weather schema 变更），经干净 HEAD（722a126）对照确认：HEAD 同样 33(cat/home/house/wallet) + 5(tool_loop) = 38 个相同测试 ID 失败；唯一差异是 `test_D2`（Phase 6 专项测试，无 Phase 6 时失败、有 Phase 6 时通过，符合预期）。Phase 6 未引入任何回归。
+
+### 10. 日志脱敏
+只记录脱敏统计：`共同经历提取：batch=1 items=N llm_calls=0`、`共同经历写入：supabase=N pinecone=N`、`共同经历跳过：原因=...`、`共同经历解析失败：原因=...`。未记录用户正文 / assistant 原文 / thinking / reasoning / 结构化 JSON 全文 / summary 全文 / user_id / vector ID / API Key / Token / Cookie / Session / Base64。
+
+### 11. 数据安全声明
+- 未执行 Supabase 删除 / 更新 / DDL / migration / 写 RPC 测试。
+- 未连接真实 Pinecone 做写入测试；未删除、更新或迁移旧 Pinecone。
+- 未部署或重启 Zeabur；未修改 Zeabur 环境变量。
+- 未新增环境变量（因此未修改 VARIABLES.md）。
+
+### 12. 未处理内容
+DeepSeek 402 余额不足；旧 Pinecone 向量；Pinecone score 正式阈值；完整事件 / 线索状态机；persona_profile；persona_candidates；drift_audit；AI 口吻学习；RikkaHub 前端行为；Core_Cognition 完整重构；TG 渠道的 30 条批量总结触发（TG 走 `async_message_summarizer`，本阶段仅在 `check_and_summarize_all` 接入，TG 渠道共同经历提取为已知缺口）。
+
+### 13. 已知限制
+- 共同经历只在网页 + QQ 渠道的 30 条批量总结中提取；TG 渠道（`async_message_summarizer`）尚未接入。
+- Core_Cognition 阶段总结（稳定前缀）与 shared_experience（易变尾块）可能涉及同一事件，存在轻度重复注入；本阶段不做去重。
+- 提取质量依赖 compression 模型对结构化 JSON 指令的遵循度；无标签 / 解析失败时静默跳过（不写入）。
+- 生产 Pinecone 全量数据未做写入核验（仅 mock 测试）。
+

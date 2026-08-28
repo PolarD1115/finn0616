@@ -478,13 +478,39 @@ async def check_and_summarize_all():
                     f"2. 绝对禁止以'今天'开头！因为这些聊天记录可能跨越了好几天。请扔掉日记格式，直接开门见山地叙述事情"
                     f"（例如直接说：'{user_name}最近在忙...' 或 '我们刚才聊了...'）。"
                 )
+                # Phase 6：复用本次总结调用追加共同经历结构化提取（0 额外 LLM 调用）
+                from shared_experience import (
+                    build_extraction_prompt_suffix, split_summary_and_shared,
+                    parse_shared_experiences, persist_shared_experiences,
+                )
+                prompt += build_extraction_prompt_suffix(ai_name, user_name)
                 # 用户要求：总结类一律走 compression 角色池（带 failover），不用便宜/默认模型
                 try:
                     summary = dep.ask_role_sync("compression", prompt, temperature=0.7)
-                    if summary and hasattr(dep, "_save_memory_to_db"):
+                    core_text = summary
+                    se_raw = None
+                    if summary:
+                        # 切分 Core_Cognition 正文与 <shared_experiences> 结构化 JSON；
+                        # 无标签时 core_text == summary，退化为现有行为（零回归）。
+                        core_text, se_raw = split_summary_and_shared(summary)
+                    if core_text and hasattr(dep, "_save_memory_to_db"):
                         dep._save_memory_to_db(
-                            f"📚 全渠道阶段总结", summary, "记事", "温情", "Core_Cognition"
+                            "📚 全渠道阶段总结", core_text, "记事", "温情", "Core_Cognition"
                         )
+                    # Phase 6：共同经历结构化提取（复用本次调用，0 额外 LLM 调用；
+                    # 失败/空/无标签均静默跳过，绝不影响主聊天或 Core_Cognition）
+                    try:
+                        _items = parse_shared_experiences(se_raw)
+                        if _items:
+                            _cnt = persist_shared_experiences(_items, dep)
+                            _naplog(f"共同经历提取：batch=1 items={len(_items)} llm_calls=0")
+                            _naplog(f"共同经历写入：supabase={_cnt['supabase']} pinecone={_cnt['pinecone']}")
+                        elif se_raw is not None:
+                            _naplog("共同经历跳过：原因=空数组或解析无效")
+                        else:
+                            _naplog("共同经历跳过：原因=无结构化输出")
+                    except Exception as se_err:
+                        _naplog(f"共同经历解析失败：原因={type(se_err).__name__}")
                     # 归档所有旧记录，彻底防止下次重复拉取
                     dep.supabase.table("memories").update(
                         {"tags": "Archived_Chat", "importance": 1}

@@ -984,13 +984,18 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
 
     pinecone_context = "无相关深层记忆"
+    shared_context = ""  # Phase 6：shared_experience 共同经历短摘要
     mr = r.get("pinecone")
     if mr:
         rl = mr.get("results", mr) if isinstance(mr, dict) else mr
         if isinstance(rl, list) and rl:
-            pinecone_context = "\n".join(
-                [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl]
-            )
+            from shared_experience import partition_recall, render_shared_context
+            _regular, _shared = partition_recall(rl)
+            if _regular:
+                pinecone_context = "\n".join(
+                    [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in _regular]
+                )
+            shared_context = render_shared_context(_shared)
             # 脱敏召回观测日志由 search() 内部 _log_pinecone_recall() 统一生成
             # 此处不再重复记录简单 score 范围
 
@@ -1020,6 +1025,8 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         "与当前问题无关时忽略，只使用回答所需的最少信息。 ---",
         f"【深层关联记忆】:\n{pinecone_context}",
     ]
+    if shared_context:
+        volatile_parts.append(shared_context)
     if history_text:
         volatile_parts.append(f"【近期对话回顾】:\n{history_text}")
     if device_snapshot:

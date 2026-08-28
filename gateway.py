@@ -2261,6 +2261,7 @@ class HostFixMiddleware:
         # 🚫 向量记忆注入门控：vector_memory_injection_enabled=false 时跳过 Pinecone 检索
         #    （不影响普通画像注入、Core_Cognition 注入、Pinecone 数据本身）。
         pinecone_context = "无相关深层记忆"
+        shared_context = ""  # Phase 6：shared_experience 共同经历短摘要
         mc = _get_pinecone_memory()
         if mc and current_query.strip() and _vector_injection_enabled():
             try:
@@ -2271,7 +2272,11 @@ class HostFixMiddleware:
                 if mr:
                     rl = mr.get("results", mr) if isinstance(mr, dict) else mr
                     if isinstance(rl, list) and rl:
-                        pinecone_context = "\n".join([f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in rl])
+                        from shared_experience import partition_recall, render_shared_context
+                        _regular, _shared = partition_recall(rl)
+                        if _regular:
+                            pinecone_context = "\n".join([f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in _regular])
+                        shared_context = render_shared_context(_shared)
                     else:
                         _log("🧠 Pinecone 召回 0 条")
                 else:
@@ -2366,6 +2371,8 @@ class HostFixMiddleware:
             f"与当前问题无关时忽略，只使用回答所需的最少信息。 ---\n"
             f"【深层关联记忆】:\n{pinecone_context}\n"
         )
+        if shared_context:
+            volatile_block += f"{shared_context}\n"
         if device_snapshot:
             volatile_block += f"{device_snapshot}\n"
         # 🏠 Home Runtime 上下文（只读，受运行时门控，放在 volatile 区域不破坏缓存前缀）
