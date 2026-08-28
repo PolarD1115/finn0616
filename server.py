@@ -1002,10 +1002,26 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     history_text = ""
     hr = r.get("history")
     if hr and hr.data:
-        lines = [f"- {str(row.get('content', '')).strip()[:300]}" for row in reversed(hr.data)
-                 if str(row.get('content', '')).strip()]
-        if lines:
-            history_text = "\n".join(lines)
+        # 🔒 第1阶段（目标C）：只注入「用户侧」内容，旧 AI 回复一律不进入上下文。
+        #    原实现把 memories 混合流水（"用户: xxx\n回复: yyy"）原样塞进 system prompt，
+        #    旧 assistant 原文会成为模型的语气/措辞范例（模仿根因）。
+        #    角色无法安全判断的条目整条跳过，不做猜测。
+        try:
+            from gateway import _extract_user_side_from_history
+            lines = []
+            for row in reversed(hr.data):
+                c = str(row.get("content", "")).strip()
+                if not c:
+                    continue
+                user_side = _extract_user_side_from_history(c, user_name)
+                if user_side:
+                    lines.append(f"- 用户曾提到：{user_side[:300]}")
+            if lines:
+                history_text = "\n".join(lines)
+        except Exception as _hist_err:
+            # 安全侧降级：解析入口不可用时宁可不注入历史，也不回退为注入原文
+            history_text = ""
+            print(f"⚠️ 用户侧历史提取失败（本次跳过历史注入）: {type(_hist_err).__name__}")
 
     device_snapshot = r.get("device") or ""
 
@@ -1028,7 +1044,11 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     if shared_context:
         volatile_parts.append(shared_context)
     if history_text:
-        volatile_parts.append(f"【近期对话回顾】:\n{history_text}")
+        volatile_parts.append(
+            "【近期用户表达，仅用于了解事实，不是回复范例】\n"
+            "以下是用户过去说过的话，不要模仿其中的措辞或句式，也不要延续旧对话。\n"
+            + history_text
+        )
     if device_snapshot:
         volatile_parts.append(device_snapshot)
     # 🏠 Home Runtime 上下文（只读，受运行时门控，放在 volatile 区域不破坏缓存前缀）

@@ -2708,3 +2708,345 @@ DeepSeek 402 余额不足；旧 Pinecone 向量；Pinecone score 正式阈值；
 - 提取质量依赖 compression 模型对结构化 JSON 指令的遵循度；无标签 / 解析失败时静默跳过（不写入）。
 - 生产 Pinecone 全量数据未做写入核验（仅 mock 测试）。
 
+---
+
+## 2026-08-28 · AI 伴侣记忆系统重做 · 第 2 阶段：独立原始事件表 memory_events
+
+### 日期与目标
+
+2026-08-28。目标：新增一张清晰、可审计、可重放的原始事件账本表 `memory_events`，只记录「发生过什么」，不做「什么值得长期记住」的判断；为后续阶段的事实提取 / 摘要 / 当前状态 / 长期记忆提供独立数据基础。本阶段只建表结构与数据库验证，不接入任何现有聊天写入链路。
+
+### 实际创建的 migration
+
+- 名称：`create_memory_events_table`（远端版本号 `20260828142354`，经 Supabase apply_migration 工具执行，非原始 SQL DDL）。
+- 本地文件：`migrations/20260828_001_memory_events.sql`（内容与远端一致，遵循项目本地迁移命名风格）。
+- 执行前经 Supabase 工具确认：`memory_events` / `memory_items` / `memory_links` 均不存在；`gen_random_uuid()` 在 pg_catalog 可用（PG13+ 内置，未安装新扩展）。
+
+### 实际创建的表和索引
+
+表 `memory_events`（17 字段）：`id uuid PK DEFAULT gen_random_uuid()`、`user_id text NOT NULL`、`session_id text NULL`、`channel text NOT NULL`（CHECK 限 web/tg/qq/email/background/home/mcp/unknown）、`role text NOT NULL`（CHECK 限 user/assistant/tool/system/event）、`content text NOT NULL`、`content_hash text NOT NULL`（普通索引，**非唯一**）、`occurred_at timestamptz NOT NULL`、`created_at timestamptz NOT NULL DEFAULT now()`、`source_event_id text NULL`、`batch_id uuid NULL`、`processing_status text NOT NULL DEFAULT 'pending'`（CHECK 限 pending/processed/failed/ignored）、`processed_at timestamptz NULL`、`attempt_count integer NOT NULL DEFAULT 0`（CHECK >= 0）、`last_error text NULL`、`metadata jsonb NOT NULL DEFAULT '{}'`、`created_by text NOT NULL`。
+
+索引（3 个 + 主键）：`memory_events_user_occurred_idx (user_id, occurred_at DESC)`、`memory_events_user_status_created_idx (user_id, processing_status, created_at)`、`memory_events_content_hash_idx (content_hash)`。未创建 `(user_id, channel, occurred_at)` 索引（当前无明确查询需求）；未为 metadata 创建 GIN 索引（无查询路径）。
+
+### RLS 处理
+
+RLS 已启用，但**未创建任何业务读写策略**（deny-by-default）。原因：`user_id` 是应用层隔离字段，不等于 `auth.uid()`，项目当前没有可安全映射的用户认证体系；旧表的 public 全放行是不安全的历史设计，本表不复制。当前网关 anon key 读写此表会被拒绝，但本阶段表未接入任何写入链路，不影响现有运行。后续接入前必须配合 service_role 或明确的用户身份方案设计策略。
+
+### 是否修改旧表 / 写入业务数据 / 执行删除
+
+- 旧表结构：未修改（未 ALTER 任何旧表、未给旧表加字段、未改旧表 RLS）。
+- 旧表数据：未修改（未 INSERT/UPDATE/DELETE/迁移/复制/重分类/恢复任何旧数据；未把 memories 批量导入新表）。
+- 业务数据：未写入 `memory_events`（验证行数 = 0）。
+- 删除：未执行任何 DELETE / DROP / TRUNCATE；未清理旧表、孤立表或 Pinecone；未修改 Pinecone。
+- 环境变量：未新增；requirements.txt / Dockerfile / docker-compose / 前端 / 上下文注入逻辑 / 第 1 阶段修复：均未修改。
+
+### 验证结果（全部来自 Supabase 工具实查）
+
+- 表存在，17 字段类型/可空性/默认值与设计一致（information_schema.columns）。
+- 主键 `memory_events_pkey` 存在；3 个新索引定义正确（pg_indexes）。
+- RLS `relrowsecurity = true`；`pg_policies` 中本表策略数 = 0（预期 deny-by-default）。
+- 行数 = 0；7 张旧表行数 migration 前后完全一致（memories 3833 / chat_messages 37610 / user_facts 21 / memory_summaries 13 / active_memories 119 / memory_house 5 / device_data 590）。
+- 远端迁移列表新增 `20260828142354 create_memory_events_table`。
+- 本地迁移文件经 SQL 语法目检 + 与远端 apply_migration 已成功执行的同内容比对（无 Python 代码改动，无需 py_compile）。
+
+### 已知限制
+
+- 新表尚未接入任何写入链路；现有聊天仍写入旧 memories（3833 行，含 3004 条 embedding 为 NULL 的历史遗留问题，本阶段未处理）。
+- 现有历史数据没有自动导入新表（按规则明确不做）；Archived_Chat 812 条仍未恢复。
+- 现有 Pinecone 完全未变（旧 assistant 混合向量仍在，仅靠第 1 阶段前的过滤逻辑拦截）。
+- RLS deny-by-default 意味着 anon key 网关当前无法读写此表；接入写入前需先落实 service_role 或认证方案。
+- 新表不会自动修复召回、不会自动恢复 Archived_Chat、不会自动完成事实抽取、不会让模型记住过去——它只是可靠的原始事件账本。
+
+### 下一阶段建议
+
+为 Web 单一入口（gateway._save_conversation）增加 memory_events 双写（保留旧 memories 写入不变）；使用 source_event_id + content_hash 做幂等去重；先双写观察，不改变当前召回，不删除任何旧数据；用 mock 测试 + Supabase 只读验证。
+
+---
+
+## 2026-08-28 · AI 伴侣记忆系统重做 · 第 3 阶段：Web 原始事件双写接入
+
+### 日期与目标
+
+2026-08-28。目标：只为 Web `/v1/chat/completions` 增加 `memory_events` 原始事件双写（保留旧 memories 写入，双写观察）。不读取 memory_events、不改变上下文注入、不改变 Pinecone、不做事实提取、不接 TG/QQ/后台活动。
+
+### 修改的文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `gateway.py` | `_save_conversation` 内新增「2.5 Web 原始事件账本」写入块（Pinecone 之后、总结触发之前，chat_history_write_enabled 门控内、独立 try） |
+| `test_memory_phase3_events.py`（新增） | 18 个测试，覆盖任务 A-G 全部场景 + 源码约束 |
+| `PROJECT_NOTES.md` | 追加本节日志 |
+
+### Web 事件写入位置与设计
+
+- **写入位置**：`_save_conversation`（gateway.py），该函数每轮 Web 请求恰好被调度一次——流式路径（原 L2234）与天气工具循环路径（原 L2679-2681）两个 `asyncio.create_task` 调度点互斥汇聚于此，在函数内接入即全覆盖，无需改动两处调用点。
+- **request_id**：函数内生成 uuid4（服务端生成，不信任用户传入 ID）；user/assistant 事件 `source_event_id` 分别为 `{request_id}:user` / `{request_id}:assistant`（text 列无长度限制，实查确认）；日志只取前 8 位。
+- **user_id**：复用 `server._resolve_pinecone_user_id()`（USER_ID → MEM0_USER_ID → default 全项目唯一规则）。
+- **session_id**：Web 请求当前无可靠会话标识（全项目核查确认缺位），诚实写 NULL，不伪造。
+- **occurred_at**：与 memories.created_at 同一 `now_str`（保存时刻，UTC ISO 带时区），保证跨表时间线可对账；与「用户消息实际到达时刻」存在流式回复时长的偏差（已知限制）。
+- **content**：user 事件存原始消息；assistant 事件存 final_save_text（默认已剥离 `<think>`，SAVE_THINKING=true 的旧行为继承；reasoning 参数永不单独写入）；工具调用无正文时为现有逻辑生成的脱敏描述（`[系统记录：调用了工具 xxx]`，不含参数与结果原文）。
+- **content_hash**：SHA-256 hexdigest，内存计算，不落日志。
+- **processing_status='pending'、attempt_count=0、batch_id/processed_at/last_error 空**（后续阶段的状态机预留）；metadata 仅 `{"request_id": ...}`，不含正文/请求头/密钥。
+- **不写 tool 事件**：工具结果当前无可靠的结构化事件数据，且本阶段不允许扩大范围；工具调用轮次以脱敏描述计入 assistant 事件。
+
+### Supabase 客户端身份处理
+
+- 写入复用 `server.supabase_service`（service_role 客户端，server.py:99 既有单例，Home Runtime RPC 写入已在用）——**未新建客户端、未读取 SUPABASE_SERVICE_KEY 环境变量值、未新增 create_client**。
+- 旧 memories / Pinecone / 上下文注入仍走 anon 客户端，身份分离不变。
+- service 客户端不可用（SUPABASE_SERVICE_KEY 未配置）→ 降级为记一条日志并跳过事件写入，主聊天与旧 memories 写入完全不受影响。
+- 未修改 RLS、未新增策略、未新增 migration。
+
+### 幂等策略
+
+- 单次 `_save_conversation` 调用内 user+assistant 两条事件**一次批量 insert**（原子落库，不存在"半轮事件"）。
+- **不做 select-then-insert 预查询**：两个调度点互斥、无重试循环，单调用天然幂等；表无 source_event_id 唯一约束，查询无法做到强幂等（TOCTOU），而查询失败时跳过插入会丢事件（丢事件代价高于极小概率重复）。
+- 客户端重试 HTTP 会生成新 request_id → 属合法新事件，本就不去重。
+
+### 失败隔离
+
+新代码是 `_save_conversation` 内第 4 个平级独立 try 块（与 memories 块、Pinecone 块、总结触发块并列）：memory_events 查询/写入任何失败只记脱敏日志（异常消息不含正文），不影响 memories 写入、Pinecone 写入、总结触发和已发送的聊天响应；不执行任何 fallback 写入；不改 RLS；不隐藏失败。
+
+### 声明
+
+- 是否新增环境变量：**否**。
+- 是否修改 schema：**否**。
+- 是否修改 RLS：**否**。
+- 是否修改旧表数据：**否**（memories 由生产服务自然增长，非本阶段写入）。
+- 是否执行 DELETE：**否**。
+- 是否操作 Pinecone 删除：**否**。
+- 唯一允许的业务 INSERT（memory_events 合成测试事件）实际未发生：本地开发环境无 SUPABASE_URL/SUPABASE_SERVICE_KEY（无 .env 文件），网关代码无法在本地真实落库；按任务规则不改用其他连接方式，真实端到端写入留待生产部署后验证（生产 SUPABASE_SERVICE_KEY 已配置——由 Home Runtime RPC 写入在生产正常工作推断）。
+
+### 测试结果
+
+- `test_memory_phase3_events.py`：**18/18 通过**（A 双写字段与请求关联 / B assistant 不进 Pinecone / C 空白与工具调用 / D service 缺失·insert 异常·日志脱敏·无删除 / E memories 双 insert·Pinecone user-only·总结触发回归 / F 单调用单 insert·两调用不同 request_id / G SHA-256 一致 / 源码约束：memory_events 无 select·_inject_context 无接触·无 create_client·无 os.environ·metadata 无正文）。
+- 回归：`test_memory_phase1_fixes`(19) + `test_memory_phase3`(33) + `test_legacy_isolation_phase5`(25) + `test_recall_observability_phase4`(20) + `test_sanitize_phase41`(20) + `test_shared_experience_phase6`(49) = **147/147 通过**。
+- `py_compile gateway.py test_memory_phase3_events.py` 通过。
+- 模式搜索人工核验：memory_events 全项目仅 gateway 写入块 4 处（注释/降级日志/insert/失败日志）+ 测试文件；未进入 `_inject_context`、`_build_channel_context`、`search_memory`、Pinecone 任何路径。
+
+### Supabase 验证结果（只读）
+
+- `memory_events` 行数 = 0（本地无凭据未真实写入，符合预期；表结构/RLS/策略未变：17 字段、RLS 启用、0 策略）。
+- 旧表未受影响：chat_messages 37610 / user_facts 21 / active_memories 119 / memory_summaries 13 均与第 2 阶段一致；memories 3833→3851 为生产服务自然写入（心跳/自由活动等既有路径），非本阶段操作。
+
+### 已知限制
+
+- 真实生产流式请求的端到端事件写入未验证（本地无凭据）；部署后应由首批真实流量观察 `memory_events` 落库与失败日志。
+- 高并发下无唯一约束的完全幂等未保证（当前架构下单调用点天然幂等，残余风险为假想的并发重复插入）。
+- occurred_at 语义为"保存时刻"而非"用户消息到达时刻"，偏差为流式回复时长。
+- SAVE_THINKING=true 时 assistant 事件 content 含 `<think>` 块（继承旧行为；未来若进普通召回需先剥离）。
+- memory_events 原始 content 含对话隐私，表为 deny-by-default RLS + service_role 专用，未来任何读取界面必须严格隔离。
+- 双写期间数据暂存两套账本（memories 流水 + memory_events 事件），为观察期设计。
+- 旧 Pinecone assistant 向量未删除；Archived_Chat 未恢复——本阶段均不处理。
+
+### 下一阶段建议
+
+对 memory_events 做只读时间线检查（真实落库后）；设计统一的批量事实提取（以 memory_events 为输入、处理状态机更新 processed_at/attempt_count/last_error）；明确 memory_items 或长期记忆产物表；评估 source_event_id 唯一部分索引等安全幂等约束（需 migration）；仍不删除旧数据、仍用 Supabase 工具核实。
+
+---
+
+## 2026-08-28 · AI 伴侣记忆系统重做 · 第 4 阶段：长期记忆产物表 memory_items
+
+### 日期与目标
+
+2026-08-28。目标：新增长期记忆产物表 `memory_items`（经事实抽取后的「应该记住什么」，区别于 memory_events 原始事件账本与 memories 旧混装表）。只建表结构，不接入提取、不写入业务数据、不改变现有读取和回复行为。
+
+### migration 与本地文件
+
+- migration 名称：`create_memory_items_table`（远端版本 `20260828151027`，经 Supabase apply_migration 执行）。
+- 本地文件：`migrations/20260828_002_memory_items.sql`（同日 002 编号，遵循 `YYYYMMDD_NNN_name.sql` 项目命名格式）。
+- 执行前经 Supabase 工具实查确认：`memory_items` 及相近表（long_term_memories/memories_items/persistent_memories/memory_facts/memory_records/memory_links）均不存在；pgvector 已装、现有 5 处 vector 列均为 vector(1024)。
+
+### 实际字段（21 列）
+
+id uuid PK DEFAULT gen_random_uuid()；user_id text NOT NULL；memory_type text NOT NULL（CHECK: core/current/long_term/moment/memo/fact/shared_experience）；content text NOT NULL；content_hash text NOT NULL；status text NOT NULL DEFAULT 'active'（CHECK: active/superseded/expired/rejected/pending_review）；importance integer NOT NULL DEFAULT 3（CHECK 1-10）；confidence double precision NOT NULL DEFAULT 0.5（CHECK 0-1）；source text NOT NULL DEFAULT 'unknown'；source_event_ids uuid[] NOT NULL DEFAULT '{}'；source_batch_id uuid NULL；subject_key text NULL；valid_at/invalid_at/expires_at timestamptz NULL；superseded_by uuid NULL（自引用 FK）；last_confirmed_at timestamptz NULL；created_at/updated_at timestamptz NOT NULL DEFAULT now()；metadata jsonb NOT NULL DEFAULT '{}'；created_by text NOT NULL DEFAULT 'memory_extractor'。
+
+**与任务建议字段的差异（经 general-purpose 设计审查 + 主线程复核裁决）**：
+- 删除 canonical_content：规范化是写入方（提取器）应用层职责，仅 content_hash 落库；"NULL=同 content"语义歧义。
+- 删除 scope：单用户项目无消费方，channel 维度可由 source_event_ids→memory_events 派生。
+- 删除 first_seen_at：去重=UPDATE 旧行设计下恒等于 created_at。
+- 删除 last_recalled_at/recall_count：纯遥测、无消费者、无索引使用；日后需要时 additive 补。
+- 新增 superseded_by uuid（自引用 FK）：显式替代链指针，支撑非破坏性收束（旧事实置 superseded+invalid_at+superseded_by=新行 id，永不物理删除）。
+- memory_type CHECK 在任务要求 5 值基础上增加 fact/shared_experience（纯语义种类，core/current/long_term 保留为可选层级语义，层级主要由 status+importance 表达）。
+- confidence 用 double precision 而非 numeric(4,3)：与项目现有浮点规范一致（user_facts.confidence、active_memories.strength 均为 double precision）。
+- source_event_ids 用 uuid[] NOT NULL DEFAULT '{}'（对齐 eventide_dream_cards.after_effect_tags 的 text[] 数组先例，消除 NULL/空双态）；数组列无 FK，对 memory_events.id 的引用完整性由应用层保证。
+- status 保留 expired 枚举值（任务硬性要求），但约定「过期判定以 expires_at 派生为准」（召回查询必须带 expires_at 过滤），避免状态与时间双真相。
+- 新增一致性 CHECK：superseded → invalid_at NOT NULL；时间窗口（invalid_at>=valid_at 且 expires_at>=valid_at，双方可空、锚点为 valid_at，不阻碍历史回填）。
+- embedding 不创建：未来检索方案与维度未定，后续以 additive migration 补列。
+
+### 实际索引（3 个 + 主键 + FK）
+
+memory_items_user_status_type_idx (user_id, status, memory_type, importance DESC, updated_at DESC)——读取当前有效记忆；memory_items_user_subject_valid_idx (user_id, subject_key, valid_at DESC)——主题归并/替代链查询；memory_items_user_hash_idx (user_id, content_hash)——去重候选（普通索引，非唯一）。无 GIN/HNSW/全局唯一/部分索引。
+
+### RLS
+
+启用且零策略（deny-by-default，与 memory_events 同款）。anon/authenticated 读写全部拒绝；service_role 后续安全写入。本阶段零读写代码，不影响现有链路；接入前必须配合 service_role 或明确身份方案，不得复制旧表 public 全放行模式。
+
+### 声明
+
+- 是否创建 memory_items：是（仅结构）。
+- 是否修改旧表 / memory_events：否（未 ALTER 任何旧对象、未改任何 RLS/策略）。
+- 是否写入业务数据：否（memory_items 实测 0 行）。
+- 是否执行删除：否（无 DELETE/DROP/TRUNCATE）。
+- 是否安装扩展：否（pgvector 已存在，未动）。
+- 是否新增环境变量 / 修改 requirements / Docker / 前端 / 旧 migration：否。
+- 是否接入事实提取或长期记忆读取：否（零代码改动，本阶段不修改 gateway.py/server.py/napcat.py/heartbeat.py）。
+
+### Supabase 验证结果（全部来自 Supabase 工具实查）
+
+- 表存在，21 字段类型/默认值/可空性逐项与设计一致（information_schema.columns）。
+- 主键 memory_items_pkey + 3 个索引定义逐字正确（pg_indexes）。
+- 6 个 CHECK + 1 个自引用 FK（superseded_by REFERENCES memory_items(id)）定义正确（pg_constraint）。
+- RLS relrowsecurity=true；pg_policies 策略数 = 0。
+- memory_items 0 行；memory_events 0 行（不变）。
+- 旧表行数 migration 前后一致：memories 3862 / chat_messages 37610 / user_facts 21 / active_memories 119 / memory_summaries 13 / memory_house 5；device_data 594→595 为生产服务自然写入（非本阶段操作）。
+- 远端迁移列表新增 20260828151027 create_memory_items_table。
+
+### 已知限制
+
+- memory_items 尚未接入任何写入链路（0 行）与读取链路；现有 memories 仍是当前主要记忆来源。
+- 现有 Pinecone 未改变；旧 Archived_Chat（812 条）未恢复；memories 3004 条 embedding NULL 的历史遗留未处理。
+- 当前没有事实抽取、没有去重与冲突处理逻辑——content_hash 去重、subject_key 归并、superseded_by 替代链的使用约定全部由未来提取器实现。
+- RLS deny-by-default：未来代码访问前必须先落实 service_role 或明确认证方案。
+- embedding 未创建：未来接入向量检索前需先确定维度（现有 vector(1024) 不可直接假定）并以 additive migration 补列。
+- status=expired 为预留枚举值，当前无收敛机制（无触发器、无定时收束），过期判定依赖查询侧 expires_at 过滤——提取器设计时必须遵守该约定。
+- superseded_by 自引用 FK 不设 ON DELETE 行为（默认 NO ACTION）：本表永不物理删除行，该约束不会成为障碍。
+
+### 下一阶段建议
+
+设计并实现事实提取器：以 memory_events 为输入（pending 状态 + 既有索引取批），先生成候选 memory_items（pending_review 或 active，携带 source_event_ids/source_batch_id/confidence/subject_key），用 service_role 安全写入；不读取新表到生产上下文、不修改现有召回、不删除旧数据、不修改旧 memories；建立成功/失败/重试/审计测试；处理状态机更新 memory_events 的 processing_status/processed_at/attempt_count/last_error。
+
+---
+
+## 2026-08-28 · AI 伴侣记忆系统重做 · 第 5 阶段：长期事实提取器（离线 Mock 阶段）
+
+### 日期与目标
+
+2026-08-28。目标：建立独立事实提取模块，将若干 memory_events 转换为候选 memory_items（`events → extractor → validated candidates`）。本阶段只完成输入/Prompt/LLM 调用（可注入）/严格 JSON 解析/验证清洗/规范化/批内去重/状态计划生成，并以 mock 测试验证；**不处理生产 pending 事件、不写入生产数据、不修改事件状态、不接入上下文/聊天/后台**。
+
+### 是否使用子智能体
+
+使用 2 个，均成功：① Explore——LLM 调用入口全景（ask_role_sync 返回空串即失败、compression temperature 惯例 0.7）、确认无同名 extractor 模块、第 0-4 阶段 PROJECT_NOTES 约定摘要、测试 mock 风格；② general-purpose——验证规则设计审查（指出"我会"前缀误伤用户承诺、问句/寒暄需事实信号词豁免、verbatim-copy 守卫缺口、current 默认过期必须从 max(valid_at, occurred_at) 起算以满足 DB CHECK、全拒→failed 的重试死循环风险等），主线程逐条复核后采纳。
+
+### 新增或修改文件
+
+| 文件 | 内容 |
+|---|---|
+| `memory_extractor.py`（新增，约 510 行） | 提取器纯函数模块：Prompt 构造 / 严格 JSON 解析 / 单候选验证与规范化 / 批内去重 / 状态计划 / 异步主入口 / 真实 LLM 调用工厂（惰性） |
+| `test_memory_extractor_phase5.py`（新增，33 个测试） | 覆盖任务 A-L 全部场景 + 源码约束 |
+| `PROJECT_NOTES.md` | 追加本节日志 |
+
+未修改 gateway.py / server.py / napcat.py / heartbeat.py / shared_experience.py / migrations / requirements.txt / VARIABLES.md / 前端 / Docker；未新增环境变量。
+
+### 提取器职责与设计要点
+
+- **输入**：memory_events 行列表（dict）；tool/system 等非 user/assistant 事件被过滤出可提取集（工具事件本阶段不做提取），但仍计入状态计划。Prompt 总长上限 20000 字符、单事件截断 500 字符（截断与验证共用同一索引空间）。
+- **user/assistant 区分**：user 事件是事实唯一来源（每条候选至少引用一个 user 事件）；assistant 事件仅用于理解对话结果，模型伪造的 source_event_ids 一律忽略，source_event_ids 由代码从 source_event_indexes 映射生成。
+- **防模仿（Prompt + 验证双层）**：Prompt 含 12 条防模仿条款（事实提取非回复生成、禁复制改写原文/语气/口头禅、禁角色前缀、禁人格定性、AI 猜测不写成事实、承诺需用户确认、证据不足输出空数组、低价值类别排除清单等）。验证层确定性拦截：行首角色前缀（半/全角冒号）、`我(名称)：` 自称（正则不依赖 AI 名称）、**verbatim-copy 守卫**（与 assistant 原文最大公共子串 ≥12 字或相似度 ≥0.7 → 拒——防模仿红线的代码级落地）。
+- **误伤防护**（设计审查修正）：「我会/我将」仅对 assistant 来源候选有意义，user 来源的承诺事实合法保留；问句/寒暄拒绝规则带事实信号词豁免（记住/生日/考试/喜欢等）；"回答"等普通中文词在句中不受影响（仅行首前缀锚定）。
+- **memory_type**：core/current/long_term/moment/memo（任务 5 类）；core 高门槛——confidence<0.9 或 importance<8 降级 long_term；**显式记忆请求覆盖**：被引用 user 事件含「记住/别忘了/一定要记/记下来」→ core 跳过降级并提升 importance≥8（测试覆盖）。
+- **current 过期**：模型未给 expires_at → 补默认 72h（常量 CURRENT_DEFAULT_EXPIRY_HOURS，从 max(valid_at, 最早来源事件时间) 起算，满足 DB CHECK expires_at>=valid_at）；模型给值早于 valid_at → clamp；禁止无限期。
+- **JSON 验证**：空串/Markdown 围栏/非 JSON/顶层非对象/memories 非数组/单条非对象 → JSON_PARSE_ERROR；字段缺失/类型错误/非法 memory_type（含 raw_event/assistant_style 等）/非法时间/indexes 越界·assistant-only·超 5 个/空 content/超长（>500 字）→ 候选拒绝并记录脱敏原因代码。
+- **批内去重**：content_hash 相同 → 保留 confidence 最高（tie-break importance）并合并 source_event_ids 并集；不做语义去重、不查库。
+- **状态计划（只生成不执行）**：LLM 异常→failed(LLM_ERROR)；空响应→failed(EMPTY_RESPONSE)；JSON 解析失败→failed(JSON_PARSE_ERROR)；合法空 memories→processed；部分通过→processed（拒绝计数在 rejected）；全部被拒→failed(ALL_CANDIDATES_REJECTED)——确定性失败不自动重试（防重试死循环，重试策略留待下一阶段）。last_error 只存脱敏代码。
+- **status=pending_review**：候选未经跨批去重/冲突处理/人工确认，本阶段默认全部进入待审状态。
+- **真实 LLM 能力**：make_compression_llm_call() 工厂惰性 import server 复用 compression 角色池（temperature=0.7 跟随项目惯例）；本阶段不被聊天/后台/启动任何流程调用，测试全部用注入 mock。
+
+### 测试结果
+
+- `test_memory_extractor_phase5.py`：**33/33 通过**（A 正常提取含模型伪造 uuid 忽略 / B 闲聊过滤两路径 / C assistant 隔离 4 场景含 verbatim-copy 与角色前缀、用户承诺与事实问句不误伤 / D current 默认 72h+clamp+非法时间 / E core 四场景 / F moment 合法与引文拒绝 / G memo 合法与转录拒绝 / H 解析级 7 例+验证级 10 例+部分通过 / I 去重保留高置信合并来源 / J LLM 异常 / K 状态计划 4 场景 / L 源码约束：无 DB/Pinecone/环境变量/自动调度，真实 LLM 工厂惰性）。
+- 回归：第 1-4 阶段 7 个测试文件 **184/184 通过**。
+- 修复过程中发现并修正 1 个实现缺陷：_resolve_ts 曾以字符串 "bad"/"ok" 作状态标志而检查用 `if not ok:`，导致非法时间从不拒绝（非空字符串恒 truthy）；已改为布尔返回并由测试覆盖（INVALID_TIME 两场景）。
+
+### Supabase 只读核实
+
+- memory_events 0 行（pending 0）——生产未部署第 3 阶段网关版本，无事件可提取；本阶段未处理、未调用模型、未改任何状态。
+- memory_items 0 行（未变）。
+- memories 3870→3872、chat_messages/user_facts 不变（memories 增长为生产服务自然写入）。
+- 本阶段对 Supabase 仅执行上述只读 SELECT（经 Supabase 工具），零写入。
+
+### 声明
+
+是否连接真实 Supabase 写入：否；是否写入 memory_items：否；是否修改 memory_events：否；是否操作 Pinecone：否；是否执行真实 LLM：否；是否读取真实凭据：否；是否修改现有聊天链路/上下文注入：否。
+
+### 已知限制
+
+- 提取器未接入任何自动调度与生产数据（纯离线）；
+- 只做批内精确去重，无跨批去重、语义去重、冲突处理、superseded_by 写入；
+- 内容安全规则为确定性启发式（前缀/信号词/相似度阈值），无法覆盖全部自然语言形态——prompt 层约束是第一道防线，验证层是兜底；ALL_CANDIDATES_REJECTED 与误拒率需在真实试运行中校准；
+- current 默认 72h 是保守常量，不区分类型细节；
+- 真实 compression 模型输出质量、真实生产事件提取结果、真实写入权限与状态更新均未验证（依赖下一阶段小批量试运行）。
+
+### 下一阶段建议
+
+设计手动触发的「小批量真实提取试运行」：用 Supabase 工具只读读取少量 pending memory_events（若无事件先由生产部署第 3 阶段版本积累）→ 运行 extract_memory_candidates 输出候选（不直接写入）→ 人工检查候选质量与误拒率 → 确认后再单独设计 service_role 写入与 memory_events 状态更新执行器；设计跨批去重；不修改当前聊天上下文；不删除任何旧数据；不自动启用后台提取。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 6 阶段：小批量真实提取试运行（未执行：无 pending 事件）
+
+### 日期与分支决策
+
+2026-08-29。目标：从真实 Supabase 只读读取少量 pending memory_events，调用真实 compression 模型，经第 5 阶段提取器输出候选质量报告（只读、不写库）。
+
+**实际执行结果：试运行未执行。** 执行前 Supabase 只读核查（Supabase 工具实查）：`memory_events` 总行数 = 0、pending = 0（processed/failed 均 0）、channel/role/user_id 分布为空集、无时间范围。原因：第 3 阶段网关双写版本尚未部署到生产环境，事件账本尚未积累任何真实事件。
+
+按第 6 阶段任务规则「如果 pending 事件少于 1 条：停止真实提取，不调用真实 compression 模型，输出无 pending 事件报告」——本阶段未调用真实 LLM、未读取任何正文、无敏感事件需要判断、无候选产出。子智能体未使用（试运行分支未触发，其核查目标在前序阶段已由主线程亲自实现与验证）。
+
+### 代码核查（零修改）
+
+- `import memory_extractor` 零副作用实测：入口与真实 LLM 工厂均可调用，且 `server` 模块未被触发导入（真实调用完全惰性）。
+- 本阶段未修改任何项目代码（含 memory_extractor.py）；无新增环境变量；无持久化文件生成。
+
+### 测试与前后对比
+
+- 8 个测试文件（第 1-5 阶段全部记忆相关测试）：**217/217 通过**（基线未变）。
+- Supabase 前后只读对比：memory_events 0→0、pending 0→0、memory_items 0→0、memories 3874→3874、chat_messages 37610 不变、user_facts 21 不变——**零变更确认**。
+
+### 声明
+
+未执行 INSERT/UPDATE/DELETE/DROP/TRUNCATE；未修改 memory_events/memory_items/旧表数据；未操作 Pinecone；未调用真实 compression（因无事件，非技术阻塞）；未发送任何消息；未新增环境变量；未保存 Prompt/模型响应/真实正文（本就没有产生）；未读取或输出真实凭据。
+
+### 已知限制与下一阶段建议
+
+- 真实提取质量校准（误拒率、模型输出稳定性）仍然空白，前置条件是**生产部署第 3 阶段网关版本**以积累真实 memory_events。
+- 下一阶段：生产部署后重跑本阶段试运行流程（选 5-10 条同用户同会话事件 → 脱敏检查 → 真实 compression 单次调用 → 第 5 阶段提取器 → 人工质量审查 → 前后对比）；候选质量合格后再设计 service_role 写入与状态更新执行器。全程保持：不删除旧数据、不修改旧 memories、不操作 Pinecone、不恢复 Archived_Chat、不自动启用后台提取、不将 memory_items 接入正式上下文。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 7 阶段：生产部署与 Web 双写验证（部署未执行）
+
+### 日期与分支决策
+
+2026-08-29。目标：确认生产部署方式、部署第 1～3 阶段代码、验证 Web 双写。**实际结果：部署未执行，Web 验证请求未发送。**
+
+### 部署方式核查结果
+
+- 项目文档（DEPLOY_ZEABUR.md）确认部署方式：Zeabur 控制台关联 GitHub 仓库（PolarD1115/finn0616）自动构建，部署命令 `python server.py`——即部署以「代码提交并推送到 GitHub」为前置。
+- 第 1～6 阶段的全部代码修改（gateway/server/napcat/heartbeat/memory_extractor 及测试）**均未提交**（工作区状态）；而本阶段任务规则禁止创建 Git commit。
+- 本机网络无法访问 GitHub（git fetch 超时 5 分钟，Connection timed out）。
+- Zeabur 查询工具不可用（list_projects 返回 Invalid request parameters，无法确认生产服务与部署状态）。
+
+### 阻塞原因（三项叠加）
+
+1. **规则阻塞（决定性）**：部署需要 commit + push，本阶段任务明确禁止创建 commit；工作区含第 1～6 阶段未提交修改，也不得为部署而提交。
+2. **环境阻塞**：本机无法连接 GitHub（fetch 超时）。
+3. **工具阻塞**：Zeabur MCP 工具不可用，无法安全确认生产部署目标与当前运行版本（任务规则：无法安全确认部署目标时不得部署、不得猜测、不得换用未知方式）。
+
+### 代码版本核查（工作区 vs 生产候选版本）
+
+- 工作区代码包含第 1～3 阶段全部标志：napcat 总结失败不归档（Archived_Chat 写入点仅成功路径 1 处）、gateway 用户侧历史过滤（_extract_user_side_from_history）、自动清理暂停（_clean_old_memories）、memory_events 双写（4 处引用、supabase_service 复用、channel=web、成对写入、失败隔离）、memory_extractor.py 存在。
+- 生产候选版本（本地 HEAD b9846a1，即最近一次提交）的 gateway.py **不含** memory_events 任何引用（git show 实查 0 命中）——确认生产当前运行旧代码，双写功能尚未上线。
+- py_compile gateway/server/napcat/heartbeat/memory_extractor 5 文件通过；第 1～5 阶段 8 个测试文件 217/217 通过。
+
+### Supabase 前后对比（只读）
+
+memory_events 0→0（channel=web 0→0）、memory_items 0→0、memories 3882→3882。零变更。因生产运行旧代码，发送 Web 验证请求只会走旧链路、无法产生 memory_events 且无验证意义，故未发送。
+
+### 声明
+
+未执行任何 Supabase 写入；未修改数据库 schema/RLS/数据；未操作 Pinecone；未调用事实提取与真实 compression；未发送任何渠道消息；未新增环境变量；未修改任何项目代码（仅追加本日志）；未创建 commit；未覆盖工作区已有修改。
+
+### 下一阶段建议
+
+部署需要用户决策与操作：① 用户确认后将第 1～3 阶段修改提交并推送到 GitHub（或授权 AI 创建 commit）；② 确认 Zeabur 自动构建部署成功、服务健康；③ 再执行 Web 合成验证请求（单次、合成内容）与 memory_events 成对性检查。全部数据库与代码安全约束保持不变。
+

@@ -421,7 +421,9 @@ async def check_and_summarize_all():
     设计原则（移植自 mcp-gateway-main 并通用化）：
     - 完全变量化（AI_NAME / USER_NAME / CHAT_TAG / SUMMARY_THRESHOLD）
     - 单条消息截断 500 字，prompt 上限 8 万字，防止 token 爆炸
-    - 失败兜底：即使 LLM 调用失败，也把旧记录归档，防止无限重试堆积
+    - 🔒 第1阶段修复（目标A）：只有「总结正文非空 + Core_Cognition 写入确认成功」
+      才归档，且只归档本次真正进入总结 prompt 的记录；LLM 异常 / 总结为空 /
+      写入失败一律不归档，原始流水保留原标签，允许下次重试，绝不影响主聊天流程
     - 全程 try/except 包裹，绝不影响主聊天流程
     """
     dep = _get_deps()
@@ -446,13 +448,14 @@ async def check_and_summarize_all():
             if all_chats and all_chats.data and len(all_chats.data) >= threshold:
                 # 只取最新的阈值条数，防止历史堆积导致token爆炸
                 items_to_summarize = all_chats.data[-threshold:]
-                # 将所有旧记录都归档（不仅仅是这批），防止下次再全量拉取
-                all_ids_to_archive = [item['id'] for item in all_chats.data]
 
-                _naplog(f"📦 全渠道累计对话满 {len(all_chats.data)} 条，正在触发统一总结（取最新{threshold}条，归档全部）...")
+                _naplog(f"📦 全渠道累计对话满 {len(all_chats.data)} 条，正在触发统一总结（本次最多处理最新{threshold}条）...")
 
-                # 逐条截断，防止单条超长消息撑爆prompt
+                # 逐条截断，防止单条超长消息撑爆prompt；
+                # summarized_items 与 chat_parts 一一对应，记录真正进入总结 prompt 的记录，
+                # 作为归档范围的唯一依据（未进入 prompt 的积压记录保留原标签待下次处理）
                 chat_parts = []
+                summarized_items = []
                 total_chars = 0
                 for item in items_to_summarize:
                     truncated_content = item['content'][:_MAX_MSG_CHARS]
@@ -468,7 +471,12 @@ async def check_and_summarize_all():
                         _naplog(f"⚠️ 总结prompt已达 {_MAX_PROMPT_CHARS} 字符上限，截断剩余 {len(items_to_summarize) - len(chat_parts)} 条记录")
                         break
                     chat_parts.append(part)
+                    summarized_items.append(item)
                     total_chars += len(part)
+
+                if not summarized_items:
+                    _naplog("⚠️ 无可总结的记录（prompt 配额为 0），跳过本次总结，不归档")
+                    return
 
                 chat_text = "\n".join(chat_parts)
                 prompt = (
@@ -485,47 +493,60 @@ async def check_and_summarize_all():
                 )
                 prompt += build_extraction_prompt_suffix(ai_name, user_name)
                 # 用户要求：总结类一律走 compression 角色池（带 failover），不用便宜/默认模型
+                # 🔒 第1阶段（目标A）：以下任何一步失败都不归档，原始流水保留原标签待下次重试。
                 try:
                     summary = dep.ask_role_sync("compression", prompt, temperature=0.7)
-                    core_text = summary
-                    se_raw = None
-                    if summary:
-                        # 切分 Core_Cognition 正文与 <shared_experiences> 结构化 JSON；
-                        # 无标签时 core_text == summary，退化为现有行为（零回归）。
-                        core_text, se_raw = split_summary_and_shared(summary)
-                    if core_text and hasattr(dep, "_save_memory_to_db"):
-                        dep._save_memory_to_db(
-                            "📚 全渠道阶段总结", core_text, "记事", "温情", "Core_Cognition"
-                        )
-                    # Phase 6：共同经历结构化提取（复用本次调用，0 额外 LLM 调用；
-                    # 失败/空/无标签均静默跳过，绝不影响主聊天或 Core_Cognition）
-                    try:
-                        _items = parse_shared_experiences(se_raw)
-                        if _items:
-                            _cnt = persist_shared_experiences(_items, dep)
-                            _naplog(f"共同经历提取：batch=1 items={len(_items)} llm_calls=0")
-                            _naplog(f"共同经历写入：supabase={_cnt['supabase']} pinecone={_cnt['pinecone']}")
-                        elif se_raw is not None:
-                            _naplog("共同经历跳过：原因=空数组或解析无效")
-                        else:
-                            _naplog("共同经历跳过：原因=无结构化输出")
-                    except Exception as se_err:
-                        _naplog(f"共同经历解析失败：原因={type(se_err).__name__}")
-                    # 归档所有旧记录，彻底防止下次重复拉取
-                    dep.supabase.table("memories").update(
-                        {"tags": "Archived_Chat", "importance": 1}
-                    ).in_("id", all_ids_to_archive).execute()
-                    if summary:
-                        _naplog(f"✅ 全渠道对话总结完成，已归档 {len(all_ids_to_archive)} 条流水")
-                    else:
-                        _naplog("⚠️ 总结未产出内容（LLM 未配置或全部端点失败），仅归档旧记录")
                 except Exception as llm_err:
-                    _naplog(f"❌ 统一总结LLM调用失败: {llm_err}")
-                    # 即使LLM调用失败，也把旧记录归档，防止无限重试堆积
-                    dep.supabase.table("memories").update(
-                        {"tags": "Archived_Chat", "importance": 1}
-                    ).in_("id", all_ids_to_archive).execute()
-                    _naplog(f"✅ 虽然总结失败，但已将 {len(all_ids_to_archive)} 条旧记录归档，防止下次继续堆积")
+                    _naplog(f"❌ 统一总结LLM调用失败（不归档，流水保留待重试）: {type(llm_err).__name__}")
+                    return
+                if not summary or not str(summary).strip():
+                    _naplog("⚠️ 总结为空（LLM 未配置或全部端点失败），不归档，流水保留待重试")
+                    return
+                # 切分 Core_Cognition 正文与 <shared_experiences> 结构化 JSON；
+                # 无标签时 core_text == summary，退化为现有行为（零回归）。
+                try:
+                    core_text, se_raw = split_summary_and_shared(summary)
+                except Exception as split_err:
+                    _naplog(f"❌ 总结正文切分失败（不归档，流水保留待重试）: {type(split_err).__name__}")
+                    return
+                if not core_text or not str(core_text).strip():
+                    _naplog("⚠️ 总结无正文（仅含结构化块），不写空阶段总结，不归档，流水保留待重试")
+                    return
+                if not hasattr(dep, "_save_memory_to_db"):
+                    _naplog("⚠️ 环境缺少 _save_memory_to_db，无法确认阶段总结已落库，不归档，流水保留待重试")
+                    return
+                try:
+                    core_saved = bool(dep._save_memory_to_db(
+                        "📚 全渠道阶段总结", core_text, "记事", "温情", "Core_Cognition"
+                    ))
+                except Exception as save_err:
+                    _naplog(f"❌ 阶段总结写入异常（不归档，流水保留待重试）: {type(save_err).__name__}")
+                    return
+                if not core_saved:
+                    _naplog("⚠️ 阶段总结写入未成功，不归档，流水保留待重试")
+                    return
+                # Phase 6：共同经历结构化提取（复用本次调用，0 额外 LLM 调用；
+                # 失败/空/无标签均静默跳过，绝不影响主聊天或 Core_Cognition）
+                try:
+                    _items = parse_shared_experiences(se_raw)
+                    if _items:
+                        _cnt = persist_shared_experiences(_items, dep)
+                        _naplog(f"共同经历提取：batch=1 items={len(_items)} llm_calls=0")
+                        _naplog(f"共同经历写入：supabase={_cnt['supabase']} pinecone={_cnt['pinecone']}")
+                    elif se_raw is not None:
+                        _naplog("共同经历跳过：原因=空数组或解析无效")
+                    else:
+                        _naplog("共同经历跳过：原因=无结构化输出")
+                except Exception as se_err:
+                    _naplog(f"共同经历解析失败：原因={type(se_err).__name__}")
+                # 🔒 归档范围修复：只归档本次真正进入总结 prompt 的记录。
+                #    原实现归档全部积压记录，其中因 prompt 超限被截断、从未被总结过的
+                #    记录也会被静默归档脱离上下文；积压记录现在保留原标签分批消化。
+                summarized_ids = [it['id'] for it in summarized_items]
+                dep.supabase.table("memories").update(
+                    {"tags": "Archived_Chat", "importance": 1}
+                ).in_("id", summarized_ids).execute()
+                _naplog(f"✅ 全渠道对话总结完成，已总结并归档 {len(summarized_ids)} 条流水")
             else:
                 total_count = len(all_chats.data) if all_chats and all_chats.data else 0
                 _naplog(f"📦 全渠道当前对话流水 {total_count} 条，未达{threshold}条总结阈值")

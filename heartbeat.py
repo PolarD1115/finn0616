@@ -209,6 +209,24 @@ async def async_autonomous_life():
 # 1.5 每日日记生成 (深度睡眠模式)
 # ==========================================
 
+def _clean_old_memories(supabase_client):
+    """🔒 第1阶段（目标D）：旧数据自动清理 —— 安全暂停版，不执行任何删除。
+
+    原实现（本函数内的内联闭包）会执行
+    DELETE FROM memories WHERE importance<4 AND created_at < now-2天，
+    但聊天流水（Web_Chat/TG_MSG/QQ_MSG/QQ_Chat/QQ_Group/Email_Process，默认
+    importance=1）、Archived_Chat、Shared_Experience、Desire_Trace 等记忆数据
+    全部落在该条件内，会被误删，直接造成跨会话失忆（第0阶段审计确认）。
+
+    当前行为：保留函数与调用点，但不访问数据库、不删除任何数据。
+    在建立可审计的归档/保留策略（明确允许删除的临时数据白名单）之前，
+    memories 表中的数据一律长期保留；如需清理须单独设计并经明确授权。
+    """
+    print("🔒 [记忆保护] 旧数据自动清理已暂停：不再删除任何 memories 数据"
+          "（聊天流水/Archived_Chat/Shared_Experience/Core_Cognition 等全部保留）。"
+          "待建立明确的归档与保留策略后再恢复。")
+
+
 async def _perform_deep_dreaming():
     """
     🌙【深夜日记模式】每日自动生成"昨日回溯"日记。
@@ -275,12 +293,10 @@ async def _perform_deep_dreaming():
             print("⚠️ 日记生成失败（LLM 返回空），跳过后续宏观收束。")
             return
 
-        # 清理 2 天前的低重要度记录（防止流水单调累积）
+        # 🔒 第1阶段（目标D）：旧数据自动清理已暂停（见 _clean_old_memories）。
+        #    原逻辑会删除 importance<4 且 2 天前的记录，聊天流水与归档记忆会被误删。
         try:
-            def _clean_old():
-                del_time = (now_bj - datetime.timedelta(days=2)).isoformat() + "+08:00"
-                supabase.table("memories").delete().lt("importance", 4).lt("created_at", del_time).execute()
-            await asyncio.to_thread(_clean_old)
+            await asyncio.to_thread(_clean_old_memories, supabase)
         except Exception as e:
             print(f"⚠️ 旧记忆清理失败（不影响日记）: {e}")
 

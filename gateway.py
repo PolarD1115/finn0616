@@ -1184,6 +1184,52 @@ def _gw_home_context_safe() -> str:
         return ""
 
 
+def _extract_user_side_from_history(content, user_name):
+    """🔒 第1阶段（目标B/C）：从 memories 历史条目中只提取「用户侧」内容。
+
+    背景（第0阶段审计确认）：memories 聊天流水混合存储了用户与 AI 双方原文，
+    旧 AI 回复一旦进入上下文，模型会把它当作自己的续写范例（模仿/重复根因）。
+    本函数按各渠道写入端（gateway._save_conversation / heartbeat._handle_merged /
+    napcat._handle_merged）的确定性格式提取用户侧，无法安全判断角色时返回 None，
+    调用方应整条跳过——宁可少注入，也绝不注入 AI 原文。
+
+    支持的写入格式：
+      1. Web user 条目:  f"{user_name}：{msg}"              → 返回用户消息
+      2. Web AI   条目:  f"我({ai_name})：{reply}"           → 返回 None（明确排除）
+      3. TG/QQ 混合条目: "用户: {text}\\n回复: {reply}" / "{nick}: {text}\\n回复: {reply}"
+                          → 只保留 "回复:" 之前的用户部分，并剥掉 "{角色}: " 前缀
+      4. 其他未知格式    → 返回 None（不做猜测）
+    """
+    if not isinstance(content, str):
+        return None
+    c = content.strip()
+    if not c:
+        return None
+    # 1. Web user 条目（中文冒号），如 "小满：今天好累"
+    if user_name and c.startswith(user_name):
+        if "：" in c:
+            return c.split("：", 1)[-1].strip() or None
+        return None
+    # 2. Web AI 条目，如 "我(Finn)：好的亲爱的……" —— 旧 AI 回复不得进入上下文
+    if c.startswith("我("):
+        return None
+    # 3. TG/QQ 混合条目：以行首 "回复:" / "回复：" 分隔，前半段是用户侧
+    parts = re.split(r"\n\s*回复[:：]", c, maxsplit=1)
+    if len(parts) == 2:
+        user_part = parts[0].strip()
+        if not user_part:
+            return None
+        # 剥掉第一行的 "{用户: " / "{昵称}: " 角色前缀（取第一个冒号之后的内容）
+        for sep in ("：", ":"):
+            if sep in user_part:
+                user_part = user_part.split(sep, 1)[1].strip()
+                break
+        return user_part or None
+    # 4. 其余格式无法安全判断角色（如 TG 兜底 "[未回复：AI 服务未配置]"、
+    #    Core_Cognition 总结、自由活动日志等）——整条跳过，不做猜测
+    return None
+
+
 def _config_source_of(key: str) -> str:
     """判断某个开关当前生效来源：'database' / 'env' / 'default'。"""
     raw = _load_sys_config_raw()
@@ -2324,10 +2370,13 @@ class HostFixMiddleware:
                         c = str(row.get("content", "")).strip()
                         if not c:
                             continue
-                        if c.startswith(user_name):
-                            history_msgs.append({"role": "user", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
-                        elif c.startswith("我(") or c.startswith(f"我({ai_name})"):
-                            history_msgs.append({"role": "assistant", "content": (c.split("：", 1)[-1] if "：" in c else c)[:500]})
+                        # 🔒 第1阶段（目标B）：数据库兜底历史只注入「用户侧」内容。
+                        #    原实现把旧 AI 回复（"我(AI名)：..."）转成 {"role": "assistant"}
+                        #    消息重放给模型，是模仿/重复的直接根因；现在旧 AI 回复与
+                        #    无法判断角色的条目一律跳过，不再进入 messages。
+                        user_side = _extract_user_side_from_history(c, user_name)
+                        if user_side:
+                            history_msgs.append({"role": "user", "content": user_side[:500]})
                     # 合并相邻同 role
                     merged = []
                     for m in history_msgs:
@@ -2777,6 +2826,70 @@ class HostFixMiddleware:
                     _log(f"Pinecone 写入失败: {e}")
             elif mc and not mc.index:
                 _log("🔇 Pinecone 未配置（PINECONE_API_KEY 缺失），跳过向量写入")
+
+            # 2.5 🔒 第3阶段（memory_events 双写）：Web 原始事件账本（只写不读）
+            #    - 受与 memories/Pinecone 相同的 chat_history_write_enabled 门控（隐私开关语义一致：
+            #      用户关闭聊天记录写入时，原始事件同样不落库）；
+            #    - 独立 try 块：任何失败只记日志，绝不影响上方 memories/Pinecone 写入与主聊天响应；
+            #    - user + assistant 两条事件一次批量 insert（同一请求原子落库，不存在半轮事件）；
+            #    - 本函数每轮请求恰好被调度一次（流式 / 天气工具循环两条路径互斥汇聚于此），
+            #      单次调用内只 insert 一次，天然幂等；不做 select-then-insert 预查询——
+            #      表无 source_event_id 唯一约束，查询也做不到强幂等，而查询失败时跳过插入
+            #      反而会丢事件（丢事件的代价高于极小概率的重复）；
+            #    - occurred_at 与 memories.created_at 使用同一 now_str（保存时刻），保证跨表
+            #      时间线可对账；它与"用户消息到达时刻"存在流式回复时长的偏差，已知限制。
+            try:
+                import uuid as _uuid
+                import hashlib as _hashlib
+                import server as _srv_ev
+                _ev_service = _srv_ev.supabase_service
+                if not _ev_service:
+                    _log("🔇 [事件账本] service_role 客户端不可用（SUPABASE_SERVICE_KEY 未配置），跳过 memory_events 写入")
+                else:
+                    # 请求级 ID：uuid4 由服务端生成，仅用于本轮事件归属与日志关联，日志只取前 8 位
+                    _ev_request_id = str(_uuid.uuid4())
+                    # 统一用户隔离 ID：复用全项目唯一解析规则（USER_ID → MEM0_USER_ID → default）
+                    _ev_uid = _srv_ev._resolve_pinecone_user_id()
+                    _ev_rows = []
+                    if user_msg and user_msg.strip():
+                        _ev_rows.append({
+                            "user_id": _ev_uid,
+                            "session_id": None,  # Web 请求当前无可靠会话标识，诚实写空
+                            "channel": "web",
+                            "role": "user",
+                            "content": user_msg,
+                            "content_hash": _hashlib.sha256(user_msg.encode("utf-8")).hexdigest(),
+                            "occurred_at": now_str,
+                            "source_event_id": f"{_ev_request_id}:user",
+                            "processing_status": "pending",
+                            "attempt_count": 0,
+                            "metadata": {"request_id": _ev_request_id},
+                            "created_by": "gateway",
+                        })
+                    if final_save_text and final_save_text.strip():
+                        _ev_rows.append({
+                            "user_id": _ev_uid,
+                            "session_id": None,
+                            "channel": "web",
+                            "role": "assistant",
+                            # final_save_text 默认已剥离 <think>（SAVE_THINKING=false）；
+                            # 工具调用无正文时为脱敏的系统描述，不含工具参数与结果原文
+                            "content": final_save_text,
+                            "content_hash": _hashlib.sha256(final_save_text.encode("utf-8")).hexdigest(),
+                            "occurred_at": now_str,
+                            "source_event_id": f"{_ev_request_id}:assistant",
+                            "processing_status": "pending",
+                            "attempt_count": 0,
+                            "metadata": {"request_id": _ev_request_id},
+                            "created_by": "gateway",
+                        })
+                    if _ev_rows:
+                        def _insert_events():
+                            _ev_service.table("memory_events").insert(_ev_rows).execute()
+                        await asyncio.to_thread(_insert_events)
+                        _log(f"🧾 [事件账本] Web 原始事件已写入 {len(_ev_rows)} 条（请求 {_ev_request_id[:8]}）")
+            except Exception as e:
+                _log(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {e}")
 
         # 3. 🧠 异步触发全渠道统一对话总结（不阻塞响应）
         #    监控网页/QQ/TG/邮件等所有渠道的对话流水，
