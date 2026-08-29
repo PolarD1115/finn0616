@@ -3050,3 +3050,169 @@ memory_events 0→0（channel=web 0→0）、memory_items 0→0、memories 3882�
 
 部署需要用户决策与操作：① 用户确认后将第 1～3 阶段修改提交并推送到 GitHub（或授权 AI 创建 commit）；② 确认 Zeabur 自动构建部署成功、服务健康；③ 再执行 Web 合成验证请求（单次、合成内容）与 memory_events 成对性检查。全部数据库与代码安全约束保持不变。
 
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 7 阶段后置验证：生产 Web 双写验证（请求未发送，待事件积累）
+
+### 日期与前置状态
+
+2026-08-29。用户已自行完成代码提交、推送和 Zeabur 部署（本阶段不使用 Zeabur MCP、不负责部署与推代码）。
+
+### Git 与代码版本核查
+
+- 新 HEAD `28e74f6 feat(memory): add safe memory pipeline foundations`：gateway.py 含 memory_events 双写（与工作区无差异）、napcat.py 含第 1 阶段失败保护、heartbeat.py 含清理暂停、server.py 含 service_role 客户端——**用户推送版本包含第 1～3 阶段全部功能**。
+- 工作区仍有 3 个未提交修改：home/__pycache__ 缓存、prompts/reply_rules.md（非本系列阶段修改）、test_shared_experience_phase6.py（第 1 阶段的 D4 测试契约更新，不影响生产行为）。
+- 生产**运行版本**未能通过工具直接确认（按要求不使用 Zeabur MCP）；仅能确认「用户推送的代码包含双写」。
+
+### Web 验证请求：未发送
+
+原因：生产服务 URL 与 API 认证信息（API_SECRET）没有安全可验证的来源——项目文档无生产 URL，不猜测、不向用户索要密钥复制到聊天。按任务规则「URL 或调用条件不明确时不得发送请求」报告为：**生产请求未发送，因为缺少安全可验证的目标或认证条件**。
+
+### Supabase 只读统计
+
+memory_events 总数 0（channel=web 0、user 0、assistant 0、pending 0）、memory_items 0、memories 3885（生产服务自然写入水平）。**部署后尚无 Web 聊天产生事件**——双写的真实链路验证待首次真实 Web 请求发生后进行（用户正常聊天即可触发，无需合成请求也可积累验证样本）。
+
+### 测试与声明
+
+py_compile 5 文件通过；8 个测试套件 217/217 通过。本阶段零代码修改；未执行任何 Supabase 写入；未更新事件状态字段；未调用事实提取；未操作 Pinecone；未发送任何渠道消息；未新增环境变量；未保存 Prompt/模型响应/正文；未读取或输出凭据；未调用 Zeabur MCP。
+
+### 已知限制与下一阶段建议
+
+- 双写真实链路验证的两个途径：① 用户经 Web 正常聊天后，用 Supabase 只读核查成对性与字段质量（推荐，零成本）；② 若需受控验证，由用户 privately 提供生产 URL 与 API_SECRET 的使用方式后再发单次合成请求。
+- 事件积累后重跑第 6 阶段真实提取试运行；保持全部既有约束（不删数据、不动 Pinecone、不恢复 Archived_Chat、不自动提取、不接入 memory_items 上下文）。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 8 阶段：真实 Web 双写只读核验（结论：SUCCESS）
+
+### 日期与结论
+
+2026-08-29。用户已通过 Web 正常使用，本阶段对生产 `memory_events` 做 Supabase 只读核验。**双写结论：SUCCESS**。
+
+### memory_events 统计（全部来自 Supabase 只读实查）
+
+- 总数 **28**；channel=web 28；role 分布 user 14 / assistant 14；created_by 全部 gateway；processing_status 全部 pending；时间范围 2026-08-28 16:56~17:42 UTC（约 46 分钟真实使用窗口）；单用户、session_id 全空。
+- 字段质量 12 项异常全部为 0：非 user/assistant 角色 0、空 content 0、空 hash 0、空 source_event_id 0、created_by 异常 0、非 pending 0、attempt_count≠0 为 0、batch_id 非空 0、processed_at 非空 0、last_error 非空 0、session_id 非空 0、跨 channel 0。
+- 成对性：14 个请求组、**14 组完全成对**（每组恰 1 user + 1 assistant）、0 个只有 user、0 个只有 assistant、0 个多 user/assistant、0 个非法后缀、0 个重复 source_event_id、0 个跨 channel 组。
+- 重复检查：3 组相同 content_hash（涉及 8 行 = 6 user + 2 assistant，跨 8 个不同请求）——为用户真实重复使用（相同文本重发），全部跨请求且 source_event_id 各异，**非重复写入**；每个请求组内 user/assistant hash 各不相同（正常）。
+- 隔离检查：`<think>`/`<thinking>` 0 命中、凭据模式 0 命中、metadata 字段名仅 request_id。
+
+### 旧链路交叉验证（同时间窗口 memories）
+
+同窗口 memories 写入 34 条：Web_Chat 流水 12、Archived_Chat 14、Shared_Experience 4、Core_Cognition 2、Desire_Trace 1、Free_Activity 1——证明旧链路与新账本并行工作，且第 1 阶段修复后的总结链路在生产成功执行（有 Core_Cognition 产出与共同经历提取，归档 14 条）。两账本独立计数，精确逐轮对账受归档时序影响，不作为双写判据。
+
+### memory_items 与提取隔离
+
+memory_items 0 行（未写入）；未调用 memory_extractor；未执行事实提取；memory_events 状态字段（processing_status/processed_at/attempt_count/batch_id/last_error）全部未被本阶段修改；上下文注入与 Pinecone 未改变。
+
+### 测试与声明
+
+py_compile 5 文件通过；8 个测试套件 217/217 通过。本阶段零代码修改；全部 Supabase 查询为只读 SELECT/count；未发送请求、未调用 Zeabur MCP、未调用真实 LLM、未操作 Pinecone、未输出任何正文/ID/hash 原文/凭据。
+
+### 已知限制与下一阶段建议
+
+- 生产运行版本仍无法独立确认（无 Zeabur MCP），但事件特征（channel=web、created_by=gateway、成对、时间窗口）与第 3 阶段代码行为完全吻合。
+- 双写结论 SUCCESS 后的下一阶段：再积累一小批事件后重跑第 6 阶段真实提取试运行（只读 5-10 条 pending → 单次 compression → memory_extractor 只出候选 → 人工质量审查）；候选合格后再设计 service_role 写入与状态更新执行器。保持全部既有约束。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 9 阶段：真实事件提取试运行（真实 compression 调用未执行：本地执行环境配置阻塞）
+
+### 日期与结论
+
+2026-08-29。目标：从真实 memory_events 只读选择最多 10 条 pending 事件，调用 1 次真实 compression，经第 5 阶段提取器生成候选并人工质量审查（零写入）。**实际结果：事件选择与脱敏检查完成；真实 compression 调用未执行——本地执行环境配置阻塞（端点池为空），按任务 §十四 失败分支记录，未重试、未修改配置。**
+
+### 事件选择与脱敏检查（Supabase 只读）
+
+- 执行前统计：memory_events 28 条全部 pending、全部 channel=web、单用户单渠道、14 组各 2 条成对。
+- 选中范围：最近的 5 个成对请求组共 10 条（时间窗口 2026-08-28 17:25 ~ 08-29 02:01 UTC，两轮对话）。
+- 脱敏扫描：窗口内凭据/密码/长数字串/身份证银行卡模式 0 命中（更早窗口有 2 条命中凭据类模式词，已排除在选择外）；无 `<think>` 标记。未触发 SENSITIVE_EVENT_SKIPPED。
+- 读取中发现（记录不修复）：assistant 事件 content 含上游模型的 `<final>...</final>` 内部标记——第 5 阶段验证规则未覆盖的新形态（非 reasoning/非凭据），作为 `INTERNAL_MARKUP_FINAL` 观察项记录，下一阶段提取器规则校准时处理。
+- 事件正文仅在内存中用于审查与传递，未写入任何文件、未进入报告。
+
+### 真实 compression 调用未执行的原因（静态实证）
+
+- 本地进程 `gateway.resolve_llm_pool("compression")` 实测返回**空池（0 端点）**；
+- 本地环境 COMPRESS_API_KEY / CHAT_API_KEY 均未配置；模型注册表（user_facts.llm_models）只能经生产数据库访问，读取其凭据内容被任务禁止；
+- 空池时 `ask_role_sync` 确定性行为为返回空字符串（server.py 空池直接 return）→ 提取器将返回 EMPTY_RESPONSE 且候选必为空；
+- 数据传递通道另受 Windows 命令行 8191 字符限制约束（事件 payload 约 13KB），可行中转方案与「不得将真实事件写入文件」禁令冲突；
+- 综合判断：为一次确定性失败的调用违反数据落地禁令不值得，真实调用未执行。未重试、未修改环境变量、未修改模型配置、未换模型。
+
+### 状态计划与数据库状态
+
+- 未生成状态计划（未到达提取阶段）。
+- Supabase 前后只读对比：memory_events 28→30（+2 为用户继续聊天的生产自然写入，非本阶段操作）；全部事件 processing_status 仍为 pending（30/30）、processed 0、failed 0、batch_id/processed_at/attempt_count/last_error 非空计数均为 0；memory_items 0→0；memories 3956→3960（自然写入）。
+
+### 测试与声明
+
+py_compile 5 文件通过；8 个测试套件 217/217 通过。临时脚本已删除（未含任何真实数据）。本阶段零代码修改；未执行任何 Supabase 写入；未操作 Pinecone；未发送消息；未新增环境变量；未保存 Prompt/模型响应/正文文件；未读取或输出凭据；未调用 Zeabur MCP。
+
+### 已知限制与下一阶段建议
+
+- 真实提取试运行的**前置条件**：必须在能访问生产模型注册表与凭据的环境中执行（如生产容器内手动触发一次性提取脚本，或将生产 LLM 配置以受控方式提供给本地）；本地静态环境下该调用必然失败。
+- 下一阶段：① 在生产环境内以最小脚本执行一次真实提取试运行（事件读取、提取器调用、候选输出到安全日志人工审查，零写入）；② 候选质量合格后设计 service_role 写入与状态更新执行器；③ 提取器规则校准需处理 `<final>` 标记剥离（INTERNAL_MARKUP_FINAL 观察项）。保持全部既有约束。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 10 阶段：生产安全手动事实提取预览接口
+
+### 日期与目标
+
+2026-08-29。目标：新增受 `/api/*` 统一鉴权保护的手动预览接口 `POST /api/memory-extraction-preview`（只读、零写入、手动触发），并修复 assistant 事件的 `<final>...</final>` 内部包装。
+
+### 修改文件
+
+| 文件 | 内容 |
+|---|---|
+| `memory_preview.py`（新增） | 预览模块：只读选择 pending Web 事件（最近 30 条窗口内按请求前缀分组、成对完整组、单用户、≤limit 不拆散）→ 敏感内容筛查（命中整批跳过）→ 复用 memory_extractor（compression ≤1 次，llm_call 可注入）→ 脱敏响应组装 |
+| `memory_extractor.py` | 新增 `_strip_internal_markup`（assistant 事件 `<final>` 剥离：完整包裹取正文/零散标签移除/大小写不敏感/不改输入对象）+ 验证层 `INTERNAL_MARKUP` 拒绝残留标记 + verbatim 对比基线改用剥离后文本 + prompt 渲染 assistant 剥离（user 事件原样） |
+| `gateway.py` | 路由 `/api/memory-extraction-preview`（位于 /api/* 统一 API_SECRET 鉴权之下）+ handler `_handle_memory_extraction_preview`（POST-only 405 / JSON body / confirm=PREVIEW_ONLY / limit 2~10 校验 / 复用 server.supabase_service / 500 脱敏） |
+| `test_memory_preview_phase10.py`（新增，32 个测试） | 覆盖任务 A-H 全场景 |
+| `PROJECT_NOTES.md` | 追加本节日志 |
+
+未修改 server.py / napcat.py / heartbeat.py / shared_experience.py / migrations / requirements.txt / VARIABLES.md / 前端 / Docker / Pinecone / 正式上下文注入。
+
+### 接口设计要点
+
+- **方法与鉴权**：仅 POST（其余 405）；位于 `/api/*` 统一 `_check_api_secret` 保护内（未配置 API_SECRET 时 503 拒绝——复用既有行为，未建第二套认证）；OPTIONS 由全局 CORS 处理。
+- **请求体**：`{"confirm":"PREVIEW_ONLY","limit":2~10}`——confirm 严格匹配否则 400；limit 非整数/越界 400 不自动扩大；请求体不接受 user_id/event ID/Prompt/模型参数。
+- **事件选择**：只读查询 pending+web+user/assistant（最近 30 条窗口）→ 非法后缀跳过 → 单用户（最近完整组所属用户）→ 完整成对组优先、不拆散、≤limit；无完整组返回 `NO_COMPLETE_EVENT_GROUPS`、无事件返回 `NO_PENDING_EVENTS`。
+- **敏感筛查**：凭据模式（含中文「密码」）/身份证/银行卡正则——命中整批跳过 `SENSITIVE_BATCH_SKIPPED`，只返回命中代码计数，不返回命中内容。
+- **compression**：复用 `make_compression_llm_call()`，每请求 ≤1 次，失败映射 LLM_ERROR/EMPTY_RESPONSE/JSON_PARSE_ERROR/ALL_CANDIDATES_REJECTED——**run_preview 严格检查 extract 结果的 ok 状态，失败绝不包装成 PREVIEW_READY**（此检查由 mock 测试捕获缺陷后补上）。
+- **响应**：只返回 stats/candidates（preview_index+memory_type+content+importance+confidence+subject_key+时间字段+status+quality_hint=NEEDS_HUMAN_REVIEW）/rejected 原因代码/status_plan(executed=false)/write_guards；禁止返回事件正文、ID、user_id、source_event_id、content_hash、batch_id、metadata、Prompt、模型原始响应、assistant 原始回复。
+- **零写入**：模块只调用 `.select()` 链；源码约束测试锁定无 insert/update/delete/upsert/rpc/pinecone/自动调度/create_task/Timer。
+
+### `<final>` 处理
+
+- 清理位置：memory_extractor 的 Prompt 渲染（assistant 事件剥离后进入模型输入）与 verbatim 对比基线（剥离后文本保证相似度一致）。
+- user 事件含 `<final>` 原样保留不改写；候选残留 `<final>`/`</final>` → `INTERNAL_MARKUP` 拒绝；不修改原始事件对象与数据库原文；未扩大成通用 HTML 清洗器。
+- 测试覆盖：完整包裹/大小写变体/零散标签/user 原样/残留拒绝/输入对象不变 6 项。
+
+### 实现中发现并修复的缺陷（由 mock 测试捕获）
+
+1. `_FINAL_CLOSE_RE` 定义缺失导致 NameError（正则块 Edit 遗漏）；
+2. run_preview 未检查 extract 结果的 ok 状态——提取失败会被错误包装成 PREVIEW_READY（D 组测试全部捕获）；
+3. select 计数语义：满额后 break 跳过剩余组统计、owner 应取「最近完整组所属用户」而非最新合法事件所属用户。
+
+### 测试结果
+
+- `test_memory_preview_phase10.py`：**32/32 通过**（A 鉴权路由/confirm/limit/非法请求零查询零调用；B 成组选择/不拆散/非法后缀/跨用户/无 ID 泄露；C 敏感整批跳过含中文密码模式且 LLM 零调用；D compression 单次与 5 种结果映射；E `<final>` 6 项；F 零写入（fake 仅 select 链、write_guards 全 false、无 pinecone/调度）；G 响应脱敏；H 源码约束）。
+- 回归：第 1-5 阶段 8 个测试套件 **217/217 通过**（合计 249）。
+- py_compile memory_preview/memory_extractor/gateway 通过。
+
+### Supabase 只读核查
+
+- 本阶段开发期间生产自然增长：memory_events 99→101（全部 pending，用户持续使用）；memory_items 保持 0；新表 RLS 与零策略未变。本阶段零写入。
+
+### 声明
+
+未执行 Supabase INSERT/UPDATE/DELETE/DROP/TRUNCATE；未写 memory_items；未更新 memory_events 状态字段；未操作 Pinecone；未真实调用新接口；未调用真实 compression；测试全部 mock；未新增环境变量；未保存 Prompt/模型响应/真实正文文件；未读取或输出凭据；未调用 Zeabur MCP；未创建 commit。
+
+### 已知限制与下一阶段建议
+
+- 新接口尚未在生产部署与真实调用——用户提交推送部署后，用 API_SECRET 手动 POST 一次（建议 limit=6），人工审查候选质量（只记录脱敏结论）；
+- 候选 content 属用户隐私，仅受 API_SECRET 保护——泄露即暴露长期记忆候选，须妥善保管；
+- 重复手动调用会重复消耗模型成本；接口仍不写库，pending 事件继续积累；
+- `<final>` 之外的内部标记形态仍可能出现（已有 INTERNAL_MARKUP 兜底拒绝）；
+- 质量合格后下一阶段设计：service_role 写入 memory_items（只写 pending_review、批内+跨批精确去重、写入与状态更新分步可审计、失败不标 processed）；质量不足则先校准提取器 Prompt/规则并重跑 mock。全程保持：不删除旧数据、不恢复 Archived_Chat、不操作 Pinecone、不自动调度、不接入正式上下文。
+

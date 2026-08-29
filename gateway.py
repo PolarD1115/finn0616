@@ -1870,6 +1870,11 @@ class HostFixMiddleware:
             await self._handle_miniapp_page(send)
             return
 
+        # ---------- 🧪 手动事实提取预览（第10阶段：只读、零写入；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-extraction-preview":
+            await self._handle_memory_extraction_preview(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -2917,6 +2922,58 @@ class HostFixMiddleware:
             await _send_json_resp(send, 200, {"items": items, "total": len(items)})
         except Exception as e:
             await _send_json_resp(send, 500, {"error": str(e)})
+
+    # ------------------------------------------
+    # 🧪 手动事实提取预览 /api/memory-extraction-preview（第10阶段）
+    #    只读、零写入：不写 memory_items、不更新 memory_events、不触碰 Pinecone。
+    #    位于 /api/* 统一鉴权之下（API_SECRET）；仅支持 POST；compression ≤1 次。
+    # ------------------------------------------
+    async def _handle_memory_extraction_preview(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405
+            await _send_json_resp(send, 405, {"error": f"Method {method} not allowed"})
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, {"error": "Invalid JSON body"})
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, {"error": "body 必须是 JSON 对象"})
+            return
+
+        # 显式确认：防止误触发（请求体不接受 user_id/event ID/Prompt/模型参数）
+        if payload.get("confirm") != "PREVIEW_ONLY":
+            await _send_json_resp(send, 400, {"error": "confirm 必须为 \"PREVIEW_ONLY\""})
+            return
+        limit_raw = payload.get("limit", 10)
+        if isinstance(limit_raw, bool) or not isinstance(limit_raw, int) \
+                or not (2 <= limit_raw <= 10):
+            await _send_json_resp(send, 400, {"error": "limit 必须为 2～10 的整数"})
+            return
+
+        try:
+            import memory_preview
+            import server as _srv_preview
+            result = await memory_preview.run_preview(
+                _srv_preview.supabase_service, limit=limit_raw)
+            await _send_json_resp(send, 200, result)
+        except Exception as e:
+            # 零写入保证：任何异常都不落库，只返回脱敏错误
+            _log(f"⚠️ [提取预览] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
+                                              "candidates": []})
 
     # ------------------------------------------
     # 🎛️ 多模型管理接口 /api/models
