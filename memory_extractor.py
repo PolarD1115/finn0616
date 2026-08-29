@@ -35,6 +35,10 @@ MAX_INPUT_TOTAL_CHARS = 20000    # Prompt 事件区总长上限
 CURRENT_DEFAULT_EXPIRY_HOURS = 72  # current 无 expires_at 时的保守默认（有限期，非无限）
 CORE_MIN_CONFIDENCE = 0.9
 CORE_MIN_IMPORTANCE = 8
+OVER_INFERENCE_CONFIDENCE_FLOOR = 0.8  # long_term/core 含泛化限定词时要求的最低置信度
+# 泛化限定词（第 11 阶段真实样本暴露）：仅作为「证据不足」信号与 confidence 联动，
+# 不是机械黑名单——用户明确表达相应频率/条件/因果时模型会给出高置信度，不误伤。
+GENERALIZATION_WORDS = ("容易", "经常", "总是", "尤其", "通常", "长期", "每当")
 VERBATIM_COPY_RATIO = 0.7        # 与 assistant 原文相似度阈值
 VERBATIM_COPY_MIN_SHARED_CHARS = 12  # 与 assistant 原文最大公共子串阈值
 LOW_VALUE_MIN_CHARS = 16
@@ -222,6 +226,15 @@ def build_memory_extraction_prompt(events, ai_name="助手", user_name="用户")
         "就判定为稳定人格特征。\n"
         f"10. 如果无法确认长期有效，不要归类为 core；如果事实只适用于短期，归类为 current 并设置 expires_at。\n"
         "11. 没有足够证据时输出空数组，绝不凑数、绝不生成记忆之外的内容。\n\n"
+        "【过度推断红线】\n"
+        "- 候选中的每个限定条件（原因、触发条件、频率、程度、时间跨度、长期稳定性、因果关系）"
+        "都必须能在所引用的用户事件中找到明确证据。\n"
+        "- 不得自行补充「经常 / 总是 / 容易 / 尤其 / 通常 / 长期 / 每当 / 因为 / 导致 / "
+        "在……时会……」这类限定——除非用户明确表达了相应的频率、条件、原因或时间跨度。\n"
+        "- 一次性的当前状态优先归类为 current（必须带 expires_at），不得泛化为长期规律；"
+        "不得仅凭当时的场景或环境推导用户的长期体质、习惯或人格特征。\n"
+        "- 证据不足时：删除无依据的限定、将候选降级为 current、或直接不生成该候选。\n"
+        f"- 不得通过 {ai_name} 的回复补全用户未表达的原因、条件或规律。\n\n"
         "【memory_type 规则】（只允许 core / current / long_term / moment / memo）\n"
         f"- core：仅限{user_name}的姓名、明确的长期身份、明确的人际边界、"
         f"{user_name}明确要求长期记住的重要设定、重要纪念日；默认不要轻易输出 core。\n"
@@ -361,6 +374,15 @@ def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc):
             imp = max(imp, CORE_MIN_IMPORTANCE)
         elif conf < CORE_MIN_CONFIDENCE or imp < CORE_MIN_IMPORTANCE:
             mt = "long_term"  # 降级，不拒绝（保留可审查的低层级候选）
+
+    # 7.5 🔒 第 11 阶段：过度推断兜底——long_term/core 含泛化限定词但置信度不足时拒绝。
+    #    第 9 阶段真实样本暴露：模型会把一次场景泛化为长期规律（如「一次手凉」→
+    #    「长期容易手凉，尤其疲劳/冷环境时」）。泛化词本身不是黑名单（用户明确表达时
+    #    模型会给出高置信度，见 B/E 场景）；低置信 + 泛化限定 = 模型自行补全了
+    #    频率/触发条件/因果，证据不足 → 拒绝，交由后续批次或人工确认。
+    if mt in ("long_term", "core") and conf < OVER_INFERENCE_CONFIDENCE_FLOOR:
+        if any(w in content for w in GENERALIZATION_WORDS):
+            return None, "OVER_INFERENCE"
 
     # 8. current 必须有限期：模型未给 → 补默认（从 max(valid_at, 最早来源事件时间) 起算，
     #    满足 DB CHECK expires_at >= valid_at）；模型给的值早于 valid_at → clamp 到 valid_at
