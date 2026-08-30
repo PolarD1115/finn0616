@@ -212,72 +212,55 @@ def build_memory_extraction_prompt(events, ai_name="助手", user_name="用户")
     events_text = "\n".join(lines)
 
     return (
-        "你是长期记忆事实提取模块，不是回复生成模块。你的唯一任务：从下面的原始事件中"
-        "提取「未来可能有用的事实」，输出严格 JSON。\n\n"
-        f"【事件列表】（[i] 为事件索引，source_event_indexes 必须引用这些索引）\n"
-        f"{events_text}\n\n"
-        "【提取规则】\n"
+        "你是长期记忆事实提取模块，不是回复生成模块。唯一任务：从下面的原始事件中提取"
+        "「未来可能有用的事实」，输出严格 JSON；没有可提取内容时输出 {\"memories\":[]}。\n\n"
+        f"【事件列表】（[i] 为事件索引，source_event_indexes 必须引用这些索引）\n{events_text}\n\n"
+        "【事实来源与防模仿】\n"
         f"1. 只提取用户明确表达或事件明确证明的内容；不要把 {ai_name} 自己的回复当成用户事实。\n"
         "2. 禁止复制或改写任何原始回复的句子、口头禅、撒娇、情绪表达、语气词；"
-        "content 必须用自己的话改写为陈述句。\n"
-        "3. 禁止输出任何角色前缀格式（如「我(名称)：」「assistant:」「回复:」），"
-        "候选必须是无前缀的纯事实陈述。\n"
-        "4. 禁止生成用户人格定性、心理诊断、关系性夸张（如「用户很依赖我」「我们像家人」）。\n"
-        "5. 禁止把 AI 的猜测、建议、推断写成用户事实；未经用户确认的承诺不提取。\n"
-        f"6. 每条候选必须至少引用一条用户事件，且必须能从所引事件直接推断，不得编造对话外信息。\n"
-        "7. 当前用户最新表达优先于旧事实；用户明确说「记住」时提高 importance（>=8），但内容仍必须真实有据。\n"
-        "8. 天气/宠物状态/设备状态/钱包/纯工具结果/单次闲聊/问候/单次情绪，一律不提取。\n"
-        "9. 不要因为用户问了一个问题就认为用户拥有相关偏好；不要因为用户提到某件事一次，"
-        "就判定为稳定人格特征。\n"
-        f"10. 如果无法确认长期有效，不要归类为 core；如果事实只适用于短期，归类为 current 并设置 expires_at。\n"
-        "11. 没有足够证据时输出空数组，绝不凑数、绝不生成记忆之外的内容。\n\n"
-        "【候选原子化】\n"
-        "- 每条 memory 只陈述一个可独立核验的事实；不要把事实、评价、要求、结果拼成一句。\n"
-        "- 一句话包含两个独立事实时，必须拆成多个候选分别输出。\n"
-        "- 拆分后某部分没有明确用户证据的，丢弃该部分，不要硬凑。\n"
-        "- 使用简洁的第三人称陈述；不复述对话过程。\n"
-        "- 不写「用户说……然后要求……」式的转录；不生成语法破碎、需要原对话才能理解的句子。\n"
-        "- 不保留含糊指代（如「相应」「那个」「这件事」）——必须写成明确的对象。\n\n"
+        "content 必须用自己的话改写为陈述句；不得包含模型承诺或 AI 自我描述。\n"
+        "3. 禁止输出角色前缀（如「我(名称)：」「assistant:」「回复:」）、对话转录，"
+        "以及用户人格定性、心理诊断、关系性夸张（如「用户很依赖我」「我们像家人」）。\n"
+        "4. 禁止把 AI 的猜测、建议、推断写成用户事实；未经用户确认的承诺不提取。\n"
+        f"5. {ai_name} 事件的证据边界：只用于理解对话结构——不得从中补充评价、数量、原因、"
+        "频率或用户要求；不得补全含糊指代；不得据其推导长期规律。\n"
+        "6. 天气/宠物状态/设备状态/钱包/纯工具结果/单次闲聊/问候/单次情绪，一律不提取。\n\n"
         "【限定必须有用户证据】\n"
-        "- 候选中的评价（超额/顺利/显著/优秀等）、程度（很/极其/明显/更严重等）、"
+        "候选中的每个限定条件——评价（超额/顺利/显著/优秀等）、程度（很/极其/明显/更严重等）、"
         "数量（两个阶段/三次/多个/全部等）、比较（更多/更快）、频率（经常/总是/每次等）、"
         "条件（在某种情况下会怎样）、原因和因果（因为/导致/所以）、"
-        "时间跨度（长期/一直/从来）——每一项都必须由所引用的用户事件明确表达。\n"
-        f"- 用户只表达核心事实时，只保留核心事实，不得补充任何评价、数量或程度。\n"
+        "时间跨度（长期/一直/从来）——都必须能在所引用的用户事件中找到明确依据；"
+        "用户只表达核心事实时，只保留核心事实。\n"
         "- confidence 只是模型对提取结果的自评分，不能证明任何条件、频率、数量、"
-        "程度、原因或评价来自用户——不要用高置信度为自己补充的限定背书。\n\n"
-        f"【{ai_name} 事件的证据边界】\n"
-        f"- {ai_name} 的事件只用于理解对话结构：不得从中补充评价、数量、原因、频率"
-        "或用户要求；不得补全含糊指代；不得据其推导长期规律。\n\n"
-        "【过度推断红线】\n"
-        "- 候选中的每个限定条件（原因、触发条件、频率、程度、时间跨度、长期稳定性、因果关系）"
-        "都必须能在所引用的用户事件中找到明确证据。\n"
-        "- 不得自行补充「经常 / 总是 / 容易 / 尤其 / 通常 / 长期 / 每当 / 因为 / 导致 / "
-        "在……时会……」这类限定——除非用户明确表达了相应的频率、条件、原因或时间跨度。\n"
-        "- 一次性的当前状态优先归类为 current（必须带 expires_at），不得泛化为长期规律；"
-        "不得仅凭当时的场景或环境推导用户的长期体质、习惯或人格特征。\n"
-        "- 证据不足时：删除无依据的限定、将候选降级为 current、或直接不生成该候选。\n"
-        f"- 不得通过 {ai_name} 的回复补全用户未表达的原因、条件或规律。\n\n"
-        "【memory_type 规则】（只允许 core / current / long_term / moment / memo）\n"
+        "程度、原因或评价来自用户——不要用高置信度为自己补充的限定背书。\n"
+        "- 证据不足时：删除无依据的限定、将候选降级为 current（必须带 expires_at）、"
+        "或直接不生成该候选；不得把一次场景泛化为长期规律；不得仅凭当时的场景或环境"
+        "推导用户的长期体质、习惯或人格特征；当前最新表达优先于旧事实。\n"
+        "- 用户明确说「记住」时提高 importance（>=8），但内容仍必须真实有据。\n\n"
+        "【候选原子化与类型规则】（memory_type 只允许 core / current / long_term / moment / memo）\n"
+        "- 每条 memory 只陈述一个可独立核验的事实；一句话包含两个独立事实时，"
+        "拆成多个候选分别输出；拆分后没有明确用户证据的部分直接丢弃，不要硬凑。\n"
+        "- 不保留含糊指代（如「相应」「那个」「这件事」）；不生成语法破碎、"
+        "需要原对话才能理解的句子；不要因为用户问了问题就认定用户拥有相关偏好。\n"
         f"- core：仅限{user_name}的姓名、明确的长期身份、明确的人际边界、"
         f"{user_name}明确要求长期记住的重要设定、重要纪念日；默认不要轻易输出 core。\n"
         "- current：最近正在做什么、近期情绪、当前计划、当前身体状态、短期未完成事项；"
         "必须给 expires_at（ISO 时间，含时区，不得无限期）。\n"
         "- long_term：稳定偏好、长期习惯、重要经历、长期计划、持续性关系事实、"
         "明确的工作或生活选择；一次性话题不要写成长期事实。\n"
-        f"- moment：{user_name}和{ai_name}一起完成的重要事情、关系中的特殊时刻、"
+        f"- moment：{user_name}和{ai_name}一起完成的重要事情、关系中特殊的时刻、"
         "重要的第一次、冲突与和好；必须是事实化短叙述，不得包含 "
         f"{ai_name} 的原文、语气或口头禅。\n"
         "- memo：当前窗口未完成事项、下次对话需要接续的任务、刚提出尚未完成的计划；"
         "不是完整聊天总结。\n\n"
-        "【输出格式】只返回 JSON，不要 Markdown 代码围栏，不要任何解释：\n"
+        "【输出格式】只返回一个 JSON 对象，不要 Markdown 代码围栏，不要任何解释：\n"
         '{"memories":[{"memory_type":"long_term","content":"事实化陈述",'
         '"subject_key":"english_snake_topic 或 null","importance":4,"confidence":0.9,'
         '"valid_at":"ISO时间或null","invalid_at":null,'
         '"expires_at":"ISO时间或null（current 必填）",'
         '"source_event_indexes":[0],"reason":"简短依据"}]}\n'
-        f"- memories 最多 {MAX_CANDIDATES} 条；每条 content 不超过 {MAX_CONTENT_CHARS} 字。\n"
-        f"- source_event_indexes 每条候选至少 1 个、最多 {MAX_SOURCE_INDEXES} 个，"
+        f"- memories 最多 {MAX_CANDIDATES} 条；每条 content 不超过 {MAX_CONTENT_CHARS} 字；"
+        f"source_event_indexes 每条候选至少 1 个、最多 {MAX_SOURCE_INDEXES} 个，"
         "且至少一个指向用户事件。"
     )
 
@@ -286,16 +269,56 @@ def build_memory_extraction_prompt(events, ai_name="助手", user_name="用户")
 # 严格 JSON 解析
 # ════════════════════════════════════════════════════════════
 
+# 🔒 第 15 阶段：严格单围栏兼容——只处理「整个响应被一个完整代码围栏包裹」的形态，
+#    围栏前后只允许空白、语言标记仅允许空或 json（大小写变体）、不做任何 JSON 修复。
+FENCE_ERR_MALFORMED = "FENCE_MALFORMED"
+_FENCE_OPEN_RE = re.compile(r"^```([A-Za-z]*)[ \t]*\r?\n")
+_FENCE_CLOSE_RE = re.compile(r"\r?\n[ \t]*```[ \t]*$")
+
+
+def _strip_single_json_fence(text):
+    """严格剥离单一完整 JSON 代码围栏（第 15 阶段）。
+
+    仅接受两种形态：裸 JSON（原样返回），或「开围栏 + 内容 + 闭围栏」构成整个响应
+    （strip 后首尾即围栏标记，语言标记仅允许空或 json 大小写变体）。
+    围栏外说明、多个围栏、围栏内嵌套围栏、不支持的语言标记、截断（缺闭围栏）、
+    空内容——一律拒绝。不做 JSON 修复、不抽取混合文本中的 JSON、不修改输入。
+    返回 (可解析正文, None) 或 (None, FENCE_ERR_MALFORMED)。"""
+    s = text.strip()
+    if not s.startswith("```"):
+        return s, None  # 裸 JSON：成败交由后续 json.loads 判定
+    open_m = _FENCE_OPEN_RE.match(s)
+    if not open_m:
+        return None, FENCE_ERR_MALFORMED
+    lang = open_m.group(1)
+    if lang and lang.lower() != "json":
+        return None, FENCE_ERR_MALFORMED  # 不支持的语言标记
+    rest = s[open_m.end():]
+    close_m = _FENCE_CLOSE_RE.search(rest)
+    if not close_m:
+        return None, FENCE_ERR_MALFORMED  # 缺闭围栏（截断或闭围栏前混入说明）
+    body = rest[:close_m.start()].strip()
+    tail = rest[close_m.end():].strip()
+    if tail or not body:
+        return None, FENCE_ERR_MALFORMED  # 闭围栏后仍有内容 / 围栏内为空
+    if "```" in body:
+        return None, FENCE_ERR_MALFORMED  # 多个围栏或内容中嵌套围栏标记
+    return body, None
+
+
 def parse_memory_extraction_response(text):
     """严格解析模型输出。返回 (candidates_raw_list, None) 或 (None, error_code)。
-    Markdown 代码围栏按任务约定直接拒绝（模型被明令禁止使用围栏）。"""
+
+    🔒 第 15 阶段：接受「裸 JSON」或「整个响应被单一完整 json 围栏包裹」两种形态
+    （围栏剥离后仍走 json.loads + 结构校验，不做任何 JSON 修复）；
+    围栏外说明、多个围栏、不支持的语言标记、截断与畸形 JSON 一律 JSON_PARSE_ERROR。"""
     if not isinstance(text, str) or not text.strip():
         return None, ERR_EMPTY
-    s = text.strip()
-    if s.startswith("```"):
+    body, fence_err = _strip_single_json_fence(text)
+    if fence_err or not body:
         return None, ERR_JSON
     try:
-        data = json.loads(s)
+        data = json.loads(body)
     except (json.JSONDecodeError, ValueError):
         return None, ERR_JSON
     if not isinstance(data, dict):
