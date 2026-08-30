@@ -1806,10 +1806,11 @@ async def fetch_schedule_for_injection():
 
     _tz_bj = datetime.timezone(datetime.timedelta(hours=8))
     now_bj = datetime.datetime.now(_tz_bj)
+    # 注意：aware datetime 的 isoformat() 已自带 +08:00，不能再手动拼接，否则时区重复导致 API 解析失败
     time_min = (now_bj - datetime.timedelta(days=days_before)).replace(
-        hour=0, minute=0, second=0, microsecond=0).isoformat() + "+08:00"
+        hour=0, minute=0, second=0, microsecond=0).isoformat()
     time_max = (now_bj + datetime.timedelta(days=days_after)).replace(
-        hour=23, minute=59, second=59, microsecond=0).isoformat() + "+08:00"
+        hour=23, minute=59, second=59, microsecond=0).isoformat()
 
     try:
         def _fetch():
@@ -1822,8 +1823,13 @@ async def fetch_schedule_for_injection():
             ).execute().get('items', [])
 
         events = await asyncio.to_thread(_fetch)
-    except Exception:
-        return None  # 查询失败静默降级
+    except Exception as e:
+        try:
+            import gateway as _gw
+            _gw._log(f"⚠️ [Calendar] 日程查询失败: {e}")
+        except Exception:
+            pass
+        return None
 
     if not events:
         _sched_cache["text"] = None
