@@ -35,10 +35,15 @@ MAX_INPUT_TOTAL_CHARS = 20000    # Prompt 事件区总长上限
 CURRENT_DEFAULT_EXPIRY_HOURS = 72  # current 无 expires_at 时的保守默认（有限期，非无限）
 CORE_MIN_CONFIDENCE = 0.9
 CORE_MIN_IMPORTANCE = 8
-OVER_INFERENCE_CONFIDENCE_FLOOR = 0.8  # long_term/core 含泛化限定词时要求的最低置信度
-# 泛化限定词（第 11 阶段真实样本暴露）：仅作为「证据不足」信号与 confidence 联动，
-# 不是机械黑名单——用户明确表达相应频率/条件/因果时模型会给出高置信度，不误伤。
+# 🔒 第 13 阶段：confidence 不再参与「无依据限定是否合法」的判断——它只是模型
+#    对提取结果的自评分，不能证明任何条件、频率、数量、程度、原因或评价来自用户。
+#    泛化/评价限定改用「user 事件字面证据映射」校验（见 validate 第 7.5 步）。
+# 泛化限定词（第 11 阶段真实样本暴露）：候选中出现而 user 事件未表达时 → OVER_INFERENCE。
 GENERALIZATION_WORDS = ("容易", "经常", "总是", "尤其", "通常", "长期", "每当")
+# 评价词（第 12 阶段真实样本暴露：「超额完成」）：候选中出现而 user 事件未表达时 → EVALUATION_UNSUPPORTED。
+EVALUATION_WORDS = ("超额", "顺利", "显著", "优秀", "严重")
+# 含糊指代（第 12 阶段真实样本暴露：「相应延长」需要原对话才能理解）→ VAGUE_REFERENCE。
+VAGUE_REFERENCE_WORDS = ("相应", "此事", "上述")
 VERBATIM_COPY_RATIO = 0.7        # 与 assistant 原文相似度阈值
 VERBATIM_COPY_MIN_SHARED_CHARS = 12  # 与 assistant 原文最大公共子串阈值
 LOW_VALUE_MIN_CHARS = 16
@@ -226,6 +231,24 @@ def build_memory_extraction_prompt(events, ai_name="助手", user_name="用户")
         "就判定为稳定人格特征。\n"
         f"10. 如果无法确认长期有效，不要归类为 core；如果事实只适用于短期，归类为 current 并设置 expires_at。\n"
         "11. 没有足够证据时输出空数组，绝不凑数、绝不生成记忆之外的内容。\n\n"
+        "【候选原子化】\n"
+        "- 每条 memory 只陈述一个可独立核验的事实；不要把事实、评价、要求、结果拼成一句。\n"
+        "- 一句话包含两个独立事实时，必须拆成多个候选分别输出。\n"
+        "- 拆分后某部分没有明确用户证据的，丢弃该部分，不要硬凑。\n"
+        "- 使用简洁的第三人称陈述；不复述对话过程。\n"
+        "- 不写「用户说……然后要求……」式的转录；不生成语法破碎、需要原对话才能理解的句子。\n"
+        "- 不保留含糊指代（如「相应」「那个」「这件事」）——必须写成明确的对象。\n\n"
+        "【限定必须有用户证据】\n"
+        "- 候选中的评价（超额/顺利/显著/优秀等）、程度（很/极其/明显/更严重等）、"
+        "数量（两个阶段/三次/多个/全部等）、比较（更多/更快）、频率（经常/总是/每次等）、"
+        "条件（在某种情况下会怎样）、原因和因果（因为/导致/所以）、"
+        "时间跨度（长期/一直/从来）——每一项都必须由所引用的用户事件明确表达。\n"
+        f"- 用户只表达核心事实时，只保留核心事实，不得补充任何评价、数量或程度。\n"
+        "- confidence 只是模型对提取结果的自评分，不能证明任何条件、频率、数量、"
+        "程度、原因或评价来自用户——不要用高置信度为自己补充的限定背书。\n\n"
+        f"【{ai_name} 事件的证据边界】\n"
+        f"- {ai_name} 的事件只用于理解对话结构：不得从中补充评价、数量、原因、频率"
+        "或用户要求；不得补全含糊指代；不得据其推导长期规律。\n\n"
         "【过度推断红线】\n"
         "- 候选中的每个限定条件（原因、触发条件、频率、程度、时间跨度、长期稳定性、因果关系）"
         "都必须能在所引用的用户事件中找到明确证据。\n"
@@ -375,14 +398,18 @@ def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc):
         elif conf < CORE_MIN_CONFIDENCE or imp < CORE_MIN_IMPORTANCE:
             mt = "long_term"  # 降级，不拒绝（保留可审查的低层级候选）
 
-    # 7.5 🔒 第 11 阶段：过度推断兜底——long_term/core 含泛化限定词但置信度不足时拒绝。
-    #    第 9 阶段真实样本暴露：模型会把一次场景泛化为长期规律（如「一次手凉」→
-    #    「长期容易手凉，尤其疲劳/冷环境时」）。泛化词本身不是黑名单（用户明确表达时
-    #    模型会给出高置信度，见 B/E 场景）；低置信 + 泛化限定 = 模型自行补全了
-    #    频率/触发条件/因果，证据不足 → 拒绝，交由后续批次或人工确认。
-    if mt in ("long_term", "core") and conf < OVER_INFERENCE_CONFIDENCE_FLOOR:
-        if any(w in content for w in GENERALIZATION_WORDS):
-            return None, "OVER_INFERENCE"
+    # 7.5 🔒 第 13 阶段：限定词证据映射——候选中的泛化限定与评价词必须能在被引用的
+    #    user 事件中找到字面证据；confidence 完全不参与判断（它只是模型自评分，不是
+    #    来源证据——第 11 阶段的置信度联动「低置信拒绝/高置信放行」存在错误前提，已删除）。
+    #    字面匹配是保守检查：模型同义改写（如「一直」→「长期」）会被误拒，
+    #    宁可误拒交由人工确认，也不放行无证据限定；不声称自动验证了语义忠实度。
+    user_text = " ".join(str(e.get("content", "")) for e in user_refs)
+    if any(w in content and w not in user_text for w in GENERALIZATION_WORDS):
+        return None, "OVER_INFERENCE"
+    if any(w in content and w not in user_text for w in EVALUATION_WORDS):
+        return None, "EVALUATION_UNSUPPORTED"
+    if any(w in content for w in VAGUE_REFERENCE_WORDS):
+        return None, "VAGUE_REFERENCE"
 
     # 8. current 必须有限期：模型未给 → 补默认（从 max(valid_at, 最早来源事件时间) 起算，
     #    满足 DB CHECK expires_at >= valid_at）；模型给的值早于 valid_at → clamp 到 valid_at

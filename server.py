@@ -1804,7 +1804,8 @@ async def fetch_schedule_for_injection():
     days_before = int(os.environ.get("CALENDAR_INJECT_DAYS_BEFORE", "7"))
     days_after = int(os.environ.get("CALENDAR_INJECT_DAYS_AFTER", "7"))
 
-    now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    _tz_bj = datetime.timezone(datetime.timedelta(hours=8))
+    now_bj = datetime.datetime.now(_tz_bj)
     time_min = (now_bj - datetime.timedelta(days=days_before)).replace(
         hour=0, minute=0, second=0, microsecond=0).isoformat() + "+08:00"
     time_max = (now_bj + datetime.timedelta(days=days_after)).replace(
@@ -1839,14 +1840,13 @@ async def fetch_schedule_for_injection():
             dt_start = datetime.datetime.fromisoformat(raw_dt.replace('Z', '+00:00'))
             if dt_start.tzinfo is None:
                 dt_start = dt_start.replace(tzinfo=datetime.timezone.utc)
-            dt_bj = dt_start.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+            dt_bj = dt_start.astimezone(_tz_bj)
         else:
             # 全天事件（date 字段，格式 YYYY-MM-DD）
             raw_date = e['start'].get('date')
             if not raw_date:
                 continue
-            dt_bj = datetime.datetime.strptime(raw_date, '%Y-%m-%d').replace(
-                tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+            dt_bj = datetime.datetime.strptime(raw_date, '%Y-%m-%d').replace(tzinfo=_tz_bj)
             is_all_day = True
 
         event_date = dt_bj.date()
