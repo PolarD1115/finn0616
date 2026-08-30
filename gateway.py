@@ -1880,6 +1880,14 @@ class HostFixMiddleware:
             await self._handle_memory_extraction_commit(scope, receive, send)
             return
 
+        # ---------- 🗂️ pending_review 人工审批（第19阶段：只读列表 + 单条 approve/reject；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-review":
+            await self._handle_memory_review(scope, receive, send)
+            return
+        if scope["path"] == "/api/memory-review/decision":
+            await self._handle_memory_review_decision(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -3064,6 +3072,139 @@ class HostFixMiddleware:
             "MEMORY_ITEM_INSERT_FAILED": 500,
             "EVENT_STATUS_UPDATE_FAILED": 500,
             "SERVICE_UNAVAILABLE": 503,
+        }
+        status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🗂️ pending_review 人工审批列表 /api/memory-review（第19阶段）
+    #    只读列出 status=pending_review 候选（最旧优先，limit 1~20），生成短时
+    #    review_session_token；候选定位全走服务端缓存，客户端不见数据库 ID。
+    #    位于 /api/* 统一鉴权之下（API_SECRET）；仅 GET；零写入、不查 active/rejected。
+    # ------------------------------------------
+    async def _handle_memory_review(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "GET":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库）
+            await _send_json_resp(send, 405, {"ok": False, "code": "METHOD_NOT_ALLOWED",
+                                              "stats": {}})
+            return
+
+        # 解析 query string（沿用项目手写解析模式）
+        qs = scope.get("query_string", b"").decode("utf-8")
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+        limit_raw = params.get("limit", "20")
+        _invalid = {"ok": False, "code": "INVALID_REVIEW_REQUEST", "stats": {}}
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            await _send_json_resp(send, 400, _invalid)
+            return
+        if not (1 <= limit <= 20):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        try:
+            import memory_review
+            import server as _srv_review
+            result = await memory_review.run_list(_srv_review.supabase_service, limit=limit)
+        except Exception as e:
+            # 只读保证：任何异常都不写库，只返回脱敏错误
+            _log(f"⚠️ [记忆审核列表] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
+                                              "stats": {}})
+            return
+
+        status = 200 if result.get("ok") else 500
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🗂️ pending_review 人工单条决策 /api/memory-review/decision（第19阶段）
+    #    approve 仅 pending_review→active；reject 仅 pending_review→rejected（不删除）。
+    #    请求体严格 4 字段白名单：客户端不提交候选正文、不提交 status/user_id 等
+    #    任何字段；候选定位全部取自 review_session_token 对应服务端缓存。
+    #    位于 /api/* 统一鉴权之下（API_SECRET）；仅 POST；逐条显式决策，无批量。
+    # ------------------------------------------
+    async def _handle_memory_review_decision(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库、不更新）
+            await _send_json_resp(send, 405, {"ok": False, "code": "METHOD_NOT_ALLOWED",
+                                              "stats": {}})
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        _invalid = {"ok": False, "code": "INVALID_REVIEW_REQUEST", "stats": {}}
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        # 严格字段白名单：除以下 4 个字段外，出现任何其他字段（item ID/content/
+        # status/user_id/importance/confidence/subject_key/memory_type/valid_at/
+        # expires_at/metadata/active/reason/comment 等）→ 400，不执行更新
+        allowed_fields = {"confirm", "review_session_token", "review_index", "decision"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # 显式确认（必须完全匹配）
+        if payload.get("confirm") != "DECIDE_MEMORY_REVIEW":
+            await _send_json_resp(send, 400, {"ok": False, "code": "INVALID_CONFIRMATION",
+                                              "stats": {}})
+            return
+        token = payload.get("review_session_token")
+        if not isinstance(token, str) or not token:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        index = payload.get("review_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            await _send_json_resp(send, 400, _invalid)
+            return
+        decision = payload.get("decision")
+        if decision not in ("approve", "reject"):
+            await _send_json_resp(send, 400, {"ok": False, "code": "INVALID_DECISION",
+                                              "stats": {}})
+            return
+
+        try:
+            import memory_review
+            import server as _srv_review
+            result = await memory_review.run_decision(
+                _srv_review.supabase_service, token, index, decision)
+        except Exception as e:
+            # 任何异常都不写库、不消费 index，只返回脱敏错误（不含异常原文）
+            _log(f"⚠️ [记忆审核决策] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
+                                              "stats": {}})
+            return
+
+        error_status = {
+            "INVALID_REVIEW_REQUEST": 400,
+            "INVALID_DECISION": 400,
+            "REVIEW_SESSION_NOT_FOUND_OR_EXPIRED": 404,
+            "REVIEW_INDEX_NOT_FOUND": 404,
+            "REVIEW_INDEX_ALREADY_DECIDED": 409,
+            "REVIEW_ITEM_STATE_CHANGED": 409,
+            "ACTIVE_SUBJECT_CONFLICT": 409,
+            "ACTIVE_EXACT_DUPLICATE": 409,
+            "REVIEW_QUERY_FAILED": 500,
+            "REVIEW_UPDATE_FAILED": 500,
         }
         status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
