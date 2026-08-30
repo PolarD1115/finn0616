@@ -3534,3 +3534,287 @@ commit 不重新调用 compression；不信任客户端提交的任何候选正�
 4. Supabase 只读核验：只新增选中的 1 条 item 且 status=pending_review、本批全部事件 processed、未选候选未写入；
 5. 不选择医疗隐私候选；不接正式上下文；不自动调度；不删除旧数据；不操作 Pinecone；
 6. 首次真实验证通过后，再评估 pending_review 读取链路（召回过滤）与失败重试运维手册的设计。
+
+---
+
+## 2026-08-30 · AI 伴侣记忆系统重做 · 第 19 阶段：pending_review 只读管理与人工审批接口
+
+### 阶段目标
+
+在手动提取（第 10 阶段 preview + 第 17 阶段 commit）已生产验收、`memory_items` 中存在
+唯一一条 pending_review 记录的基线上，实现「查看 pending_review → 人工逐条 approve /
+reject」的受保护管理接口。approve 仅 `pending_review → active`；reject 仅
+`pending_review → rejected` 且绝不删除记录。本阶段 active 仍不进入正式聊天上下文，
+不自动审批、不批量操作、不真实调用生产接口（实现 + mock 测试）。
+
+### 新增接口（均位于 /api/* 统一 API_SECRET 鉴权之下）
+
+1. `GET /api/memory-review`（gateway `_handle_memory_review`）
+   - 仅 GET；query `limit` 默认 20、范围 1～20，非整数或越界返回 400 `INVALID_REVIEW_REQUEST`；
+   - 只读查询 `memory_items` 中 `status=pending_review`，按 `created_at` 升序（最旧优先，
+     避免长期积压），只拉 limit 条；不查 active/rejected；不调用 LLM、不操作 Pinecone；
+   - 无待审数据：`{"ok":true,"code":"NO_PENDING_REVIEW_ITEMS","stats":{"count":0},"items":[]}`，
+     不返回 token；有数据：`REVIEW_ITEMS_READY` + 不透明 `review_session_token` +
+     `expires_in_seconds=900` + 脱敏 items（review_index 1 起始 + 白名单字段 +
+     固定 `privacy_hint="REVIEW_REQUIRED"`）；
+   - 响应条目字段白名单：review_index / memory_type / content / importance /
+     confidence / subject_key / valid_at / invalid_at / expires_at / source /
+     created_at / privacy_hint；绝不返回数据库 item ID、user_id、content_hash、
+     source_event_ids、source_batch_id、metadata、superseded_by、created_by、
+     last_confirmed_at、updated_at、status。
+2. `POST /api/memory-review/decision`（gateway `_handle_memory_review_decision`）
+   - 仅 POST；请求体严格 4 字段白名单（confirm / review_session_token / review_index /
+     decision），出现 item ID、content、status、user_id、importance、confidence、
+     subject_key、memory_type、valid_at、expires_at、metadata、active、reason、comment
+     等任何额外字段一律 400——客户端不提交、不修改候选正文与任何字段；
+   - confirm 必须完全匹配 `DECIDE_MEMORY_REVIEW`；review_index 必须 int 且非 bool；
+     decision 只允许 `approve` / `reject`（无默认、无批量）。
+
+### review session（memory_review.py，单进程内存缓存）
+
+- `secrets.token_urlsafe(32)` 不透明随机 token；不含数据库信息、不写日志、不持久化、
+  进程重启即失效；TTL=900s、MAX_SESSIONS=20、每 session 最多 20 条（均为代码常量，
+  不新增环境变量）；惰性清理 + 超容量移除最旧，无后台线程 / Timer；
+- 缓存结构：token → review_index → 内部快照（item_id / user_id / status /
+  subject_key / content_hash / created_at），客户端不可见；不与第 17 阶段 preview
+  token 混用；
+- 单条成功后消费该 index（重复提交返回 `REVIEW_INDEX_ALREADY_DECIDED`，不再 UPDATE）；
+  session 中其余未处理 index 继续有效；全部 index 处理完消费整个 token（之后再提交
+  返回 `REVIEW_SESSION_NOT_FOUND_OR_EXPIRED`）；失败路径不消费 index，可安全重试；
+- 多 worker / 多实例 / 重启后 token 失效，统一返回
+  `REVIEW_SESSION_NOT_FOUND_OR_EXPIRED`；本阶段不引入 Redis 或新表。
+
+### approve 语义与冲突保护
+
+- 乐观条件更新：`UPDATE memory_items SET status='active', updated_at=<UTC>,
+  last_confirmed_at=<UTC> WHERE id=<缓存快照> AND status='pending_review'`，返回行数
+  必须恰为 1，0（或多）行 → `REVIEW_ITEM_STATE_CHANGED`，不消费 index；不修改
+  content / memory_type / content_hash / importance / confidence / source /
+  source_event_ids / source_batch_id / subject_key / valid_at / invalid_at /
+  expires_at / metadata / created_by / superseded_by；
+- approve 前两类只读冲突检查（均排除自身，命中即拒绝、不 UPDATE、不消费 index、
+  不自动 supersede、不返回旧记录任何内容）：
+  1. 同 user_id + 同 subject_key 的 active 记录存在 → `ACTIVE_SUBJECT_CONFLICT`
+     （subject_key 为空时跳过该检查，仍可人工 approve）；
+  2. 同 user_id + 同 content_hash 的 active 精确重复存在 → `ACTIVE_EXACT_DUPLICATE`
+     （不自动把当前项标 rejected，不删除）。
+
+### reject 语义与零删除
+
+- `UPDATE memory_items SET status='rejected', updated_at=<UTC> WHERE id=<缓存快照>
+  AND status='pending_review'`，返回行数同样必须恰为 1；不删除记录、不写理由字段、
+  不动 metadata、不动 last_confirmed_at / invalid_at；reject 不做 approve 专属冲突检查。
+
+### 修改文件
+
+| 文件 | 修改 |
+|---|---|
+| `memory_review.py`（新增） | 列表执行体 `run_list`（只读 SELECT + 脱敏组装 + session 生成）+ 决策执行体 `run_decision`（冲突检查 + 乐观条件 UPDATE + index 消费）+ 进程内 session 缓存；数据库操作仅限 memory_items 的 SELECT + 条件 UPDATE |
+| `gateway.py`（纯新增 141 行、零删改） | 两处路由分发 + 两个 handler（方法检查 / JSON body / 白名单与类型校验 / 复用 server.supabase_service / 错误码→HTTP 状态映射：404 session·index 不存在、409 已决定·状态已变·两类冲突、400 校验类、500 查询·更新失败）；审批逻辑全部在 memory_review.py |
+| `test_memory_review_phase19.py`（新增，56 个测试） | 覆盖任务 A-J 十组 |
+| `PROJECT_NOTES.md` | 追加本节日志 |
+
+未修改 memory_preview.py / memory_extractor.py / server.py / napcat.py / heartbeat.py /
+migrations / requirements.txt / VARIABLES.md / 正式上下文 / Pinecone / 前端 / Docker。
+
+### 测试结果
+
+- `test_memory_review_phase19.py`：**56/56 通过**；
+- 记忆相关全量回归 12 套件（phase1_fixes / phase3 / phase3_events / preview_phase10 /
+  extractor phase11+13+15 / extractor_phase5 / commit_phase17 / review_phase19 /
+  recall_observability_phase4 / legacy_isolation_phase5 / gateway_routes）：**305/305 通过**；
+- 补充回归（shared_experience_phase6 / security_phase36 / sanitize_phase41）：**120/120 通过**；
+  合计 425 个全过；
+- py_compile：memory_review.py / gateway.py / 测试文件全部通过；
+- 开发过程中修复 2 个测试自身断言缺陷（上下文注入切片过长误吞后续段落、docstring
+  红线声明文字被宽松子串误报），改为函数级切片 + AST import 白名单断言。
+
+### 数据安全声明
+
+- 本阶段未真实调用 list 接口、未真实调用 decision 接口（全部经 handler 直调 + mock
+  客户端完成）；
+- 本机无 Supabase 凭据（部署平台注入，本机 API_SECRET/SUPABASE_* 均未设置），SELECT
+  只读核查未真实执行；表结构与 status CHECK（active/superseded/expired/rejected/
+  pending_review）经 migration 文件 `20260828_002_memory_items.sql` 确认可支持安全实现；
+  计数基线沿用第 18 阶段生产验收记录（1 条 pending_review、active=0、rejected=0），
+  部署后应先只读复核；
+- INSERT=否；UPDATE=否（未真实执行）；DELETE=否（源码级 + AST 级双重断言无删除）；
+- memory_items 未真实修改；memory_events 未触碰（memory_review.py 代码零引用）；
+  Pinecone=否；LLM=否；自动调度=否；新增环境变量=否；修改 requirements / Docker /
+  前端 / schema / RLS=否；commit / push / 部署=否；未覆盖任何现有未提交修改；
+- 本日志与报告不记录 token、候选正文、user_id、item ID、hash、来源 ID、batch ID、
+  密钥或生产 URL。
+
+### 已知风险
+
+- review session 为单进程内存缓存：网关重启或多 worker / 多实例下 token 失效，需重新
+  拉取列表（本阶段不引入共享存储）；
+- active subject_key 冲突只阻止不解决：同主题新事实无法自动替代旧事实，需人工先处理
+  旧 active 记录（本阶段无该工具）；
+- reject 无理由字段、不写 metadata：拒绝动机不可追溯；
+- active 尚未进入正式聊天上下文：approve 后的记忆在接入读取链路前不产生任何效果；
+- 人工误审批风险：approve 无法在本阶段撤销（无 active→pending_review 回退接口），
+  敏感内容（如医疗）完全依赖人工判断，服务端只给固定 `REVIEW_REQUIRED` 提示；
+- 冲突检查与更新非同一事务：极端并发下（冲突检查后、更新前另一流程写入同主题
+  active）可能漏检；乐观条件仍保证状态机不被破坏。
+
+### 下一阶段建议
+
+用户提交、推送、部署本阶段代码后：
+
+1. Supabase 只读复核基线（memory_items 仍为 1 条 pending_review、active=0、
+   rejected=0、memory_events 不受影响）；
+2. `GET /api/memory-review`（limit 默认）核对唯一 pending_review 内容（人工判断是否
+   低敏感且正确）；
+3. 确认保留 → POST decision `decision=approve`；不希望保留 → `decision=reject`
+   （记录保留在 rejected 状态，不删除）；
+4. Supabase 只读核验：该条 status 只改变一次（active 或 rejected），其余字段不变，
+   事件账本零变化；
+5. 暂不接入正式上下文；不自动调度；不操作 Pinecone；不删除任何记录；
+6. 下一阶段可评估：active 记忆的召回接入（读取链路过滤 pending_review / rejected）、
+   subject 冲突的人工 supersede 工具、active 回退接口与审批审计日志。
+
+---
+
+## 第 21 阶段：active 记忆只读召回预览（2026-08-30）
+
+### 阶段目标
+
+在 active 记忆尚未接入任何正式上下文的前提下，提供一个人工验证召回效果的手动
+预览接口：用户手动提交一条查询 → 服务端只读查询同用户 `status=active` 的
+memory_items → 内存排除已过期条目 → 确定性词面相关性排序 → 返回脱敏召回预览。
+不注入正式聊天、不写任何数据、不调用 LLM / Pinecone / embedding。
+
+### 新增接口 POST /api/memory-recall-preview
+
+- 受既有 `/api/*` API_SECRET 统一鉴权保护（gateway 中间件全局拦截，新路由自动
+  覆盖）；仅 POST，其余方法 405 且不查库；OPTIONS 沿用全局 CORS 预检。
+- 请求体严格 3 字段白名单（confirm / query / top_k）：出现 user_id、status、
+  memory_type、item ID、namespace、threshold、provider、model、include_*、
+  write_back、update_recall_count 等任何额外字段一律 400 且零查询；
+  confirm 必须严格等于 `RECALL_PREVIEW_ONLY`；query 字符串 trim 后非空且
+  ≤500 字符；top_k 整数且非 bool，缺省 5，范围 1~10（网关层 400 拒绝）。
+- 路由与鉴权、方法校验、请求体读取、user_id 解析、调用执行体全部在
+  gateway.py handler；排序/过滤/脱敏全部在新模块 memory_recall.py。
+
+### active-only 与服务端隔离
+
+- 查询由服务端强制 `user_id = 统一解析 user_id` + `status = 'active'` 双条件
+  （user_id 复用 `server._resolve_pinecone_user_id()`：USER_ID → MEM0_USER_ID →
+  default），客户端无任何提交入口；
+- 模块在内存对返回行做二次 active 过滤（即使查询层条件失效也只保留 active），
+  永不返回 pending_review / rejected / superseded / expired。
+
+### 过期过滤
+
+- active 但 `expires_at <= 当前 UTC`（aware datetime 比较）的条目不返回；
+  expires_at 为空视为不过期；时间解析失败的条目保守跳过；
+- 不通过 UPDATE 把任何条目标成 expired，不改任何状态与统计字段；
+- stats 记录 active_fetched / status_filtered / expired_filtered /
+  invalid_time_filtered / matched / returned 六个安全计数。
+
+### deterministic_lexical_v1（不是语义检索）
+
+- 本阶段没有可用的 embedding 检索链路，实现的是确定性词面相关性：NFKC +
+  小写 + 保留中文/字母/数字 + 折叠空白的简单规范化（不引入分词库、不新增依赖）；
+- 五个可解释信号与匹配原因码：EXACT_QUERY_IN_CONTENT（0.50）、
+  CONTENT_FRAGMENT_IN_QUERY（content ≥3 字中文连续段包含于 query，0.25）、
+  SUBJECT_KEY_MATCH（subject_key 与 query 完整子串关系，0.25）、
+  CHINESE_BIGRAM_OVERLAP（0.20×重合比例）、TOKEN_OVERLAP（0.20×重合比例，
+  token 长度 ≥2、大小写不敏感）；
+- 最低命中条件 = 任一信号触发；完全无词面重合的 active 记忆不得因 importance
+  高而返回；单字符查询与纯 ASCII 双字符 compact（跨词边界拼接噪声）不触发
+  子串信号（宁拒不放）；
+- score ∈ [0,1]、确定性、同输入结果恒定；仅用于预览排序，不是概率、不是
+  embedding 相似度；全程不称语义检索/向量召回。
+
+### 取数上限与排序
+
+- 无向量索引，先拉取最多 MAX_ACTIVE_CANDIDATES=200（代码常量）条 active 候选
+  再内存排序；超过 200 条时可能漏掉较旧但相关的记忆（取数序 importance DESC +
+  updated_at DESC 缓解），不为理论大规模数据增加基础设施；
+- 排序：score DESC → importance 仅 tie-break → updated_at 最终 tie-break →
+  原始取数序稳定收尾 → top_k 截断（模块层对越界 top_k 夹取防御，
+  gateway 层负责 400）。
+
+### 响应与日志脱敏
+
+- 响应条目白名单：recall_index / memory_type / content / importance /
+  confidence / subject_key / valid_at / expires_at / source / score /
+  match_reasons；绝不含 item ID、user_id、content_hash、source_event_ids、
+  source_batch_id、metadata、superseded_by、created_by、updated_at、status、
+  last_recalled_at；错误响应只含 ok/code/stats；不返回 SQL 与数据库异常原文；
+- 日志仅计数：`active记忆召回预览：fetched=N matched=N returned=N`；异常只记
+  stage + 异常类型；query 原文、记忆正文、user_id、subject_key 原文、密钥均
+  不落日志。
+
+### 零写入与隔离
+
+- memory_recall.py 对数据库仅 memory_items SELECT（单次，最多 200 行）；AST 与
+  源码双断言：无 insert/update/delete/upsert/rpc、无 Pinecone、无 LLM、无
+  embedding、无 create_task/Timer/threading、不读环境变量、仅标准库 4 项 import
+  （asyncio/datetime/re/unicodedata）；
+- `_inject_context` 与 `_build_channel_context` 未改动、不读取 memory_items、
+  不调用本模块；active 仍未接入 Web / TG / QQ 正式上下文；
+- 不新增环境变量；不修改 requirements / Docker / 前端 / migrations / RLS；
+  不触碰 memory_events；不操作 Pinecone；无自动调度。
+
+### 修改文件
+
+- 新增 `memory_recall.py`（只读召回执行体）；
+- 修改 `gateway.py`（仅新增路由注册 + handler，+88 行，无删除）；
+- 新增 `test_memory_recall_phase21.py`（专项 67 测试）。
+
+### 测试结果
+
+- py_compile：memory_recall.py / gateway.py / test_memory_recall_phase21.py 全过；
+- 专项测试 `python -m unittest test_memory_recall_phase21`：67 个全过
+  （路由鉴权/请求校验/状态隔离/用户隔离/过期/中文/英文数字/subject_key/排序/
+  脱敏/源码隔离/模块防御 12 组）；
+- 全量记忆回归（第 1~19 阶段全部记忆模块 + test_gateway_routes + 本阶段）：
+  455 个测试全过、零失败。
+
+### Supabase 只读基线（执行前 = 执行后，全程零写入）
+
+- memory_items 总数 1；active=1；pending_review=0；rejected=0；superseded=0；
+  expired=0；active 中 expires_at 已过期=0；
+- 唯一 active 条目非敏感结构：memory_type=long_term、source=web、importance=3、
+  confidence=0.7、有 subject_key、expires_at 为空；
+- memory_events 未因本阶段变化（本阶段代码零引用）。
+
+### 数据安全声明
+
+- SELECT=是（仅 memory_items，且本阶段仅在 Mock 测试中执行，未真实调用生产
+  接口）；INSERT=否；UPDATE=否；DELETE=否；UPSERT/RPC=否；
+- memory_items 未修改；memory_events 未修改；Pinecone=否；LLM=否；
+  新建 embedding=否；接入 pgvector=否；真实 recall preview 调用=否；
+  active 未接正式上下文=是（保持）；commit / push / 部署=否；
+- 未覆盖、未清理任何既有未提交修改。
+
+### 已知风险
+
+- lexical 不是语义检索：中文同义表达、换说法、抽象提问（如"我之前在忙什么"）
+  可能漏召回，这是本阶段设计取舍而非缺陷；
+- active 超过 200 条时可能漏掉较旧但相关的记忆（本阶段接受该上限）；
+- API_SECRET 泄露会暴露 active 候选正文（接口允许返回事实化 content，仅供
+  用户本人审核）；
+- active 尚未自动过期落状态：过期条目只在召回时被内存过滤，状态仍为 active，
+  需要未来专门的过期处理流程；
+- active 尚未接入正式上下文：召回预览通过不代表聊天中可见，接入需另行设计；
+- subject_key 精确子串信号在 query 极短时可能贡献偏高分数（仅预览排序，无
+  持久影响）。
+
+### 下一阶段建议
+
+用户提交、推送、部署本阶段代码后：
+
+1. 用一个与唯一 active 记忆明确相关的合成查询真实调用 recall preview，核对
+   命中与 match_reasons 是否符合预期；
+2. 再用一个完全无关的查询验证不召回（NO_RELEVANT_ACTIVE_MEMORIES）；
+3. Supabase 只读确认零写入（memory_items/memory_events 基线不变）；
+4. 若相关查询命中、无关查询不命中，可进入 active 上下文注入设计：限量、去重、
+   只读、active-only、排除过期，且与 `_inject_context`/`_build_channel_context`
+   的稳定前缀缓存兼容；
+5. 不删除旧数据；不操作 Pinecone；不自动调度；不删除 rejected/superseded 记录；
+6. 后续可评估：active 自动过期流程、last_recalled_at 统计、embedding 检索链路
+   （接入前本接口保持 deterministic_lexical_v1 并如实标注）。

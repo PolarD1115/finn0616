@@ -1888,6 +1888,11 @@ class HostFixMiddleware:
             await self._handle_memory_review_decision(scope, receive, send)
             return
 
+        # ---------- 🔎 active 记忆只读召回预览（第21阶段：只读、零写入、不接正式上下文；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-recall-preview":
+            await self._handle_memory_recall_preview(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -3205,6 +3210,89 @@ class HostFixMiddleware:
             "ACTIVE_EXACT_DUPLICATE": 409,
             "REVIEW_QUERY_FAILED": 500,
             "REVIEW_UPDATE_FAILED": 500,
+        }
+        status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🔎 active 记忆只读召回预览 /api/memory-recall-preview（第21阶段）
+    #    用户手动提交一条查询，服务端只读查询同用户 status=active 的
+    #    memory_items，内存排除已过期条目，确定性词面相关性排序返回预览。
+    #    位于 /api/* 统一鉴权之下（API_SECRET）；仅 POST；零写入、不接正式
+    #    上下文、无 LLM/Pinecone/embedding；user_id 由服务端统一解析，
+    #    请求体严格 3 字段白名单（confirm/query/top_k），其余字段一律 400。
+    # ------------------------------------------
+    async def _handle_memory_recall_preview(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库）
+            await _send_json_resp(send, 405, {"ok": False, "code": "METHOD_NOT_ALLOWED",
+                                              "stats": {}})
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        _invalid = {"ok": False, "code": "INVALID_RECALL_REQUEST", "stats": {}}
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        # 严格字段白名单：出现任何其他字段（user_id/status/memory_type/item ID/
+        # namespace/threshold/provider/model/include_pending/include_rejected/
+        # include_expired/write_back/update_recall_count 等）→ 400，不查库
+        allowed_fields = {"confirm", "query", "top_k"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # 显式确认（必须完全匹配）
+        if payload.get("confirm") != "RECALL_PREVIEW_ONLY":
+            await _send_json_resp(send, 400, {"ok": False, "code": "INVALID_CONFIRMATION",
+                                              "stats": {}})
+            return
+        # query：字符串、trim 后非空、≤500 字符
+        query = payload.get("query")
+        if (not isinstance(query, str) or not query.strip()
+                or len(query.strip()) > 500):
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # top_k：整数且非 bool，缺省 5，范围 1~10
+        top_k = payload.get("top_k", 5)
+        if (isinstance(top_k, bool) or not isinstance(top_k, int)
+                or not (1 <= top_k <= 10)):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        try:
+            import memory_recall
+            import server as _srv_recall
+            # user_id 由服务端统一解析规则给出，客户端无任何提交入口
+            result = await memory_recall.run_recall(
+                _srv_recall.supabase_service,
+                _srv_recall._resolve_pinecone_user_id(),
+                query.strip(), top_k)
+        except Exception as e:
+            # 只读保证：任何异常都不写库，只返回脱敏错误（不含异常原文）
+            _log(f"⚠️ [记忆召回预览] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
+                                              "stats": {}})
+            return
+
+        error_status = {
+            "INVALID_RECALL_REQUEST": 400,
+            "RECALL_QUERY_FAILED": 500,
+            "RECALL_SERVICE_UNAVAILABLE": 503,
         }
         status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
