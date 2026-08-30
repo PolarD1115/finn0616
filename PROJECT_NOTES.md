@@ -3214,5 +3214,323 @@ py_compile 5 文件通过；8 个测试套件 217/217 通过。临时脚本已�
 - 候选 content 属用户隐私，仅受 API_SECRET 保护——泄露即暴露长期记忆候选，须妥善保管；
 - 重复手动调用会重复消耗模型成本；接口仍不写库，pending 事件继续积累；
 - `<final>` 之外的内部标记形态仍可能出现（已有 INTERNAL_MARKUP 兜底拒绝）；
-- 质量合格后下一阶段设计：service_role 写入 memory_items（只写 pending_review、批内+跨批精确去重、写入与状态更新分步可审计、失败不标 processed）；质量不足则先校准提取器 Prompt/规则并重跑 mock。全程保持：不删除旧数据、不恢复 Archived_Chat、不操作 Pinecone、不自动调度、不接入正式上下文。
+- 保持全部既有约束：不删除旧数据、不恢复 Archived_Chat、不修改 Pinecone、不自动调度、不接入正式上下文、不接入 TG/QQ/后台事件。
 
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 11 阶段补充：真实预览质量验收与过度推断校准
+
+### 日期与来源
+
+2026-08-29。用户自行成功调用一次生产预览接口（本补充任务未重复调用）：code=PREVIEW_READY、selected=6（user 3 + assistant 3）、candidates=2、rejected=0、status_plan.executed=false、write_guards 三项全 false。
+
+### 响应安全契约验收：通过
+
+- 顶层字段（ok/code/stats/candidates/rejected/status_plan/write_guards）与候选字段（preview_index/memory_type/content/importance/confidence/subject_key/valid_at/invalid_at/expires_at/status/quality_hint）全部在白名单内，无多余字段；
+- 禁止字段（user_id/event ID/source_event_id/content_hash/batch_id/request_id/metadata/Prompt/模型原始响应/provider/API key/Authorization/Cookie/SQL/traceback）零命中；
+- write_guards 三项全 false、status_plan.executed=false。
+
+### 候选质量验收（不复制正文）
+
+| 序号 | 类型 | 质量 | 原因代码 | assistant 泄露 | 时间问题 | 过度推断 |
+|---|---|---|---|---:|---:|---:|
+| 1 | current | good | TEMPORARY_STATE | 0 | 0（expires_at 恰在截止日期后） | 0 |
+| 2 | long_term | needs_review | OVER_INFERENCE | 0 | 0 | 1 |
+
+候选 1（项目+截止日期）：current 分类合理、expires_at 恰当、importance/confidence 保守。
+
+候选 2（手凉 + 触发条件）：「容易」「尤其在冷环境或疲劳时」「变得很冰」的触发条件/程度/频率描述仅凭响应无法证明来自用户明确表达，confidence=0.65 自证证据较弱——按保守原则标 needs_review（不写成已确认错误）；status=pending_review 未入库。
+
+### 质量门槛：QUALITY_GATE_CONDITIONAL
+
+依据：安全契约通过、零泄露、零 core 误判、current 有 expires_at；但 1 条候选疑似把一次性场景泛化为长期规律，且样本仅 2 条不足以直接进入正式写入。
+
+### 最小规则校准（只改 memory_extractor.py 的 Prompt 与验证层）
+
+- **问题**：模型可能在用户未明确表达时自行补充原因、触发条件、频率、程度或长期规律（一次场景 → 长期规律）。
+- **Prompt 新规则**（语义规则，第一道防线）：候选的每个限定条件（原因/触发条件/频率/程度/时间跨度/长期稳定性/因果关系）必须在引用的 user 事件中有明确证据；不得自行补充「经常/总是/容易/尤其/通常/长期/每当/因为/导致/在……时会……」除非用户明确表达；一次性当前状态优先 current；不得凭当时环境推导长期体质/习惯/人格；证据不足时删限定/降级 current/不生成；不得用 assistant 回复补全用户未表达的条件。
+- **验证层 confidence 联动兜底**：long_term/core 候选 content 含泛化限定词（容易/经常/总是/尤其/通常/长期/每当）且 confidence < 0.8 → 拒绝 OVER_INFERENCE。泛化词仅作为「证据不足」信号而非机械黑名单——用户明确表达时模型给出高置信度（B/E 场景验证不误伤）。
+- **为什么不机械黑名单**：正常用户事实可合法包含这些词（如「每次熬夜后都会头痛」），机械拒绝会系统性误伤。
+
+### 修改文件
+
+| 文件 | 修改 |
+|---|---|
+| memory_extractor.py | Prompt 增加过度推断红线段；常量 OVER_INFERENCE_CONFIDENCE_FLOOR=0.8 与 GENERALIZATION_WORDS；验证层第 7.5 步 confidence 联动拒绝 |
+| test_memory_extractor_phase11.py（新增，8 个测试） | A 一次状态不泛化 / B 明确长期规律保留 / C assistant 补全拒绝 / D current 截止日期不受影响 / E 合法频率表达不误伤（含高置信泛化词通过）/ F 人格推断拒绝 / Prompt 规则存在性 |
+| PROJECT_NOTES.md | 追加本节日志 |
+
+未修改 gateway.py / memory_preview.py / server.py / napcat.py / heartbeat.py / migrations / requirements.txt / VARIABLES.md / 前端 / Docker / Pinecone / 正式上下文注入。
+
+### 测试结果
+
+- `test_memory_extractor_phase11.py`：**8/8 通过**（A 低置信泛化拒绝 / B 明确规律保留 / C assistant 补全拒绝 / D current 截止日期通过 / E 合法频率+高置信泛化词不误伤 / F 人格推断拒绝 / Prompt 规则存在性）。
+- 全部回归：**249/249 通过**（第 5/10 阶段及第 1-4 阶段共 9 个套件）。
+- py_compile memory_extractor.py 通过。
+
+### 声明
+
+未再次调用生产预览接口；未调用真实 compression；未写 memory_items；未更新 memory_events；未操作 Pinecone；未修改数据库；未新增环境变量；未保存真实正文/Prompt/模型响应文件；未读取或输出凭据；未创建 commit/push。
+
+### 已知限制与下一阶段建议
+
+- 只有 2 条真实候选，样本不足以验证规则的全量误拒率（B/E 场景证明设计上不误伤明确表达，但真实模型的置信度分布未知）；
+- 未直接对照原始 user 事件正文（候选是否完全忠于原文需下次预览时人工对照）；
+- Prompt 规则不能完全取代人工审核（pending_review 状态仍是必要安全网）；
+- 高置信度的人格泛化（confidence ≥ 0.8）不会被确定性规则拦截，依赖 Prompt 规则 + pending_review 人工审查兜底；
+- 尚无正式写入、跨批去重、冲突处理、人工确认界面、正式上下文接入。
+- 下一阶段：用户提交、推送并部署本次校准 → 再手动调用一次预览（建议 limit=6）→ 验证过度推断是否消失 → 若达到 QUALITY_GATE_PASS 再设计正式写入执行器。全程保持：不删除旧数据、不恢复 Archived_Chat、不修改 Pinecone、不自动调度、不接入正式上下文。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 11 阶段：生产预览质量验收（未调用：SAFE_INVOCATION_UNAVAILABLE）
+
+### 日期与分支决策
+
+2026-08-29。目标：真实调用一次 `POST /api/memory-extraction-preview` 并做候选质量验收（零写入）。**实际结果：接口未调用——SAFE_INVOCATION_UNAVAILABLE，质量门槛 NOT_EVALUATED。**
+
+### 执行前核查
+
+- **第 10 阶段代码已进入推送版本**：新 HEAD `75913e9 feat(memory): add secure extraction preview endpoint`，`git ls-tree` 实查含 memory_preview.py 与 test_memory_preview_phase10.py，HEAD 的 gateway.py 含预览路由（2 处命中）。
+- **安全前提逐项复核**：POST-only、/api/* 统一鉴权（API_SECRET 未配置时 503）、confirm=PREVIEW_ONLY、limit 2~10、单用户完整组选择、敏感整批跳过、compression ≤1 次、零写入、响应脱敏、`<final>` 只在 assistant 提取输入清理——全部成立（第 10 阶段 32 项测试持续通过）。
+- **安全调用条件不满足**：本机环境无 API_SECRET 变量、无 ZEABUR/PROD 配置、本地与父目录均无 .env 文件——生产 URL 与认证凭据在本机无安全来源。按任务规则：不猜测、不向用户索取密钥、不创建含密钥脚本 → **报告 SAFE_INVOCATION_UNAVAILABLE，未调用接口**。
+
+### Supabase 只读统计（本阶段操作为零，前后一致）
+
+- memory_events **175** 条（全部 pending；processed 0、failed 0）；channel=web pending 175；user pending 88、assistant pending 87；最新事件 2026-08-29 13:45 UTC。
+- 成对性：88 组中 87 组成对，**1 组只有 user**（时间 07:10 UTC，非写入时序）——最可能原因：该轮 assistant 无有效正文（剥离 `<think>` 后为空），符合第 3 阶段「空 assistant 内容不写事件」设计，属符合预期的半轮，非数据损坏；不修复、不改数据。
+- memory_items **0**（未写入）；memories 4211（生产自然写入）。
+- 状态字段全部未变：batch_id 非空 0、last_error 非空 0、processed/failed 0。
+
+### 测试与声明
+
+py_compile 3 文件通过；9 个测试套件 **249/249 通过**。本阶段零代码修改；未执行任何 Supabase 写入；未操作 Pinecone；未发送任何消息；未读取或输出凭据（环境变量仅查存在性）；未调用 Zeabur MCP；未创建 commit。
+
+### 已知限制与下一阶段建议
+
+- 质量验收（25 项候选审查、质量门槛分级）因无法安全调用而 NOT_EVALUATED。
+- **解除路径**：用户自行手动调用一次 `POST /api/memory-extraction-preview`（本机安全保存的 API_SECRET，`{"confirm":"PREVIEW_ONLY","limit":6}`），将脱敏响应（移除 ID/URL/请求头/不希望 agent 看到的候选内容后）交给 agent 分析，即可重跑本阶段的质量门槛判断。
+- 或者：若未来本地环境具备安全的生产 URL 与 API_SECRET 配置来源（如用户提供安全注入方式），可由 agent 在不暴露凭据的前提下执行调用。
+- 保持全部既有约束：不删除旧数据、不恢复 Archived_Chat、不修改 Pinecone、不自动调度、不接入正式上下文、不接入 TG/QQ/后台事件。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 13 阶段：候选原子化与证据约束校准
+
+### 日期与来源
+
+2026-08-29。第二轮生产预览（QUALITY_GATE_CONDITIONAL，good=0/needs_review=2）暴露两个问题：① moment 候选含可能无用户证据支持的评价和量化描述（「超额完成两个阶段」型）；② current 候选把多个意思拼成一句、含含糊指代，表达破碎。**事实边界**：候选是否真的偏离原始 user 事件仍未确认（响应不含原始事件），只能确认候选文本包含评价/量化描述且表达不够清晰。
+
+### 核心修正：confidence 不再是证据
+
+- 第 11 阶段的 `OVER_INFERENCE_CONFIDENCE_FLOOR=0.8` 联动存在**错误前提**：confidence ≥ 0.8 时含泛化词的 long_term/core 会自动放行——即「低置信拒绝、高置信通过」，把模型自评分当成了来源证据。
+- 本阶段删除该联动（常量与分支均已移除，源码约束测试锁定）。confidence 字段保留，仅用于人工排序与审核。
+- 取代方案：**限定词的 user 事件字面证据映射**——候选中的泛化限定词（容易/经常/总是/尤其/通常/长期/每当）与评价词（超额/顺利/显著/优秀/严重）必须能在被引用的 user 事件 content 中找到字面证据，否则分别拒绝为 OVER_INFERENCE / EVALUATION_UNSUPPORTED；confidence 完全不参与判断，且检查覆盖全部 memory_type（含 moment/current）。
+- 新增含糊指代检查：候选含「相应/此事/上述」→ VAGUE_REFERENCE（第 12 阶段真实样本「相应延长」型破碎表述拦截）。
+
+### Prompt 原子化与证据规则（新增三段）
+
+1. **候选原子化**：每条 memory 只陈述一个可独立核验的事实；多事实拆分输出；无证据部分丢弃；简洁第三人称；不复述对话过程；不保留含糊指代（相应/那个/这件事）；不生成语法破碎的句子。
+2. **限定必须有用户证据**：评价/程度/数量/比较/频率/条件/因果/时间跨度每一项都必须由所引用用户事件明确表达；用户只表达核心事实时只保留核心事实；**confidence 只是模型自评分，不能证明任何限定来自用户**。
+3. **assistant 事件证据边界**：只用于理解对话结构，不得补充评价/数量/原因/频率/用户要求、不得补全含糊指代、不得推导长期规律。
+
+### 修改文件
+
+| 文件 | 修改 |
+|---|---|
+| memory_extractor.py | 删除 OVER_INFERENCE_CONFIDENCE_FLOOR 与 conf 联动分支；新增 EVALUATION_WORDS/VAGUE_REFERENCE_WORDS 常量；第 7.5 步改为证据映射（OVER_INFERENCE/EVALUATION_UNSUPPORTED/VAGUE_REFERENCE 三类拒绝，覆盖全部类型，confidence 退出判断）；Prompt 新增三段规则 |
+| test_memory_extractor_phase13.py（新增，14 个测试） | A confidence 不放行（高置信评价/泛化均拒、有 user 证据通过）/ B 用户明确评价数量保留 / C Prompt 原子化与 confidence 非证据声明 / D 含糊指代拒绝 / E 清晰 current 保留 / F assistant 补充评价拒绝+verbatim 回归 / G 明确因果频率不误伤（中置信度验证）/ H 项目截止日期回归 |
+| PROJECT_NOTES.md | 追加本节日志 |
+
+未修改 gateway.py / memory_preview.py / server.py / napcat.py / heartbeat.py / migrations / VARIABLES.md / 前端 / Docker / Pinecone / 正式上下文注入。
+
+### 测试结果
+
+- `test_memory_extractor_phase13.py`：**14/14 通过**。
+- 全部回归 10 套件：**257/257 通过**（第 5/10/11 阶段的既有场景在新证据映射下全部兼容——含第 11 阶段「高置信泛化放行」用例的封堵验证）。
+- py_compile memory_extractor.py 通过。
+
+### 声明
+
+未调用生产预览接口；未调用真实 compression；未查询或修改 Supabase；未操作 Pinecone；未新增环境变量；未创建 commit/push；未保存真实正文/Prompt/模型响应文件；未读取或输出凭据；未修改 UTC 存储设计。
+
+### 已知限制与下一阶段建议
+
+- 字面证据映射是保守检查：模型同义改写（如用户说「一直」模型写「长期」）会被误拒——宁可误拒交由人工确认，不声称自动验证了语义忠实度；
+- 评价/数量词表是有限集合，未覆盖全部评价与量化形态——Prompt 层是第一道防线，pending_review 人工审核兜底；
+- 候选原子化目前依赖 Prompt（确定性代码无法拆分语义），破碎候选由 VAGUE_REFERENCE 与人工审核拦截；
+- 未确认：真实模型对新 Prompt 的遵循度、第三轮候选质量、两轮预览是否处理过同一批事件。
+- 下一阶段：用户提交、推送、部署本次校准 → 手动调用预览（limit=6）→ 审核无依据评价/数量与破碎表述是否消失 → 若至少 1 条 good 且无严重问题，进入手动 pending_review 写入执行器设计。保持全部既有约束：不自动调度、不接正式上下文、不删除旧数据、不修改 Pinecone。
+
+---
+
+## 2026-08-29 · AI 伴侣记忆系统重做 · 第 15 阶段：严格 JSON 围栏兼容与 Prompt 精简
+
+### 日期与来源
+
+2026-08-29。第三轮生产预览返回 JSON_PARSE_ERROR（事件选择/成组正常，compression 被真实调用且返回了无法严格解析的内容，具体形态未知——未确认是否为围栏，不得写成已确认根因）。本阶段：① 为「整个响应被单一完整 json 围栏包裹」增加最小兼容；② 精简提取 Prompt 消除重复。
+
+### 修改文件
+
+| 文件 | 修改 |
+|---|---|
+| memory_extractor.py | ① 新增 `_strip_single_json_fence`（严格单围栏剥离）；② `parse_memory_extraction_response` 改为「裸 JSON 或单一完整围栏」两形态入口，围栏剥离后仍走 json.loads + 结构校验；③ Prompt 精简重写（2387 → 1906 字符，-20.2%） |
+| test_memory_extractor_phase15.py（新增，26 个测试） | 任务 A-R 场景 |
+| test_memory_extractor_phase5.py | markdown_fence 用例从「拒绝」列表移出，新增单围栏兼容验证与仍拒绝形态（围栏外说明/多围栏） |
+| test_memory_extractor_phase11.py / phase13.py | Prompt 短语断言对齐精简版（语义等价） |
+| PROJECT_NOTES.md | 追加本节日志 |
+
+未修改 gateway.py / memory_preview.py / shared_experience.py（其 _strip_code_fences 过于宽松，未复用，在 memory_extractor 内实现严格本地版本）/ server.py / napcat.py / heartbeat.py / migrations / VARIABLES.md / Docker / Pinecone / 正式上下文。
+
+### 围栏兼容设计
+
+**支持形态**：裸 JSON（原行为不变）；整个响应被一个完整围栏包裹（围栏前后仅空白；语言标记仅允许空或 json 大小写变体）。
+
+**拒绝形态**：围栏前说明、围栏后说明、多个围栏、不支持语言标记（python/javascript/yaml/JSON5）、围栏内非 JSON、截断（缺闭围栏）、闭围栏后尾随说明、围栏内含嵌套围栏标记、顶层数组、Python 字典字面量（不用 eval/ast）、尾逗号/单引号/缺括号/未转义换行等畸形 JSON。
+
+**不做的事**：不做 JSON 修复（不补括号/引号/去尾逗号）、不从混合文本抽取第一段 {...}、不接受顶层数组、不放宽 memories 结构与来源/防模仿/证据校验、不恢复 confidence 放行。错误统一映射 JSON_PARSE_ERROR（对外 API 契约不变，无模型原文返回）。
+
+### Prompt 精简
+
+- 修改前 **2387** 字符 → 修改后 **1906** 字符（**-481，-20.2%**）。
+- 合并内容：原 5 段规则（提取规则 11 条 + 候选原子化 6 条 + 限定证据 3 条 + 证据边界 1 条 + 过度推断红线 5 条，共 26 条、三重重复）合并为 3 段（事实来源与防模仿 6 条 / 限定必须有用户证据 3 条 / 候选原子化与类型规则 9 条）。
+- 保留的安全边界（语义逐项保留，由 298 项测试断言验证）：事实提取非回复、user 为唯一事实来源、assistant 证据边界、防模仿（原文/语气/承诺/转录/角色前缀）、一条一原子事实、多事实拆分、无证据丢弃、含糊指代禁止、评价/数量/频率/条件/因果/程度/时间跨度需 user 证据、confidence 非证据、core 高门槛、current 必须限期、五类类型规则、indexes 引用约束、候选上限、只返回 JSON、不返回围栏、空结果输出 {"memories":[]}。
+- 语义无变化：规则合并只消除重复表述。
+
+### 测试结果
+
+- `test_memory_extractor_phase15.py`：**26/26 通过**（A 裸 JSON / B 单围栏 / C 大小写标记 / D 空标记 / E-M 九种拒绝形态 / N 畸形 JSON 不修复 / O API 失败契约 / P 第 13 阶段规则保持（高置信评价拒、VAGUE_REFERENCE、assistant-only、current 默认 72h、`<final>` 清理）/ Q Prompt 18 条语义完整性 + 长度不高于旧版 / R 零写入与无第二次 LLM 调用源码约束）。
+- 全部回归 12 套件：**298/298 通过**（含 phase5 围栏用例按新行为更新、phase11/13 Prompt 短语断言对齐精简版——均为测试断言更新，非生产代码行为变更）。
+- py_compile memory_extractor.py 与测试文件通过。
+
+### 声明
+
+未调用生产预览接口；未调用真实 compression；未查询或修改 Supabase；未操作 Pinecone；未新增环境变量；未创建 commit/push；未保存真实 Prompt/模型响应/事件正文文件；未读取或输出凭据；未做 JSON 修复；未使用 eval/ast.literal_eval；未增加模型重试或第二次 LLM 调用；未修改 UTC 存储设计。
+
+### 已知限制与下一阶段建议
+
+- 第三轮模型原始输出形态仍未确认（接口不返回模型原文）——围栏兼容是否恰好命中生产失败形态，需部署后第四轮预览验证；
+- 若第四轮仍 JSON_PARSE_ERROR：不要再扩大宽松解析，应在预览接口失败路径增加**不含正文**的输出形态分类可观测性（如 raw_len / 是否含围栏标记 / 首字符类别等脱敏特征），定位后再修；
+- 第 13 阶段的原子化与证据约束在真实候选上的效果仍未验证（第三轮未产出候选），随第四轮一并验证；
+- 若恢复 PREVIEW_READY 且候选至少 1 条 good，进入手动 pending_review 写入执行器设计；保持全部既有约束：不自动调度、不接正式上下文、不删除旧数据、不修改 Pinecone、不恢复 Archived_Chat。
+
+
+---
+
+## 2026-08-30 · AI 伴侣记忆系统重做 · 第 17 阶段：手动候选确认与 pending_review 写入执行器
+
+### 日期与来源
+
+2026-08-30。第 16 阶段（第四轮生产预览）恢复 `PREVIEW_READY` 并产出候选（1 good + 1 需人工决定），质量门槛 `QUALITY_GATE_PASS`。本阶段在**不真实调用生产接口、不真实写库**的前提下，实现两步人工确认流程的第二步：手动候选确认与 `pending_review` 写入执行器。全程保持既有约束：不自动提取、不自动写入、不直接 active、不接正式上下文、不删除/迁移旧数据、不修改 Pinecone。
+
+### 修改文件
+
+| 文件 | 修改 |
+|---|---|
+| memory_preview.py | ① 新增 preview_token 进程内短期缓存（TTL/容量常量、惰性清理、一次性消费、失败保留）；② `run_preview` 的只读 SELECT 增加 `attempt_count` 列（供事件更新计算 +1），仅 `PREVIEW_READY` 响应追加 `preview_token` + `expires_in_seconds` 两个白名单字段，失败响应一律不发 token；③ 新增 commit 写入执行器区段：`run_commit` / `_run_commit_locked` / `_memory_item_row`（唯一允许写库的区段，仅 memory_items SELECT+INSERT 与 memory_events UPDATE） |
+| gateway.py | ① 注册 `POST /api/memory-extraction-commit` 路由（位于 `/api/*` 全局 API_SECRET 拦截之下）；② 新增 `_handle_memory_extraction_commit` handler：请求体严格字段白名单（仅 confirm/preview_token/selected_preview_indexes/reviewed_all，出现任何额外候选数据字段→400 不写库）、confirm 完全匹配 `WRITE_PENDING_REVIEW`、indexes 必须为非空不重复整数数组（排除 bool）、reviewed_all 必须严格为 true、错误码→HTTP 状态映射 |
+| test_memory_commit_phase17.py（新增，53 个测试） | 任务 A-J 全场景（路由鉴权/请求校验/token 生命周期/逐条选择/精确去重/失败恢复/事件更新/脱敏/零删除隔离） |
+| test_memory_preview_phase10.py | 源码约束更新：commit 执行器区段允许 memory_items 插入与 memory_events 条件更新；预览区段保持零写入（按区段标记拆分断言）；删除/UPSERT/存储过程/Pinecone/自动调度/环境变量仍全面禁止；两个脱敏断言改为排除随机 token 后扫描（避免随机串撞短 marker 的偶发误报） |
+| PROJECT_NOTES.md | 追加本节日志 |
+
+未修改 memory_extractor.py / server.py / napcat.py / heartbeat.py / migrations / requirements.txt / VARIABLES.md / Docker / 前端 / Pinecone / 正式上下文。
+
+### 手动两步流程
+
+```
+步骤1  POST /api/memory-extraction-preview（confirm=PREVIEW_ONLY）
+       → 生成候选 → 服务端缓存完整内部预览上下文
+       → 返回 preview_token（不透明随机串）+ 脱敏候选
+步骤2  POST /api/memory-extraction-commit（confirm=WRITE_PENDING_REVIEW）
+       → 提交 preview_token + selected_preview_indexes + reviewed_all=true
+       → 服务端只使用缓存中的原始候选
+       → 只写 memory_items(status=pending_review)
+       → 全部成功后才更新本批 memory_events 为 processed
+       → 最后才消费 token
+```
+
+commit 不重新调用 compression；不信任客户端提交的任何候选正文/类型/时间/来源（请求体白名单之外一字段即拒）；候选必须来自同一次服务端预览。
+
+### token / TTL / 容量
+
+- token：`secrets.token_urlsafe(32)`（43 字符 urlsafe 随机串，不可预测，不含 user_id/事件 ID/hash/正文）；不持久化到数据库或文件、不写日志；进程重启自然失效。
+- TTL = 900 秒（15 分钟）、容量 = 20 条，均为代码常量，未新增环境变量。
+- 清理：每次访问惰性清理过期项；超容量移除最旧（首次实现为「清理后再新增」导致稳态 21 条，测试暴露后改为「新增后再清理」，实测 20 条封顶）。
+- 一次性消费：仅全部成功后消费（移入同 TTL 墓碑，用于区分「已用」与「不存在/过期」）；任何失败路径保留 token 以便安全重试。
+- 防并发双击：同 token 的第二个并发请求在执行期间按「已用」处理（结束即释放，不影响后续重试）。
+- **多进程限制**：该缓存只适用于当前单 Web 进程部署；多 worker 或请求路由到不同实例时 token 可能找不到，此时返回 `PREVIEW_TOKEN_NOT_FOUND_OR_EXPIRED`；本阶段不为此引入 Redis 或新表。
+
+### 逐条选择与 reviewed_all 语义
+
+- 服务端绝不自动全选：只有用户明确选中的 preview_index 才写入；未选中的医疗、私密或其他候选一律不写入（专项测试用合成医疗候选验证未选不落库）。
+- 请求缺 `selected_preview_indexes` 或为空数组 → 400 拒绝。
+- `reviewed_all=true`（严格 `is True`，1/"true"/False 均拒）表示：用户已审核整批候选；未选中者视为本轮人工不采纳，不写入；本批事件无需再次自动提取。
+
+### pending_review 强制
+
+写入行完全来自服务端缓存候选，`status="pending_review"` 与 `created_by="memory_extractor"` 在 `_memory_item_row` 内强制覆盖（测试用恶意缓存值 active/someone_else 验证仍被覆盖）。写入字段与真实表结构一一对应共 18 列（user_id/memory_type/content/content_hash/status/importance/confidence/source/source_event_ids/source_batch_id/subject_key/valid_at/invalid_at/expires_at/last_confirmed_at/superseded_by/metadata/created_by）；id/created_at/updated_at 走数据库默认，绝不写入不存在的字段。隐私候选不做类型级默认排除——控制权完全在用户逐条选择。
+
+### 跨批精确去重
+
+写入前一次批量 SELECT：`user_id + content_hash` 精确匹配，状态范围仅 `pending_review / active`。命中即跳过（`duplicate_skipped` 计数），不 UPDATE 旧 memory_items、不刷新 last_confirmed_at、不合并 source_event_ids、不做语义近似、不处理 subject_key 冲突、不写 superseded_by——保持简单、可重试、非破坏性。去重查询失败视为 commit 失败（`DEDUP_CHECK_FAILED`）：不插入、不更新事件、不消费 token。另设防线：选中候选若出现重复 content_hash（提取器批内去重本应保证唯一）或缺 hash，直接 `INTERNAL_ERROR` 拒绝落库。
+
+### 写入顺序与失败恢复
+
+```
+1. 校验 reviewed_all / token / 人工选择（进程内，不查库）
+2. 精确去重 SELECT          → 失败=DEDUP_CHECK_FAILED，全停
+3. 逐条 INSERT 非重复候选    → 任一失败=MEMORY_ITEM_INSERT_FAILED，立即停止
+4. 确认全部选中候选「已插入或精确重复」
+5. 条件更新本批全部事件      → 失败/数量不足=EVENT_STATUS_UPDATE_FAILED
+6. 仅步骤 5 成功后消费 token
+```
+
+- 部分插入失败：已成功条目保留，不做补偿删除、不回滚；再次提交时精确去重跳过已成功项、继续剩余项（幂等重试设计，专项测试验证）。
+- 事件更新失败：不消费 token、返回 `EVENT_STATUS_UPDATE_FAILED`、不错误声称完成；已写入 items 不删除。
+- 任何失败路径均不更新事件、不消费 token。
+
+### 事件状态更新顺序
+
+- 全部候选处理成功后才更新本批全部事件（ops 顺序断言：全部 INSERT 先于 UPDATE）。
+- 更新条件含「id 属于本批」+「processing_status 仍为 pending」，绝不覆盖其他流程已处理的事件、不更新批外事件。
+- 按缓存中的原始 attempt_count 分组更新（同值一组 → 单条语句原子完成，避免先读后盲写）：`attempt_count=原值+1`、`processing_status=processed`、`processed_at=UTC ISO`、`batch_id=source_batch_id`、`last_error=null`；不修改事件正文/hash/来源/时间/metadata（payload 键集合断言）。
+- 更新返回行数总和必须等于本批事件数，少于即失败（数量校验断言：5/6 → 失败且 token 保留）。
+
+### 零删除声明
+
+本阶段零代码新增任何删除/UPSERT/存储过程路径；源码扫描（整个 memory_preview.py + commit handler 函数级 ast 切片）确认无删除语句、无 DROP/TRUNCATE、无 Pinecone、无 LLM 调用、无自动调度、无后台任务派发；行为级测试断言假客户端 delete/upsert/rpc 调用恒为空；commit 行为级测试 patch 提取器两个入口验证 commit 零模型调用。token 缓存清理是进程内存操作，不是任何数据库删除。
+
+### 测试结果
+
+- `test_memory_commit_phase17.py`：**53/53 通过**（A 路由鉴权 5 / B 请求校验 8 / C token 生命周期 10 / D 逐条选择 6 / E 精确去重 6 / F 失败恢复 3 / G 事件更新 8 / H 脱敏 3 / I 零删除隔离 5，含 subTest 展开计数）。
+- 回归 13 套件：**332/332 通过**（phase10 预览 38、extractor phase5/11/13/15、phase1_fixes、phase3、phase3_events、shared_experience_phase6、recall_observability_phase4、legacy_isolation_phase5、gateway_routes、phase17 专项）。
+- py_compile memory_preview.py / gateway.py / 两个测试文件通过。
+- 开发过程中测试暴露并修复 1 个真实缺陷（容量清理时序）与 3 个测试自身缺陷。
+
+### 数据安全声明
+
+- **本阶段未真实调用 preview 接口、未真实调用 commit 接口**（全部经 handler 直调 + mock 客户端完成）。
+- 本阶段 SELECT 执行情况：测试内全部为 mock；仅「验证」环节用 Supabase 工具做了**只读**核查（information_schema 列核查 + count 统计），查询内容仅表结构与计数，未读取任何正文。
+- INSERT=否（本阶段未真实执行）；UPDATE=否（本阶段未真实执行）；DELETE=否。
+- memory_items 未真实写入（远端行数 0，与阶段开始时一致）；memory_events 未真实更新（611 条全部仍为 pending，与本阶段开始一致）。
+- Pinecone=否；LLM=否；自动调度=否；新增环境变量=否；commit/push/部署=否。
+- 本日志与报告不记录 token、候选正文、user_id、事件 ID、hash、batch_id、Prompt、模型原文、密钥或生产 URL。
+
+### 已知风险
+
+- 进程内 token 在网关重启或多 worker/多实例下失效（返回 `PREVIEW_TOKEN_NOT_FOUND_OR_EXPIRED`，需重新预览；本阶段不引入共享存储）。
+- 部分插入失败依赖精确去重恢复（幂等重试），非事务式两步写入：memory_items 与 memory_events 分两阶段落库，中间态可能短暂存在（items 已写入而事件仍 pending），以 token 未消费 + 重试续传收束。
+- 事件更新为条件批量更新（按原始 attempt_count 分组），若同一批内事件被其他流程并发改动，将因数量校验失败而显式报错（符合「不覆盖其他流程处理结果」的取舍）。
+- pending_review 记忆尚不进入任何正式上下文（读取链路未接入）。
+- 人工误选敏感候选的风险由「逐条选择 + 明确确认」承担，服务端不做类型级拦截（敏感内容筛查仅在预览阶段整批跳过凭证/证件/银行卡三类）。
+
+### 下一阶段建议
+
+用户提交、推送、部署本阶段代码后：
+
+1. 先调用 preview（confirm=PREVIEW_ONLY）获取 token；
+2. 人工选择一条低敏感 good 候选（preview_index）， reviewed_all=true；
+3. 调用 commit（confirm=WRITE_PENDING_REVIEW）；
+4. Supabase 只读核验：只新增选中的 1 条 item 且 status=pending_review、本批全部事件 processed、未选候选未写入；
+5. 不选择医疗隐私候选；不接正式上下文；不自动调度；不删除旧数据；不操作 Pinecone；
+6. 首次真实验证通过后，再评估 pending_review 读取链路（召回过滤）与失败重试运维手册的设计。

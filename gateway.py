@@ -1875,6 +1875,11 @@ class HostFixMiddleware:
             await self._handle_memory_extraction_preview(scope, receive, send)
             return
 
+        # ---------- ✍️ 手动候选确认提交（第17阶段：两步人工确认第二步；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-extraction-commit":
+            await self._handle_memory_extraction_commit(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -2974,6 +2979,94 @@ class HostFixMiddleware:
             _log(f"⚠️ [提取预览] 接口异常: {type(e).__name__}")
             await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
                                               "candidates": []})
+
+    # ------------------------------------------
+    # ✍️ 手动候选确认提交 /api/memory-extraction-commit（第17阶段）
+    #    两步人工确认的第二步：本接口不接收任何候选内容——正文/类型/时间/来源
+    #    全部取自 preview_token 对应的服务端缓存；请求体走严格字段白名单，
+    #    出现 content/status/user_id 等任何额外候选数据字段一律 400 不写库。
+    #    位于 /api/* 统一鉴权之下（API_SECRET）；仅 POST；强制 status=pending_review；
+    #    失败不消费 token、不更新事件；全部成功才消费 token 并更新整批事件。
+    # ------------------------------------------
+    async def _handle_memory_extraction_commit(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405
+            await _send_json_resp(send, 405, {"ok": False, "code": "METHOD_NOT_ALLOWED",
+                                              "stats": {}})
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        _invalid = {"ok": False, "code": "INVALID_SELECTION", "stats": {}}
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        # 严格字段白名单：除以下 4 个字段外，出现任何其他字段（content/status/
+        # user_id/source_event_ids/importance/metadata/模型参数等）→ 400，不执行写入
+        allowed_fields = {"confirm", "preview_token",
+                          "selected_preview_indexes", "reviewed_all"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # 显式确认（必须完全匹配）
+        if payload.get("confirm") != "WRITE_PENDING_REVIEW":
+            await _send_json_resp(send, 400, {"ok": False, "code": "INVALID_CONFIRMATION",
+                                              "stats": {}})
+            return
+        token = payload.get("preview_token")
+        if not isinstance(token, str) or not token:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        indexes = payload.get("selected_preview_indexes")
+        if (not isinstance(indexes, list) or not indexes
+                or any(isinstance(i, bool) or not isinstance(i, int) for i in indexes)
+                or len(set(indexes)) != len(indexes)):
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # reviewed_all 必须严格为 true：用户已审核整批候选，
+        # 未选中者视为本轮人工不采纳（不写入），本批事件不再自动提取
+        if payload.get("reviewed_all") is not True:
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        try:
+            import memory_preview
+            import server as _srv_commit
+            result = await memory_preview.run_commit(
+                _srv_commit.supabase_service, token, indexes,
+                reviewed_all=payload.get("reviewed_all"))
+        except Exception as e:
+            # 任何异常都不落库、不消费 token，只返回脱敏错误（不含异常原文）
+            _log(f"⚠️ [记忆人工提交] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "code": "INTERNAL_ERROR",
+                                              "stats": {}})
+            return
+
+        error_status = {
+            "INVALID_SELECTION": 400,
+            "PREVIEW_TOKEN_NOT_FOUND_OR_EXPIRED": 404,
+            "PREVIEW_TOKEN_ALREADY_USED": 409,
+            "DEDUP_CHECK_FAILED": 500,
+            "MEMORY_ITEM_INSERT_FAILED": 500,
+            "EVENT_STATUS_UPDATE_FAILED": 500,
+            "SERVICE_UNAVAILABLE": 503,
+        }
+        status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
 
     # ------------------------------------------
     # 🎛️ 多模型管理接口 /api/models

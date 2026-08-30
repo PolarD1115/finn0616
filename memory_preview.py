@@ -1,19 +1,30 @@
 # -*- coding: utf-8 -*-
-"""第 10 阶段 —— 手动事实提取预览（只读、零写入）。
+"""第 10 阶段 —— 手动事实提取预览（只读、零写入）＋ 第 17 阶段人工提交执行器。
 
 职责：供 gateway 的受保护 POST /api/memory-extraction-preview 接口调用——
 只读选择少量 pending Web memory_events → 敏感内容筛查 → 复用
 memory_extractor.extract_memory_candidates（compression ≤1 次）→
 组装脱敏的候选预览响应。
 
-零写入红线：本模块只执行 .select() 查询；不写 memory_items、不更新
+第 17 阶段新增 commit 写入执行器（两步人工确认的第二步）：
+- PREVIEW_READY 时生成一次性 preview_token，进程内缓存完整内部预览上下文
+  （TTL/容量为代码常量、访问时惰性清理；不持久化、不入日志、重启即失效）；
+- run_commit 只信服务端缓存候选：memory_items 仅查询＋逐条插入（强制
+  status=pending_review / created_by=memory_extractor），memory_events 仅
+  条件更新为 processed；全部成功才消费 token；失败不消费、不做补偿删除，
+  依赖精确去重实现幂等重试。
+
+预览零写入红线：run_preview 只执行 .select() 查询；不写 memory_items、不更新
 memory_events 任何字段、不执行状态计划、不触碰 Pinecone、不自动调度。
 响应不包含事件 ID、user_id、source_event_id、content_hash、batch_id、
 metadata、Prompt 或模型原始响应。
 """
 
 import asyncio
+import datetime
 import re
+import secrets
+import time
 
 import memory_extractor as mx
 
@@ -27,6 +38,66 @@ CODE_SENSITIVE_BATCH = "SENSITIVE_BATCH_SKIPPED"
 CODE_SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
 CODE_DB_ERROR = "DB_ERROR"
 QUALITY_HINT = "NEEDS_HUMAN_REVIEW"
+
+# ════════════════════════════════════════════════════════════
+# 第 17 阶段 —— preview_token 进程内短期缓存
+# ════════════════════════════════════════════════════════════
+# 仅适用于单 Web 进程部署：多 worker 或请求路由到不同实例时 token 可能找不到，
+# 此时返回 PREVIEW_TOKEN_NOT_FOUND_OR_EXPIRED；本阶段不为此引入 Redis 或新表。
+# 缓存不持久化到数据库或文件、不写入日志；进程重启后自然失效。
+# 清理策略：每次访问惰性清理过期项；超容量时移除最旧缓存项（进程内存清理，
+# 不是任何数据库删除）；不建立后台清理线程。
+
+PREVIEW_TOKEN_TTL_SECONDS = 900   # 15 分钟（代码常量，不新增环境变量）
+PREVIEW_CACHE_MAX_ENTRIES = 20    # 超容量时移除最旧缓存项
+
+_preview_cache = {}        # token -> 完整内部预览上下文（未消费）
+_preview_used_tokens = {}  # token -> expires_at（已成功消费的墓碑，仅用于区分"已用"与"不存在"）
+_commit_inflight = set()   # 正在执行中的 token（防并发双击重复写入；结束即移除）
+_TOKEN_USED = object()     # peek 哨兵：token 已被成功 commit 消费
+
+
+def _purge_preview_caches(now=None):
+    """惰性清理：移除过期项 + 超容量时移除最旧（仅进程内存，不触碰数据库）。"""
+    now = time.time() if now is None else now
+    for t in [t for t, e in _preview_cache.items() if e.get("expires_at", 0) <= now]:
+        _preview_cache.pop(t, None)
+    for t in [t for t, exp in _preview_used_tokens.items() if exp <= now]:
+        _preview_used_tokens.pop(t, None)
+    while len(_preview_cache) > PREVIEW_CACHE_MAX_ENTRIES:
+        oldest = min(_preview_cache.items(), key=lambda kv: kv[1].get("created_at", 0))[0]
+        _preview_cache.pop(oldest, None)
+
+
+def _store_preview_entry(entry):
+    """缓存一次 PREVIEW_READY 的完整内部上下文，返回不透明随机 token。
+    token 用 secrets 随机源（不可预测），不含 user_id / 事件 ID / hash / 正文。"""
+    _purge_preview_caches()
+    token = secrets.token_urlsafe(32)
+    _preview_cache[token] = entry
+    while len(_preview_cache) > PREVIEW_CACHE_MAX_ENTRIES:
+        oldest = min(_preview_cache.items(), key=lambda kv: kv[1].get("created_at", 0))[0]
+        _preview_cache.pop(oldest, None)
+    return token
+
+
+def _peek_preview_entry(token):
+    """查询 token：返回缓存 dict / _TOKEN_USED（已被成功消费）/ None（不存在或已过期）。"""
+    if not isinstance(token, str) or not token:
+        return None
+    _purge_preview_caches()
+    if token in _preview_used_tokens:
+        return _TOKEN_USED
+    return _preview_cache.get(token)
+
+
+def _consume_preview_entry(token):
+    """成功 commit 后消费 token（移入墓碑，随 TTL 惰性清除）。失败路径绝不调用。"""
+    entry = _preview_cache.pop(token, None)
+    if entry is not None:
+        _preview_used_tokens[token] = entry.get(
+            "expires_at", time.time() + PREVIEW_TOKEN_TTL_SECONDS)
+    return entry
 
 # 敏感内容筛查（命中任一 → 整批跳过，不调用模型；只返回计数不返回命中内容）
 _SENSITIVE_RULES = (
@@ -173,7 +244,7 @@ async def run_preview(supabase_service, limit=MAX_PREVIEW_EVENTS,
         res = await asyncio.to_thread(
             lambda: supabase_service.table("memory_events")
             .select("id,user_id,session_id,channel,role,content,occurred_at,"
-                    "created_at,source_event_id,processing_status,metadata")
+                    "created_at,source_event_id,processing_status,attempt_count,metadata")
             .eq("channel", "web").eq("processing_status", "pending")
             .in_("role", list(_ALLOWED_ROLES))
             .order("created_at", desc=True).limit(SELECT_WINDOW).execute())
@@ -240,7 +311,25 @@ async def run_preview(supabase_service, limit=MAX_PREVIEW_EVENTS,
         })
     print(f"🧪 记忆提取预览：候选={len(candidates)} 拒绝={len(result['rejected'])}")
 
-    return {
+    # 🆕 第 17 阶段：仅 PREVIEW_READY 生成一次性 preview_token 并缓存完整内部
+    #    上下文，供 /api/memory-extraction-commit 使用；失败响应一律不发 token。
+    #    缓存内容（候选原文/来源 ID/hash/batch/user_id/各事件原始 attempt_count）
+    #    绝不返回给客户端、绝不写入日志。
+    now_ts = time.time()
+    entry = {
+        "candidates": list(result["candidates"]),   # 内部完整候选（供 commit 落库）
+        "batch_event_ids": [str(eid) for eid in result["status_plan"]["event_ids"]],
+        "event_attempt_counts": {str(e.get("id")): int(e.get("attempt_count") or 0)
+                                 for e in selected},
+        "source_batch_id": str(result["batch_id"]),
+        "user_id": clean_events[0].get("user_id"),
+        "created_at": now_ts,
+        "expires_at": now_ts + PREVIEW_TOKEN_TTL_SECONDS,
+    }
+    token = _store_preview_entry(entry)
+    print(f"🧪 记忆提取预览：已缓存人工提交上下文（{PREVIEW_TOKEN_TTL_SECONDS // 60} 分钟内一次性有效）")
+
+    resp = {
         "ok": True,
         "code": "PREVIEW_READY",
         "stats": stats,
@@ -252,4 +341,227 @@ async def run_preview(supabase_service, limit=MAX_PREVIEW_EVENTS,
             "executed": False,
         },
         "write_guards": _write_guards(),
+    }
+    resp["preview_token"] = token
+    resp["expires_in_seconds"] = PREVIEW_TOKEN_TTL_SECONDS
+    return resp
+
+
+# ════════════════════════════════════════════════════════════
+# 第 17 阶段：人工确认写入执行器（两步提交的第二步，commit）
+# ════════════════════════════════════════════════════════════
+# 本区段是全模块唯一允许写库的地方，且数据库操作仅限：
+#   memory_items : SELECT（精确去重） + INSERT（逐条，失败即停）
+#   memory_events: UPDATE（条件更新为 processed）
+# 硬边界：不重新调用模型、不触碰 Pinecone、不删除任何数据、不使用 UPSERT 或
+# 存储过程、不自动调度、不接入正式上下文。status/created_by 服务端强制覆盖，
+# 客户端提交的任何候选内容（正文/类型/时间/来源）一律不信任——候选只来自
+# preview_token 对应的服务端缓存。
+
+CODE_COMMIT_COMPLETED = "COMMIT_COMPLETED"
+CODE_DEDUP_FAILED = "DEDUP_CHECK_FAILED"
+CODE_INSERT_FAILED = "MEMORY_ITEM_INSERT_FAILED"
+CODE_EVENT_UPDATE_FAILED = "EVENT_STATUS_UPDATE_FAILED"
+CODE_TOKEN_NOT_FOUND = "PREVIEW_TOKEN_NOT_FOUND_OR_EXPIRED"
+CODE_TOKEN_USED = "PREVIEW_TOKEN_ALREADY_USED"
+CODE_INVALID_SELECTION = "INVALID_SELECTION"
+
+# 跨批精确去重只看这两种状态（不查 superseded/expired/rejected，不做语义近似，
+# 不刷新 last_confirmed_at、不合并来源、不写替代链——本阶段保持简单可重试）
+_DEDUP_STATUSES = ("pending_review", "active")
+
+# memory_items 写入字段（与第 4 阶段真实表结构一一对应；
+# id / created_at / updated_at 走数据库默认，绝不写入不存在的字段）
+_MEMORY_ITEM_FIELDS = ("user_id", "memory_type", "content", "content_hash", "status",
+                       "importance", "confidence", "source", "source_event_ids",
+                       "source_batch_id", "subject_key", "valid_at", "invalid_at",
+                       "expires_at", "last_confirmed_at", "superseded_by", "metadata",
+                       "created_by")
+
+
+def _commit_error(code, stats):
+    """脱敏错误响应：只含 ok/code/stats 计数，绝不含 token/正文/ID/hash/异常原文。"""
+    return {"ok": False, "code": code, "stats": dict(stats)}
+
+
+def _memory_item_row(cand):
+    """把服务端缓存中的内部候选转换为 memory_items 插入行。
+    status 与 created_by 在此强制覆盖，与缓存取值无关、客户端更不可控。"""
+    row = {
+        "user_id": cand.get("user_id"),
+        "memory_type": cand.get("memory_type"),
+        "content": cand.get("content"),
+        "content_hash": cand.get("content_hash"),
+        "status": "pending_review",           # 🔒 强制覆盖
+        "importance": cand.get("importance"),
+        "confidence": cand.get("confidence"),
+        "source": cand.get("source"),
+        "source_event_ids": list(cand.get("source_event_ids") or []),
+        "source_batch_id": cand.get("source_batch_id"),
+        "subject_key": cand.get("subject_key"),
+        "valid_at": cand.get("valid_at"),
+        "invalid_at": cand.get("invalid_at"),
+        "expires_at": cand.get("expires_at"),
+        "last_confirmed_at": cand.get("last_confirmed_at"),
+        "superseded_by": cand.get("superseded_by"),
+        "metadata": cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {},
+        "created_by": "memory_extractor",     # 🔒 强制覆盖
+    }
+    return {k: row[k] for k in _MEMORY_ITEM_FIELDS}
+
+
+async def run_commit(supabase_service, preview_token, selected_preview_indexes,
+                     reviewed_all):
+    """人工确认写入执行器（gateway 的 /api/memory-extraction-commit 调用）。
+
+    supabase_service: server.supabase_service（service_role；只用于上表两种操作）。
+    preview_token:    预览返回的一次性凭证；候选数据全部取自进程内缓存。
+    selected_preview_indexes: 用户明确选中的 preview_index（1 起始整数、不重复）；
+                      未选中的候选一律不写入（服务端绝不自动全选）。
+    reviewed_all:     必须严格为 True——语义为「用户已审核整批候选；未选中者视为
+                      本轮人工不采纳，不写入；本批事件无需再次自动提取」。
+
+    执行顺序（任一步失败立即停止：不更新事件、不消费 token、不做补偿删除；
+    已成功插入的条目保留，重试时经精确去重跳过——幂等重试设计）：
+      1. 校验 reviewed_all / token / 人工选择（进程内，不查库）
+      2. memory_items 精确去重（user_id + content_hash，含 pending_review/active）
+      3. 逐条 INSERT 非重复候选（强制 pending_review）
+      4. 确认全部选中候选「已插入或精确重复」
+      5. 条件更新本批全部 memory_events 为 processed（返回行数必须等于整批数）
+      6. 仅步骤 5 成功后消费 token
+    返回 API 安全响应 dict（不回显 token/正文/ID/hash/batch/user_id/Prompt）。
+    """
+    stats = {"selected": 0, "inserted": 0, "duplicate_skipped": 0,
+             "unselected_rejected": 0, "events_processed": 0}
+
+    # 0. 人工整批审核确认（缺 reviewed_all=true 视为未完成人工审核）
+    if reviewed_all is not True:
+        return _commit_error(CODE_INVALID_SELECTION, stats)
+
+    if supabase_service is None:
+        return _commit_error(CODE_SERVICE_UNAVAILABLE, stats)
+
+    # 1. token 校验（进程内缓存；不查库。不存在/过期 → NOT_FOUND；已成功消费 → USED）
+    peeked = _peek_preview_entry(preview_token)
+    if peeked is _TOKEN_USED:
+        return _commit_error(CODE_TOKEN_USED, stats)
+    entry = peeked
+    if not isinstance(entry, dict):
+        return _commit_error(CODE_TOKEN_NOT_FOUND, stats)
+
+    candidates = entry.get("candidates") or []
+    batch_event_ids = [str(e) for e in (entry.get("batch_event_ids") or [])]
+    if not candidates or not batch_event_ids:
+        return _commit_error("INTERNAL_ERROR", stats)
+
+    idx_list = selected_preview_indexes
+    if (not isinstance(idx_list, list) or not idx_list
+            or any(isinstance(i, bool) or not isinstance(i, int) for i in idx_list)
+            or len(set(idx_list)) != len(idx_list)
+            or any(not (1 <= i <= len(candidates)) for i in idx_list)):
+        return _commit_error(CODE_INVALID_SELECTION, stats)
+
+    selected = [candidates[i - 1] for i in idx_list]
+    entry_user_id = entry.get("user_id")
+    if any(not isinstance(c, dict) or c.get("user_id") != entry_user_id
+           or not c.get("content_hash") for c in selected):
+        return _commit_error("INTERNAL_ERROR", stats)
+    if len({c.get("content_hash") for c in selected}) != len(selected):
+        # 选中候选出现重复 hash（提取器批内去重本应保证唯一）→ 数据不完整，拒绝落库
+        return _commit_error("INTERNAL_ERROR", stats)
+    stats["selected"] = len(selected)
+    stats["unselected_rejected"] = len(candidates) - len(selected)
+
+    # 防并发双击：同 token 的第二个并发请求按"已用"处理（结束即释放，不影响重试）
+    if preview_token in _commit_inflight:
+        return _commit_error(CODE_TOKEN_USED, stats)
+    _commit_inflight.add(preview_token)
+    try:
+        return await _run_commit_locked(supabase_service, preview_token, entry,
+                                        selected, batch_event_ids, stats)
+    finally:
+        _commit_inflight.discard(preview_token)
+
+
+async def _run_commit_locked(supabase_service, preview_token, entry, selected,
+                             batch_event_ids, stats):
+    """run_commit 的实际写库流程（调用方已持有 inflight 标记）。"""
+    # 2. 跨批精确去重：user_id + content_hash 精确匹配（一次批量查询）；
+    #    查询失败视为 commit 失败——不插入、不更新事件、不消费 token
+    entry_user_id = entry.get("user_id")
+    hashes = sorted({str(c.get("content_hash")) for c in selected})
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase_service.table("memory_items")
+            .select("content_hash,status")
+            .eq("user_id", entry_user_id)
+            .in_("content_hash", hashes)
+            .in_("status", list(_DEDUP_STATUSES))
+            .execute())
+        existing = {str(r.get("content_hash"))
+                    for r in (getattr(res, "data", None) or []) if isinstance(r, dict)}
+    except Exception as e:  # noqa: BLE001 —— 只记异常类型，不外泄数据库异常原文
+        print(f"⚠️ 记忆人工提交失败：stage=dedup error={type(e).__name__}")
+        return _commit_error(CODE_DEDUP_FAILED, stats)
+
+    to_insert = [c for c in selected if str(c.get("content_hash")) not in existing]
+    stats["duplicate_skipped"] = len(selected) - len(to_insert)
+
+    # 3. 逐条 INSERT 非重复候选（任一失败立即停止：已成功项保留，供幂等重试）
+    inserted = 0
+    for cand in to_insert:
+        row = _memory_item_row(cand)
+        try:
+            res = await asyncio.to_thread(
+                lambda r=row: supabase_service.table("memory_items").insert(r).execute())
+            if not (getattr(res, "data", None) or []):
+                raise RuntimeError("empty insert result")
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 记忆人工提交失败：stage=insert error={type(e).__name__}")
+            stats["inserted"] = inserted
+            return _commit_error(CODE_INSERT_FAILED, stats)
+        inserted += 1
+    stats["inserted"] = inserted
+
+    # 4+5. 全部选中候选「已插入或精确重复」后，条件更新本批全部事件。
+    #      按缓存中的原始 attempt_count 分组（同值一组 → 单条语句原子更新，
+    #      避免先读后盲写）；更新条件含「仍为 pending」，绝不覆盖其他流程
+    #      已处理的事件；返回行数总和必须等于本批事件数，少于即失败。
+    processed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    attempt_map = entry.get("event_attempt_counts") or {}
+    groups = {}
+    for eid in batch_event_ids:
+        groups.setdefault(int(attempt_map.get(eid, 0)), []).append(eid)
+    updated = 0
+    try:
+        for orig, ids in sorted(groups.items()):
+            res = await asyncio.to_thread(
+                lambda o=orig, ids=ids: supabase_service.table("memory_events")
+                .update({"processing_status": "processed",
+                         "processed_at": processed_at,
+                         "batch_id": entry.get("source_batch_id"),
+                         "last_error": None,
+                         "attempt_count": o + 1})
+                .in_("id", ids)
+                .eq("processing_status", "pending")
+                .execute())
+            updated += len(getattr(res, "data", None) or [])
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 记忆人工提交失败：stage=event_update error={type(e).__name__}")
+        return _commit_error(CODE_EVENT_UPDATE_FAILED, stats)
+    if updated != len(batch_event_ids):
+        print("⚠️ 记忆人工提交失败：stage=event_update error=count_mismatch")
+        return _commit_error(CODE_EVENT_UPDATE_FAILED, stats)
+    stats["events_processed"] = len(batch_event_ids)
+
+    # 6. 全部成功 → 消费 token（唯一消费点；失败路径 token 保留以便安全重试）
+    _consume_preview_entry(preview_token)
+    print(f"✍️ 记忆人工提交：selected={stats['selected']} inserted={inserted} "
+          f"duplicate={stats['duplicate_skipped']} events={len(batch_event_ids)}")
+    return {
+        "ok": True,
+        "code": CODE_COMMIT_COMPLETED,
+        "stats": stats,
+        "write_result": {"memory_items_status": "pending_review",
+                         "memory_events_status": "processed"},
     }
