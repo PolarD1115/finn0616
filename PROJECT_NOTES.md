@@ -3818,3 +3818,334 @@ memory_items → 内存排除已过期条目 → 确定性词面相关性排序 
 5. 不删除旧数据；不操作 Pinecone；不自动调度；不删除 rejected/superseded 记录；
 6. 后续可评估：active 自动过期流程、last_recalled_at 统计、embedding 检索链路
    （接入前本接口保持 deterministic_lexical_v1 并如实标注）。
+
+
+## 阶段 C1：hungry_cat 代码驱动喂食优先级——Home 菜品优先喂小满（2026-08-31）
+
+### 问题根因
+宠物饥饿照料链路（heartbeat._try_pet_care → tool_loop.run_pet_care_tool_loop）的
+工具白名单 `_PET_CARE_TOOLS` 只有 8 个旧 cat_* 工具，到不了 Home Runtime 的
+pantry_observe / feed_member；喂食资源选择完全交给模型在 Prompt 提示下自由决定。
+因此 AI 做好的 Home 菜品（home_dishes）永远无法在"小满饿了"的照料路径中使用，
+模型通常只能走 cat_shop_buy 花钱买猫粮。此前 rpc_home_feed_member 已在线上
+（含 pets 分支，历史 4 次真实成功喂 pet_xiaoman），断点纯在调用层白名单与决策方式。
+
+### 实际修改（仅 tool_loop.py，未动其他业务文件）
+1. 新增 `_PET_FOOD_PRIORITY`（tuna_can/wet_food/fish/cat_milk/apple，仅用于从
+   已有库存中做稳定挑选，不改变食物效果）。
+2. 新增 feed_member 失败分类常量：资源类 `_HOME_FEED_RESOURCE_ERROR_CODES`
+   （DISH_NOT_AVAILABLE，允许回退宠物库存）；系统/映射类 `_HOME_FEED_STOP_ERROR_CODES`
+   （PET_MAPPING_NOT_FOUND/PET_NOT_FOUND/PET_NOT_FEEDABLE/HOME_STATE_NOT_FOUND/
+   SERVICE_KEY_MISSING/RPC_ERROR/RPC_EMPTY/DB_UNAVAILABLE/EMPTY_*/INVALID_USER，
+   必须停止本轮，不得购买猫粮掩盖；未知错误按系统类处理）。
+3. 新增纯函数 `_pick_available_dish`（pantry raw.data.dishes 中选 id 非空且
+   servings>0 的菜；份数最多者优先、并列按 id 字典序，与返回顺序无关；不从
+   text 解析 UUID）、`_pick_pet_food`（cat_status raw.inventory 按
+   _PET_FOOD_PRIORITY 挑一种 qty>0 的合法食物，玩具/清洁/未知 item 不算）。
+4. 新增 `_run_hungry_feeding`：hungry_cat 代码驱动状态机——
+   ① pantry_observe（只读失败→"厨房状态未确认"，不阻断旧链路）；
+   ② 有菜则 feed_member（target_key 固定 pet_xiaoman，actor_key 仍由
+   TOOL_REGISTRY.fixed_args 注入 ai_primary，action_key 复用
+   _gen_home_action_key 由代码生成、不暴露给模型）；
+   ③ 无菜/菜品被抢（DISH_NOT_AVAILABLE）→ 回退 cat_feed（用真实库存）；
+   ④ 库存也空 → cat_shop_buy 一次（qty=1）后 cat_feed，购买成功但喂食失败
+   不重复购买；喂成功即停，杜绝重复喂食/重复购买。
+5. run_pet_care_tool_loop：hungry_cat 分支不再让模型做工具决策（LLM 只写最终
+   日志），非 hungry 事件（dirty/tired/unhappy）流程原样保留；日志 Prompt 注入
+   结构化喂食结果摘要，严格要求"最终喂食失败时不得出现喂饱了/吃完了/不饿了"
+   等成功暗示，且不得出现 UUID/编号/内部标识；LLM 日志失败时使用区分四种结局的
+   安全兜底文案（Home 菜喂成 / 库存喂成 / 买后喂成 / 没有成功喂上）。
+6. 同步最小更新 5 个因本设计变更而失效的旧用例（test_tool_loop 2 个、
+   test_cat_check 3 个）：语义不变的改用 dirty_cat 保留原断言意图。
+
+### 喂食优先级（代码约束，非 Prompt 建议）
+Home 菜品（servings>0）→ pet_inventory 已有合法食物 → 购买（cat_shop_buy）→ 喂食。
+全部副作用仍经既有 call_tool → home_system / home.service → Supabase RPC 完成，
+未在 Python 复制任何 RPC 业务逻辑，未直接写 pets/pet_inventory/home_dishes/
+home_member_states/home_events。
+
+### care_effective 新语义（仅 hungry_cat）
+只有 feed_member 或 cat_feed 真正业务成功（raw.ok=true）才算 care_effective=True；
+pantry_observe/cat_status/cat_shop_list/购买本身/购买后喂食失败均为 False。
+其他事件保留原"非查看类成功改善工具"语义。调用方（heartbeat._try_pet_care）
+据此保留待重试标记，契约（4 元组返回）不变。
+
+### 测试结果（全部 mock，不触真实 Supabase）
+- 新增 test_pet_feed_priority.py：25 测全过（场景 A-K：Home 优先/多菜品稳定选择/
+  库存回退/购买回退/买后喂失败不重购/DISH_NOT_AVAILABLE 回退/9 类系统错误停止/
+  pantry 失败两分支/非 hungry 不变/无效库存项/raw 优先于 text/日志不含 UUID 与 action_key）。
+- 回归：test_cat_check 31、test_home_pet_bridge 59、test_cat_tick 21、
+  test_memory_phase1_fixes、test_legacy_isolation_phase5 全过；
+  test_tool_loop 108 测仅剩 5 个审计阶段已确认的旧漂移失败（与本阶段无关，
+  修改前已存在）；test_cat/test_home/test_home_garden 的 16 个失败同为审计阶段
+  已确认的"本地测试滞后于已提交代码"漂移，未篡改产品代码迎合过期断言。
+- py_compile：tool_loop.py 及 3 个测试文件全部通过。
+
+### 边界声明
+- 未修改数据库：无迁移、无 DDL、无写入，Supabase 仅只读核查（rpc_home_feed_member
+  仍为线上既有函数）。
+- 未新增环境变量：无新 cooldown/开关；不套用 _HOME_TOOL_COOLDOWN["feed_member"] 的
+  8 小时进程冷却（用户决定不加喂食频率上限），依赖"喂成功即停"防重复误操作；
+  数据库既有 intimacy 日上限保持不变。
+- 未覆盖用户已有修改：prompts/reply_rules.md（用户有意清空）、
+  test_shared_experience_phase6.py、home/__pycache__/*.pyc 均保持原样。
+
+### 已知限制
+1. 不合并自由活动与 Home 自主调度；"逛虚拟小屋"白名单仍只有旧 house_*/cat_* 工具
+   （留给统一调度阶段）。
+2. Home 菜品是否"适合宠物"沿用 rpc_home_feed_member 既有契约，未建营养学规则。
+3. cat_status 查询失败时库存未知：直接走"购买"兜底（pantry 失败时同理按推荐策略
+   允许购买），日志会如实标注厨房状态未确认。
+4. 本地 test_*.py 被 .gitignore 忽略、无版本控制，阶段 1 确认的 38 个旧漂移失败
+   仍未解决（与本阶段无关，留待测试资产治理）。
+
+
+## 阶段 C1.1：收紧喂食失败回退 + 专项测试纳入版本控制（2026-08-31）
+
+### C1 遗留问题（经实际代码复核确认）
+1. `_run_hungry_feeding` 中 cat_feed 失败时，除 INSUFFICIENT_INVENTORY 外的其他
+   错误（系统/映射/参数/未知/无错误码）也会进入一次购买路径——有"用购买猫粮掩盖
+   系统故障"的风险。
+2. cat_status 调用失败或返回结构异常（raw 非 dict / raw.ok≠true / 缺 pet /
+   pet 非 dict）时，原实现仍继续 pantry_observe → feed_member/cat_feed/购买——
+   把"状态未知"当成"库存为空"去消费。
+3. 专项测试 test_pet_feed_priority.py 被 .gitignore 的 `test_*.py` 规则忽略，
+   无法进入版本控制。
+
+### 事实核查（不轻信报告）
+- `call_tool["ok"]` = 调用过程成功（不抛异常+参数校验通过）；业务结果在
+  `raw.ok` / `raw.error_code`（顶层，无 raw.data.error_code 形态）。
+- cat_feed 真实错误码（migrations/20240811_004_cat_rpc.sql）：
+  INSUFFICIENT_INVENTORY（:153，唯一资源类）、ITEM_NOT_IN_WHITELIST（:128）、
+  NOT_FOOD_ITEM（:132）、PET_NOT_FOUND（:143）；home_system._rpc 层：
+  SERVICE_KEY_MISSING / RPC_ERROR / RPC_EMPTY。任务提示的 ITEM_NOT_FOUND
+  在真实 RPC 中不存在，未纳入可购买集合。
+- cat_shop_buy 真实错误码：INVALID_QTY / ITEM_NOT_IN_WHITELIST /
+  WALLET_NOT_FOUND / INSUFFICIENT_BALANCE + 入参层 INVALID_USER。
+- rpc_cat_status 的 inventory 元素结构为 {item_id, name, type, quantity}。
+
+### 实际修改（仅 tool_loop.py / .gitignore / 测试）
+1. 新增 `_CAT_FEED_BUYABLE_ERROR_CODES = {"INSUFFICIENT_INVENTORY"}`（白名单式）。
+   cat_feed 失败时：错误码在该集合 → 允许一次购买回退（并发消费掉库存的场景）；
+   其余一切（系统/映射/参数/未知/无错误码/call_tool 层失败 CALL_FAILED）→
+   本轮停止，不购买，care_effective=False。不以 text 文本做分类依据。
+2. `_run_hungry_feeding` 步骤 0 增加状态确认门控：status_raw 必须是
+   ok=true 且 pet 为 dict 的 dict，否则 stop_reason="CAT_STATUS_UNCONFIRMED"，
+   只调 cat_status 一项即返回——不观察厨房、不喂食、不购买。该门控覆盖
+   _format_cat_status_for_llm 返回 cat_status_ok=False 的全部形态。
+   注意区分：pantry_observe 失败（cat_status 已成功）仍可使用已确认的
+   pet_inventory，这是 C1 既有策略，保持不变。
+3. `_feeding_summary` 与日志兜底文案新增两种结局："未能确认小满状态与库存：
+   本轮未喂食、未购买，保留待重试"与"系统/未知类喂食失败：本轮停止未购买"；
+   兜底区分现在覆盖六种结局（Home 菜喂成/库存喂成/买后喂成/状态未确认未执行/
+   系统错误未购买/资源不足未喂上）。
+4. .gitignore 在 `test_*.py` 后新增精确例外 `!test_pet_feed_priority.py`；
+   其余 test_*.py 与调查文件保持忽略（check-ignore 验证 test_cat_check.py /
+   test_tool_loop.py 仍被忽略）。文件现为未跟踪（??）状态，具备可提交性；
+   本阶段未执行 git add / commit。
+5. test_pet_feed_priority.py 扩至 38 测：新增 TestCatStatusUnconfirmed
+   （7 测：call_tool 失败/raw.ok=false/raw 缺失/raw={}/缺 pet/pet 非 dict/
+   "默认全成功假体下状态失败仍全停"）与 TestCatFeedFailureClassification
+   （7 测：INSUFFICIENT_INVENTORY 购买回退成功/8 个系统映射参数码逐项停止/
+   未知码停止/无码停止注明"原因未确认"/call_tool 层失败停止/pantry 失败但
+   status 正常仍用库存）。全部先红（18 失败）后绿。
+
+### cat_status 失败流程（修复 2）
+run_pet_care_tool_loop 对 hungry_cat：cat_status 失败 → _run_hungry_feeding
+立即返回（results 仅含 cat_status 一条失败记录）→ 阶段4 日志 Prompt 收到
+"未能确认小满状态与库存：本轮未喂食、未购买，保留待重试" → care_effective=False、
+cat_status_ok=False → 仍返回 4 元组（契约不变），heartbeat._try_pet_care 消费
+care_effective=False → 自由活动侧 care_pending 保留待重试语义继续成立，
+heartbeat 无需修改。
+
+### 测试结果（全部 mock，不触真实 Supabase）
+- test_pet_feed_priority：38/38 通过。
+- 回归：test_cat_check 31 + test_home_pet_bridge 59 + test_cat_tick 21 全过；
+  test_tool_loop 108 测仅剩 5 个与 C1 前完全一致的旧漂移失败（查天气路径断言，
+  审计阶段已确认，未新增）；未修改产品代码迎合无关旧测试。
+- py_compile：tool_loop.py 与全部相关测试文件通过。
+
+### 边界声明
+- 未修改数据库（本阶段未做任何 Supabase 查询——错误码全部从仓库迁移文件与
+  home_system.py 源码核实）。
+- 未新增环境变量，VARIABLES.md 未改动。
+- 未覆盖用户已有修改：prompts/reply_rules.md（有意清空）、
+  test_shared_experience_phase6.py、home/__pycache__/*.pyc 均保持原样；
+  credentials.json / token.json 未读取未纳入。
+- 未创建 commit。
+
+### 已知限制
+1. cat_status 成功但 inventory 字段缺失（非 list）时视为"库存未知"，
+   _pick_pet_food 返回 None → 走购买兜底（真实 RPC 恒返回 inventory 数组，
+   仅 mock 场景可能出现）。
+2. cat_status 失败的轮次会消耗一次照料触发机会（30 分钟进程冷却照常记录），
+   待下一轮阈值事件或自由活动检查重试——与既有待重试语义一致。
+3. C1 报告中"cat_feed 非库存不足错误转购买路径"的旧行为已收紧，若线上出现
+   极端场景（库存快照有货但喂食因未列入的临时性错误失败），本轮会保守停止
+   而非购买——这是按"宁停不误购"原则的有意取舍。
+
+
+## 阶段 C2：Home 多轮工具执行与真实结果约束（2026-08-31）
+
+### 原单轮流程根因（修改前经代码逐一复核确认）
+1. garden_observe/pantry_observe 观察文本被 [:300]/[:200] 硬截断后塞进 Prompt，
+   plant_id/dish_id 位于截断点之后即丢失，模型无法引用真实 ID 操作；
+2. 模型一次性输出全部 tool_calls 后直接执行，没有"观察→回传→再决策"的第二轮；
+3. 模型规划前看不到写工具的冷却/熔断状态，常选择必然被拒的操作；
+4. **业务成功判定错误**：call_tool 外层 ok 仅代表"调用过程完成"，原循环用
+   res["ok"] 判定成功——raw.ok=false 的业务失败被算成功、错误更新 last_fire、
+   错误清零 fail_count、混入 tools_used；业务失败也不增加 fail_count；
+5. 空 tool_calls 仍生成"在家做了某事"式日志（"本轮仅观察"兜底也含成功暗示空间）。
+
+### 实际修改（仅 tool_loop.py，不改 heartbeat/home/service/repository）
+1. 新增模块常量：`_HOME_MAX_DECISION_ROUNDS = 3`（多轮上限，不新增环境变量）、
+   观察视图限流参数（事件条数 ≤5、非关键文本 ≤60 字；**ID 字段不截断**）。
+2. 新增 `_tool_business_ok`：外层 ok + raw.ok 双重判定；raw 缺失/结构异常保守失败。
+   新增 `_home_result_brief`（给日志的结果摘要，不含 UUID/action_key）、
+   `_home_observation_view`（home_observe/garden_observe/pantry_observe/list_letters
+   的受控结构化视图：保留完整 id/stable_key/letter_key，限制条数与文本长度，
+   不含 event_id/内部运行 ID/action_key/未拆信正文；查询失败 → 状态未知标记）、
+   `_home_observation_for_llm`（视图→模型文本，失败区域明确标注
+   "读取失败/状态未知——不要据此认为该区域没有资源"）、
+   `_home_observation_brief`（日志用观察摘要）、
+   `_home_tool_availability`（每轮为全部本 phase 工具生成状态：
+   breaker_open > cooldown > missing_prerequisite > status_unknown > available；
+   前置条件覆盖 plant/water/harvest/cook/eat/feed/leave_note/enter_room/
+   spend_time；观察查询失败标记 status_unknown 而非"没有资源"）。
+3. `run_home_autonomy_tool_loop` 重写为多轮流程：
+   - 初始观察（代码确定性调用，不计入模型预算）；home_observe 业务失败 →
+     返回 None（原判定用的是外层 ok，已修正为业务判定）；附属观察失败只标记
+     状态未知，不崩溃；
+   - 每轮：重算观察视图 + 工具可用状态 → 模型输出 {"done": bool, "tool_calls": [...]}
+     → 执行（白名单 → 单次运行去重签名 → 熔断 → 冷却 → 前置，全部代码强制；
+     action_key 代码生成）→ 业务结果回传 → 观察工具成功时刷新视图供下一轮使用；
+   - 停止条件：done=true / 空 tool_calls / 达 _HOME_MAX_DECISION_ROUNDS /
+     达 MAX_TOOL_CALLS（跨轮累计）/ 一轮内无任何可执行调用 / 规划 JSON 解析失败；
+   - 业务成功语义修正：仅 raw.ok=true 更新 last_fire、清零 fail_count、
+     进 tools_used、记录去重签名；raw.ok=false 与结构异常增加 fail_count
+     （仅真正执行到 RPC 的写工具）；skipped（冷却/熔断/前置/白名单/重复）
+     不增加 fail_count、不更新冷却、不生成 action_key；
+   - 防重复：签名 = 工具名 + 排序参数 JSON（不含 action_key/fixed_args），
+     仅拦截本次运行内完全相同且已成功的写操作；不同对象不拦；
+   - 最终日志：事实清单（成功写操作/失败操作/跳过调用/观察摘要/
+     has_successful_write 布尔）+ 严格事实边界 Prompt（无成功写操作时禁止
+     声称完成任何具体动作）；LLM 日志失败时按四类结局安全兜底。
+4. 返回契约保持 (log_text, tools_used)，tools_used 仅含业务成功的写工具
+   （观察工具不计入）；heartbeat.py 无需修改。
+5. 同步最小更新 run_home_autonomy_tool_loop docstring。
+
+### 测试
+- 新增 test_home_autonomy_loop.py（已纳入 .gitignore 精确例外）：26 测全过，
+  覆盖任务场景 A/B（ID 保真+不从 text 解析）、C/D（多轮观察后执行/连续动作）、
+  E/F（冷却/熔断可见且强制拒绝）、G（status_unknown 与 missing_prerequisite 区分、
+  查询失败不解释为无资源）、H/I/J（raw.ok=false/true/结构异常的状态更新语义）、
+  K/L/M（空调用/全失败/解析失败的日志约束）、N/O（跨轮预算/最大轮数）、
+  P/Q（同活动去重/不同对象不误拦）、R（phase 1-4 边界）+ home_observe 业务失败
+  返回 None + 附属观察失败标记状态未知；
+- 回归：test_pet_feed_priority 38 + test_cat_check 31 + test_home_pet_bridge 59 +
+  test_home/test_home_garden（仅 4 个审计已确认旧漂移失败）+ test_tool_loop
+  （仅 5 个与 C1 前一致的旧漂移，无新增）；py_compile 全过。
+
+### 边界声明
+- 未修改数据库（本阶段未做任何 Supabase 查询；观察/RPC 返回结构从
+  home/service.py 源码核实）；
+- 未新增环境变量（多轮上限为模块常量），VARIABLES.md 未改动；
+- 未覆盖用户已有修改：prompts/reply_rules.md（有意清空）、
+  test_shared_experience_phase6.py、home/__pycache__/*.pyc 保持原样；
+  credentials.json/token.json 未读取未纳入；C1/C1.1 的
+  test_pet_feed_priority.py 保持可提交且 38 测全过；
+- 未创建 commit。
+
+### 已知限制
+1. 观察工具在模型轮次中再次调用会计入 MAX_TOOL_CALLS 总预算，极端情况下
+   多次刷新观察会挤占写操作预算（提示词已引导按需刷新）。
+2. 去重签名是"完全相同参数"级别：同工具不同参数仍会执行（依赖生产冷却兜底
+   同工具频次）；跨进程重启后签名集清空（幂等仍由 action_key UNIQUE 兜底）。
+3. 多轮循环最多 3 轮决策，复杂长链任务（如种→等→收→做→喂）仍需跨多个
+   自主周期完成。
+4. 规划协议改为 {"done", "tool_calls"} 两键 JSON，模型输出格式偏离时按
+   解析失败安全停止（观察型日志），不重试。
+
+
+---
+
+## 第28阶段(2026-08-31):生产 embedding 维度安全诊断接口
+
+### 前情提要(精简)
+- 记忆人工链路已跑通(Web双写/事实提取预览/pending_review/人工approve-reject),生产 1 条 active memory_item;
+- deterministic_lexical_v1 精确命中、同义未命中(LEXICAL_ENGINE_GATE_PASS / COMPANION_RECALL_GATE_FAIL);
+- pgvector 0.8.0 就绪;旧表历史向量 vector(1024) 系旧网关写入,不能证明当前 provider 仍输出 1024 维;
+- 唯一阻塞项:EMBEDDING_DIMENSION_NOT_CONFIRMED → VECTOR_DESIGN_BLOCKED。
+
+### 阶段目标与交付
+- 新增受 API_SECRET 保护的手动诊断接口 POST /api/embedding-dimension-preview,
+  确认生产运行时 server._get_embedding() 的实际输出维度;
+- 只返回:是否成功、维度、数值是否全 finite、pgvector HNSW vector 2000 维上限判断、
+  零副作用执行声明;不返回向量/向量preview/模型名/provider/URL/Key/环境变量/
+  异常原文/traceback/请求体/探针文本;
+- 固定合成探针(中英混合短文本,代码内常量;不从请求体/数据库/环境读取,
+  不写入日志/响应/文件/存储);
+- provider 最多调用 1 次:经既有 server._get_embedding,不创建第二个 embedding 客户端、
+  不绕过、不自动重试;
+- 零数据库/Pinecone/LLM 副作用;无自动调度/启动执行/聊天热路径接入;不接正式上下文;
+- 非法请求(非 POST、confirm 缺失/错误、任何额外字段、非法 JSON)一律不调用 provider,
+  provider_calls=0。
+
+### 修改文件
+- 新增 embedding_diagnostics.py:零依赖纯函数模块——可注入 embedding callable、
+  恰最多 1 次调用、list/tuple 容器校验、逐元素 float 转换校验(类型合法性优先于数值
+  合法性)、math.isfinite 全量校验、维度计算、HNSW 2000 维上限判断;错误码
+  EMBEDDING_UNAVAILABLE / EMBEDDING_RESPONSE_INVALID / EMBEDDING_NON_FINITE_VALUES /
+  EMBEDDING_DIMENSION_UNSUPPORTED_FOR_VECTOR_HNSW / INTERNAL_ERROR;
+  返回 (安全响应结构, 安全日志行);不 import server/gateway、不读环境变量、不打印;
+- gateway.py(+97 行,无删改既有代码):路由分支(仅 POST,其他方法 405 且不触碰
+  provider)+ handler(while-receive 请求体聚合、字段白名单仅 confirm、confirm 严格
+  匹配固定令牌、惰性 import embedding_diagnostics 与 server、HTTP 映射 200/400/503/500、
+  日志仅含 ok/dimension/finite/code/stage/exception type);
+- 新增 test_embedding_diagnostics_phase28.py:37 测(A 路由鉴权/B 请求校验/C 成功
+  1024·768·1536·tuple/D 空与类型/E 元素错误含 NaN/±Inf/F 维度边界 2000 支持·2001
+  unsupported 仍返回维度/G 零泄露/H 零副作用含源码扫描与数据库零操作记录);
+- PROJECT_NOTES.md 追加本节。
+
+### 测试结果
+- py_compile(embedding_diagnostics.py / gateway.py / 专项测试)全过;
+- 专项 37/37 OK;
+- 网关+记忆直接相关 6 模块(phase28/phase19/phase10/phase21/phase17/gateway_routes)
+  246 测全过;
+- 全量 unittest discover 1331 测:38 失败 + 2 skip;失败全部为 cat/home/house/wallet/
+  tool_loop 已知漂移基线(与第27阶段记录一致),与本次改动零交集。
+
+### Supabase 只读基线(执行前核查,全程仅 SELECT)
+- memory_items 总数 1(active 1),21 列,无 embedding 字段;
+- memory_events 共 741 条,基线未变化;
+- pgvector 0.8.0;现有 vector 列:memories / memory_summaries / active_memories 的
+  embedding 均为 vector(1024);
+- 未读取正文/向量/ID/user_id/hash/来源/metadata 值。
+
+### 边界声明
+- Supabase INSERT/UPDATE/DELETE/UPSERT=否;DROP/TRUNCATE=否;apply_migration=否;
+  schema/RLS/策略/索引/RPC 未做任何修改;未给 memory_items 新增 embedding 列;
+  未回填任何向量;
+- provider 真实调用=否;新接口真实调用=否;LLM=否;Pinecone 读/写=否;Zeabur MCP=否;
+- server.py / memory_recall.py / memory_review.py / memory_preview.py /
+  memory_extractor.py / migrations / requirements.txt / VARIABLES.md / 前端 / Docker
+  未修改;未新增环境变量;
+- 未覆盖既有未提交修改;credentials.json / token.json 未读取;未 commit / push / 部署。
+
+### 已知限制
+1. server._get_embedding 将未配置/HTTP非200/异常统一返回 [] → 诊断只能报
+   EMBEDDING_UNAVAILABLE,无法区分具体根因(需另行排查生产 embedding 配置);
+2. 诊断只确认"当前时刻"的维度;provider 模型配置变更后维度可能变化,
+   正式启用向量召回前应复测;
+3. 手动接口每次调用消耗 1 次 provider embedding 请求(有成本);API_SECRET 泄露即
+   允许触发 provider 调用;
+4. 尚未创建 vector 列;memory_items 独立向量召回的 additive migration 留待下一阶段。
+
+### 下一阶段建议(用户提交/推送/部署后)
+1. 手动调用一次维度诊断接口;不把 API_SECRET 发到聊天;只提供 code、dimension、
+   finite、HNSW supported 四项结果;
+2. 若 dimension=1024 且校验通过:输出 EMBEDDING_DIMENSION_CONFIRMED,下一阶段执行
+   additive migration(vector 列 + 索引;RLS/策略不变);
+3. 若不可用:先排查生产 embedding 配置,不创建 vector 列;
+4. 若维度不是 1024:以真实返回维度为准重新设计 migration,不强行兼容历史 1024;
+5. 不删除任何数据;不操作 Pinecone;不接正式上下文。

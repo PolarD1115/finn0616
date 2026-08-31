@@ -1893,6 +1893,11 @@ class HostFixMiddleware:
             await self._handle_memory_recall_preview(scope, receive, send)
             return
 
+        # ---------- 📐 生产 embedding 维度安全诊断（第28阶段：固定合成探针、最多一次 provider 调用、零数据库/Pinecone/LLM 副作用；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/embedding-dimension-preview":
+            await self._handle_embedding_dimension_preview(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -3295,6 +3300,98 @@ class HostFixMiddleware:
             "RECALL_SERVICE_UNAVAILABLE": 503,
         }
         status = 200 if result.get("ok") else error_status.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 📐 生产 embedding 维度安全诊断 /api/embedding-dimension-preview（第28阶段）
+    #    唯一目标：确认生产运行时 _get_embedding() 的实际输出维度
+    #    （EMBEDDING_DIMENSION_NOT_CONFIRMED 是向量召回设计的唯一阻塞项）。
+    #    固定合成探针、最多一次 provider 调用；只返回维度与 finite 检查结果，
+    #    不返回向量/模型名/provider/URL/Key/环境变量/异常原文；
+    #    零数据库 / Pinecone / LLM 副作用；不接正式上下文；手动调用，无自动调度。
+    # ------------------------------------------
+    async def _handle_embedding_dimension_preview(self, scope, receive, send):
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不触碰 provider）
+            await _send_json_resp(send, 405, {
+                "ok": False, "code": "METHOD_NOT_ALLOWED",
+                "diagnostics": {"dimension": None, "all_values_numeric": None,
+                                "all_values_finite": None,
+                                "hnsw_vector_dimension_supported": None},
+                "execution": {"provider_calls": 0, "database_reads": 0,
+                              "database_writes": 0, "pinecone_touched": False,
+                              "llm_touched": False}})
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        _invalid = {
+            "ok": False, "code": "INVALID_DIAGNOSTIC_REQUEST",
+            "diagnostics": {"dimension": None, "all_values_numeric": None,
+                            "all_values_finite": None,
+                            "hnsw_vector_dimension_supported": None},
+            "execution": {"provider_calls": 0, "database_reads": 0,
+                          "database_writes": 0, "pinecone_touched": False,
+                          "llm_touched": False}}
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _invalid)
+            return
+
+        # 严格字段白名单：除 confirm 外出现任何字段（text/input/model/provider/
+        # api_key/endpoint/dimensions/user_id/write/backfill/item_id 等）→ 400，
+        # 绝不调用 _get_embedding()
+        allowed_fields = {"confirm"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _invalid)
+            return
+        # 显式确认（必须完全匹配）
+        if payload.get("confirm") != "PROBE_EMBEDDING_DIMENSION":
+            await _send_json_resp(send, 400, {
+                "ok": False, "code": "INVALID_CONFIRMATION",
+                "diagnostics": {"dimension": None, "all_values_numeric": None,
+                                "all_values_finite": None,
+                                "hnsw_vector_dimension_supported": None},
+                "execution": {"provider_calls": 0, "database_reads": 0,
+                              "database_writes": 0, "pinecone_touched": False,
+                              "llm_touched": False}})
+            return
+
+        # 惰性导入（沿用项目 handler 内按需 import 惯例）：
+        # embedding_diagnostics 为零依赖纯函数模块；server 仅取 _get_embedding，
+        # 不创建第二个 embedding 客户端、不绕过既有路径
+        try:
+            import embedding_diagnostics as _ed
+            import server as _srv_embed
+            result, log_line = _ed.run_dimension_probe(_srv_embed._get_embedding)
+        except Exception as e:
+            # 模块内部已全捕获；此处仅防御 import 等意外，异常只记类型不记原文
+            _log(f"⚠️ embedding维度诊断失败：code=INTERNAL_ERROR "
+                 f"stage=handler exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, {
+                "ok": False, "code": "INTERNAL_ERROR",
+                "diagnostics": {"dimension": None, "all_values_numeric": None,
+                                "all_values_finite": None,
+                                "hnsw_vector_dimension_supported": None},
+                "execution": {"provider_calls": 0, "database_reads": 0,
+                              "database_writes": 0, "pinecone_touched": False,
+                              "llm_touched": False}})
+            return
+
+        _log(log_line)
+        status = _ed.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
 
     # ------------------------------------------
