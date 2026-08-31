@@ -1903,6 +1903,11 @@ class HostFixMiddleware:
             await self._handle_memory_embedding_backfill(scope, receive, send)
             return
 
+        # ---------- 🧪 memory_items 向量 RPC 自匹配只读预览（第33阶段：自 content 重嵌入 → service_role 只读 RPC → Top1 内部 ID 核对；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-vector-selftest-preview":
+            await self._handle_memory_vector_selftest(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -3491,6 +3496,104 @@ class HostFixMiddleware:
 
         _log(log_line)
         status = _me.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🧪 memory_items 向量 RPC 自匹配只读预览 /api/memory-vector-selftest-preview（第33阶段）
+    #    手动、只读、受 API_SECRET 保护：服务端强制选定最旧 active 且 embedding
+    #    非空的一条，核对其 embedding_model 与当前配置一致后，用其事实化 content
+    #    恰调用一次现有 _get_embedding 生成查询向量，经 service_role 客户端只读
+    #    调用第30阶段 match_memory_items（match_count 固定 5），核对 Top1 内部
+    #    ID 与相似度（≥0.99）。
+    #    客户端仅提交 {"confirm": "..."}；item_id/正文/向量/模型/user_id 等
+    #    任何额外字段一律拒绝；响应只含脱敏统计（不含 ID/正文/user_id/模型名/
+    #    向量/RPC 原始行/hash/来源）；零写入、无 Pinecone、无 LLM、无自动调度；
+    #    不接正式上下文；自匹配成立不代表同义召回成立。
+    # ------------------------------------------
+    async def _handle_memory_vector_selftest(self, scope, receive, send):
+        def _safe_body(code):
+            """错误/诊断路径统一安全骨架（不含任何敏感值）。"""
+            return {"ok": False, "code": code,
+                    "stats": {"selected": 0, "rpc_returned": 0,
+                              "top1_match": False, "top1_similarity": None,
+                              "dimension": None},
+                    "retrieval": {"method": "pgvector_cosine_selftest_v1",
+                                  "active_only": True,
+                                  "expired_excluded": True,
+                                  "user_scoped": True,
+                                  "writes_executed": False},
+                    "execution": {"provider_calls": 0, "database_reads": 0,
+                                  "database_writes": 0,
+                                  "pinecone_touched": False,
+                                  "llm_touched": False}}
+
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库、不调 provider）
+            await _send_json_resp(send, 405, _safe_body("METHOD_NOT_ALLOWED"))
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _safe_body("INVALID_SELFTEST_REQUEST"))
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _safe_body("INVALID_SELFTEST_REQUEST"))
+            return
+
+        # 严格字段白名单：只允许 confirm。客户端提交 query/content/item_id/
+        # user_id/vector/embedding/model/provider/top_k/threshold/status/
+        # include_pending/write/update/backfill 等任何额外字段 → 400，
+        # 绝不查询数据库、绝不调用 provider、绝不调用 RPC
+        allowed_fields = {"confirm"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _safe_body("INVALID_SELFTEST_REQUEST"))
+            return
+        # 显式确认（必须完全匹配，与 memory_vector_selftest.CONFIRM_TOKEN 一致）
+        if payload.get("confirm") != "VECTOR_SELFTEST_PREVIEW_ONLY":
+            await _send_json_resp(send, 400, _safe_body("INVALID_CONFIRMATION"))
+            return
+
+        # 惰性导入（沿用项目 handler 内按需 import 惯例）：
+        # server 仅取 service_role 客户端、_get_embedding 与服务端 user_id 解析；
+        # 模型标识在 handler 内只读现有环境变量 DOUBAO_EMBEDDING_EP 后传入模块，
+        # 仅用于与库内 embedding_model 比对，不打印、不返回；不新建 embedding 客户端
+        try:
+            import memory_vector_selftest as _mvs
+            import server as _srv_st
+
+            def _rpc_caller(params):
+                # 只读 RPC：第30阶段 service_role-only 的 active-only 余弦召回；
+                # 每请求至多被 selftest 模块调用一次
+                return _srv_st.supabase_service.rpc(_mvs.RPC_NAME, params).execute()
+
+            model_id = os.environ.get("DOUBAO_EMBEDDING_EP", "").strip()
+            result, log_line = await _mvs.run_selftest(
+                _srv_st.supabase_service,
+                _srv_st._resolve_pinecone_user_id(),
+                _srv_st._get_embedding,
+                model_id,
+                _rpc_caller)
+        except Exception as e:
+            # 模块内部已全捕获；此处仅防御 import 等意外，异常只记类型不记原文
+            _log(f"⚠️ 向量自匹配预览失败：stage=handler "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        _log(log_line)
+        status = _mvs.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
 
     # ------------------------------------------
