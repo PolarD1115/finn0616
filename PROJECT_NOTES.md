@@ -4149,3 +4149,322 @@ heartbeat 无需修改。
 3. 若不可用:先排查生产 embedding 配置,不创建 vector 列;
 4. 若维度不是 1024:以真实返回维度为准重新设计 migration,不强行兼容历史 1024;
 5. 不删除任何数据;不操作 Pinecone;不接正式上下文。
+
+
+## 阶段 C3：结构化行动日志与强制留痕（activity_logs）（2026-08-31）
+
+### 表设计（迁移 activity_logs_c3，version 20260831002617）
+- 新表 `public.activity_logs`（轮级记录，与 memories 叙事日志/home_events/
+  home_action_runs 并行不悖）：id uuid PK、activity_key text NOT NULL UNIQUE
+  （代码生成的稳定唯一键，防重试重复）、activity_id text（free:<slug> /
+  home:autonomy / free:secret_diary）、activity_name、source（free_activity /
+  home_autonomy）、status CHECK（running/succeeded/observed/partial/failed/
+  skipped，text+CHECK 不用 enum）、thought_summary（可展示摘要，应用层限 500）、
+  result_summary（限 1000）、tools_used jsonb（安全摘要数组）、started_at/
+  finished_at/created_at/updated_at timestamptz。
+- 索引：PK + activity_key UNIQUE + started_at DESC。无多余索引。
+- RLS：ENABLE 且**零 policy**（deny-by-default），并 REVOKE anon/authenticated
+  全部权限——读写均走 service_role（绕过 RLS），前端不可见；C6 再经
+  API_SECRET 保护的网关接口读取。
+- 只新增：无 DROP/DELETE/迁移旧数据/修改既有日志；应用后 list_tables/
+  execute_sql 核验（13 列、0 行、3 索引、0 policy、0 anon 授权、RLS true）。
+- advisors：security 仅 INFO 级 rls_enabled_no_policy（有意设计，与
+  memory_events 等表同模式；其余 ERROR/WARN 均为既有对象历史问题）；
+  performance 仅新索引 unused（表空，预期）。
+
+### 代码分层
+- 新增 `home/activity_log.py`：`start_activity_log`（幂等建 running：同 key
+  不插第二行、已完成不回置 running；失败返回 error_code）、
+  `finalize_activity_log`（条件更新只改 running 行：已完成重复 finalize 返回
+  already_final 不覆盖、NOT_FOUND 不插已完成记录掩盖、文本限长、
+  tools_used 归一化、finished_at/updated_at 显式写入）、
+  `fail_activity_log`（异常路径 → failed，摘要 ≤200 字，堆栈只进服务日志）、
+  `sanitize_thought_summary`（非字符串为空；含 <think>/<thinking>/
+  reasoning_content 载体整体丢弃，不提取标签内容；截 500）、
+  `sanitize_tools_used`（每项只留 {name, ok, status, error_code}，
+  status 仅接受 succeeded/failed/skipped，非 dict/无名跳过，上限 20 条，
+  args/UUID/action_key/raw/text/正文一律丢弃）。
+- 全部写入走 service_role（复用 home.repository._get_supabase_service）；
+  数据库异常记录位置+类型+堆栈到 logger，不崩溃后台循环、不假装成功。
+
+### start-before-side-effect 接入
+- `heartbeat.async_free_activity`：调 run_free_activity_tool_loop **之前**
+  start_activity_log（activity_key=fa_{ts}_{hex}，代码生成非模型值）；
+  start 失败/已存在 → 本轮 continue，不执行任何工具、不写 memories、不推送。
+  活动结束后按真实结果 finalize（在 memories 写入与外向推送之后）。
+- `heartbeat.async_home_autonomy_tick`：同构接入（activity_key=home_{ts}_{hex}）。
+- 异常路径：内层 try/except 中 fail_activity_log 后重新 raise（异常不被吞掉）；
+  finalize 失败打印明确错误，不重跑真实操作，不伪造留痕成功。
+- 进程崩溃留 running 属可接受审计状态（本阶段不做清理器）。
+
+### thought_summary 定义与隐私隔离
+- 来源：模型 stage1（自由活动）/每轮规划（Home，取首个非空合法值，后续轮
+  不覆盖防拼成推理轨迹）明确生成的可展示一句话（Prompt 明确 20-80 字、
+  不写分析步骤/工具规划/模型后台任务字样），经 sanitize_thought_summary 清洗。
+- 绝不保存 reasoning_content/thinking/系统 Prompt/模型原始响应/调试日志。
+- 脱敏固定文案（正文零进入）：写秘密日记 → thought="想写点只给自己看的记录"、
+  result="写了一篇秘密日记。"；外向三类 → result="生成并发送了一条主动消息。"；
+  翻旧回忆/逛淘宝/网上冲浪 → result 固定（查询词/搜索结果/记忆正文不进日志）。
+  其余活动 result=log_text 截 300（本就可展示叙事）。
+- 自由活动/Home 原有 memories 叙事日志继续保留（memories 三类 tag 原样写入）。
+
+### meta_out 元数据通道
+- run_free_activity_tool_loop / run_home_autonomy_tool_loop 新增可选
+  `meta_out: dict | None = None`（向后兼容，2 元组返回契约不变，旧测试零改动）；
+  填充 {activity_name, thought_summary, tools_used(归一化), tool_ok/tool_fail/
+  tool_skip/tool_total, planning_failed, has_write_ok, write_fail, skip_count}。
+- 自由活动 stage1 prompt 扩为 {activity, thought_summary, log}；Home 每轮规划
+  扩为 {done, thought_summary, tool_calls}。
+
+### 状态映射
+- 自由活动：循环返回 None → skipped；tool_total=0 → succeeded；全部业务失败
+  → failed；有成功且有失败/跳过 → partial；否则 succeeded。
+- Home（C2 真实业务结果）：None → skipped；planning_failed → failed；
+  有写成功+有失败/跳过 → partial；全写成功 → succeeded；全写失败 → failed；
+  仅观察 → observed。
+
+### 测试（test_activity_logs.py，已纳入 .gitignore 精确例外）
+- 37 测全过：清洗函数（thought 标签丢弃/截长/非字符串；tools 白名单/上限/推断）、
+  start/finalize/fail 幂等（FakeSB 模拟链式调用；重复/已最终/NOT_FOUND/
+  SERVICE_KEY_MISSING/非法 status/DB 异常日志）、两条链路真实驱动
+  （async_free_activity 与 async_home_autonomy_tick 单轮：第二次 sleep 抛
+  BaseException 穿透终止；L/M start 阻断、N/O 顺序 start→loop→memories→
+  finalize、I/J/K 脱敏、P observed、Q partial、R failed、S skipped、
+  T 异常 fail finalize、V start 先于 loop、状态映射矩阵）。
+- 回归：test_pet_feed_priority 38 + test_home_autonomy_loop 26 +
+  test_cat_check 31 + test_home_pet_bridge 59 全过；test_home/test_home_garden
+  4 个旧漂移 + test_tool_loop 5 个旧漂移（与 C1 前一致，无新增）；
+  py_compile 全过。
+
+### 边界声明
+- 未删除/未迁移/未修改任何旧数据（activity_logs 线上 0 行；memories 三类
+  日志 1669 条原样）；未新增环境变量（VARIABLES.md 未动）；未创建 commit；
+  用户已有修改（reply_rules.md 清空、test_shared_experience_phase6.py、
+  pyc、gateway.py 第 28 阶段 embedding 诊断）全部保持原样；
+  credentials.json/token.json 未读取未纳入。
+
+### 已知限制
+1. 只接入两条顶层自主链路；宠物照料（_try_pet_care）暂不建 activity_logs
+   （避免一次唤醒多条顶层记录），统一归属留到调度合并阶段。
+2. start 后进程崩溃会残留 running 记录（可接受审计状态，无超时清理器）。
+3. activity_id 仍是简单 slug 规则（free:<slug>/home:autonomy），
+   完整 activity_id 统一属 C5。
+4. 每轮自主活动额外增加 2 次 activity_logs 表往返（start+finalize），
+   service_role 直写、单行操作，开销可忽略但非零。
+
+
+## 第30阶段(2026-08-31):memory_items 向量列、HNSW 与 active-only RPC 基础设施
+
+### 前情提要(精简)
+- 第29阶段生产诊断 EMBEDDING_DIMENSION_CONFIRMED=1024(VECTOR_DESIGN_READY);
+- 人工记忆链路已验收(提取预览/pending_review/人工approve/active 召回预览),生产 1 条 active;
+- deterministic_lexical_v1 词面精确命中、同义未命中,向量召回为补位方向;
+- pgvector 0.8.0 位于 extensions schema;旧 RPC(query_embedding text、PUBLIC 可执行)
+  不可复用不可动;本阶段只建 additive 数据库基础设施,不回填、不接正式上下文。
+
+### migration
+- 名称 add_memory_items_vector_infrastructure,文件
+  migrations/20260831_002_memory_items_vector_infrastructure.sql,
+  经 Supabase apply_migration 执行成功(单事务原子,失败即整体回滚);
+- 执行前已核查:本地与远端均无同名 migration、无 match_memory_items 函数、
+  无 memory_items_embedding_idx 索引、memory_items 无目标列。
+
+### 新增字段与一致性约束
+- memory_items 新增 3 个可空列:embedding extensions.vector(1024)、
+  embedding_model text、embedded_at timestamptz;无默认值、无触发器、不自动生成;
+- 采用 memory_items_embedding_triplet_check CHECK:三列要么全 NULL、要么全 NOT NULL,
+  防半写入;现有 1 行三列全 NULL 天然满足;未来 backfill 必须单条 UPDATE 原子写三列。
+
+### HNSW 索引
+- memory_items_embedding_idx:USING hnsw (embedding extensions.vector_cosine_ops),
+  pgvector 默认参数(m=16/ef_construction=64,未显式设置),不用 IVFFlat;
+- pgvector 官方确认:NULL 向量与零向量(cosine)不入索引,与 RPC 的
+  embedding IS NOT NULL 过滤天然一致;表索引共 5 个(4 旧+1 新,无重复),
+  索引 valid/ready/live 全 true。
+
+### match_memory_items RPC(active-only 只读召回)
+- 参数:query_embedding extensions.vector(不带 typmod——PostgreSQL 官方文档明确
+  CREATE FUNCTION 丢弃参数类型 typmod,维度约束不能依赖参数声明)、
+  p_user_id text、match_count integer DEFAULT 5;
+- 函数体内显式校验:向量非空、extensions.vector_dims()=1024、p_user_id 非空白、
+  match_count 1..10;非法一律 RAISE EXCEPTION 不静默空集,错误信息不含向量/user_id 值;
+- 固定过滤(调用方不可关闭):user_id=p_user_id AND status='active' AND
+  (expires_at IS NULL OR expires_at>now()) AND embedding IS NOT NULL;
+- 排序与相似度同一表达式:extensions.<=> 余弦距离升序,相似度=1-距离;
+- 返回 10 字段含内部 memory_item_id(供未来 lexical+vector 候选合并);
+  不返回 user_id/embedding/content_hash/source_event_ids/source_batch_id/
+  metadata/created_by/superseded_by;
+- 属性:LANGUAGE plpgsql + STABLE + SECURITY INVOKER + SET search_path TO '',
+  函数体内全部对象 schema 全限定(含 OPERATOR(extensions.<=>));
+- 权限:同一 migration 内 REVOKE PUBLIC/anon/authenticated EXECUTE、
+  GRANT service_role;执行后核验 ACL 仅属主+service_role;
+- 本阶段未真实调用该 RPC(无 query embedding,且禁止生成真实向量)。
+
+### Supabase 执行后验证(全程只读)
+- 三列存在且类型/可空/无默认值正确;triplet CHECK 存在且定义正确;
+- RLS 保持原状:rowsecurity=true、零策略、force=false;
+- RPC:签名/返回字段/STABLE('s')/非 SECURITY DEFINER/proconfig search_path=""/ACL 全符合;
+- 数据不变:memory_items 仍 1 行(1 active,triplet 全 NULL,零回填,triplet_mixed=0);
+  旧向量表非空向量数与基线完全一致;旧 RPC 参数/ACL/volatility 原样;
+- memory_events 仅 pending 计数因生产 Web 双写自然增长(processed/failed 保持 6/0
+  不变),与本次 DDL 无关,migration 未对该表做任何写入;
+- Pinecone 未查询未操作;真实 embedding provider/LLM 未调用。
+
+### advisors(与执行前基线对比)
+- security:新增 0 条告警(新函数未触发 function_search_path_mutable、
+  未触发 anon_security_definer_function_executable;其余均为执行前既有历史对象告警);
+- performance:新增 1 条 INFO unused_index(memory_items_embedding_idx 未被使用)——
+  预期现象(表内向量 0 条、RPC 未调用),不删除该索引;
+  remediation:https://supabase.com/docs/guides/database/database-linter?lint=0005_unused_index
+
+### 边界声明
+- Supabase:SELECT=是;apply_migration=是(仅本次 additive DDL);
+  INSERT/UPDATE/DELETE/UPSERT/TRUNCATE/DROP=否;回填向量=否;
+  memory_items 业务行未修改;memory_events/memories/active_memories/memory_summaries
+  未修改;旧向量列/索引/RPC 未修改;RLS 与既有策略未修改;未删除任何数据或对象;
+- Pinecone=否;真实 embedding provider/LLM=否;正式聊天上下文未接入;
+- Python 代码未修改(gateway/server/memory_*/requirements.txt/VARIABLES.md/前端/
+  Docker 均未动);未新增环境变量;未创建独立 embedding 表;无自动调度;
+- 未覆盖既有未提交修改;credentials.json/token.json 未读取;未 commit/push/部署。
+
+### 已知限制
+1. 零向量:pgvector 官方确认零向量不入 cosine HNSW 索引;查询向量为零向量时
+   余弦距离为 NaN(不报错但结果无意义)——未来 Python 层调用前必须拦截
+   零向量/非 finite 值(embedding_diagnostics 已校验 finite,非零校验待补);
+2. 过滤+HNSW:索引扫描后过滤,选择性强时可能返回少于 LIMIT 行,官方方案为
+   迭代扫描(hnsw.iterative_scan,默认 off);当前数据量极小无影响,
+   数据量增长后如出现欠召回再评估启用;
+3. hnsw.ef_search 与 m/ef_construction 均用默认值,数据量上来后需按官方指引校准;
+4. 新 RPC 未做真实查询验证(本阶段禁止生成真实向量),
+   service_role 真实调用路径(含 PostgREST JSON 数组传参→vector)留待 backfill 阶段验证。
+
+### 下一阶段建议(手动 active embedding backfill)
+1. 只处理 embedding IS NULL 的 active 行,一次先处理 1 条(当前仅 1 条);
+2. 以该行正文经既有 server._get_embedding 生成向量,校验 1024/全 finite/非零;
+3. 同一条 UPDATE 原子写 embedding+embedding_model+embedded_at 三列
+   (满足 triplet CHECK),不更新记忆正文/状态/updated_at;
+4. 不从旧 Pinecone/旧 Supabase 向量表导入;不接正式上下文;先 Mock 后生产手动验证;
+5. backfill 完成后可用合成向量只读调用 match_memory_items 做最小查询验证。
+## 2026-08-31 第31阶段：手动 active memory embedding backfill 执行器
+
+### 前情提要(已确认事实)
+- 记忆人工链路已通过生产验收(Web 原始事件双写/事实提取预览/pending_review 写入/
+  人工 approve/reject),当前生产有 1 条 active memory_item;
+- lexical 召回:精确字面可命中、同义改写不命中,LEXICAL_ENGINE_GATE_PASS +
+  COMPANION_RECALL_GATE_FAIL;
+- 第29阶段生产诊断 EMBEDDING_DIMENSION_CONFIRMED=1024、VECTOR_DESIGN_READY;
+- 第30阶段 additive migration 已建 embedding/embedding_model/embedded_at 三列
+  + triplet CHECK + HNSW cosine 索引 + service_role-only match_memory_items RPC
+  (未真实调用);该 active 三列全 NULL,零回填;
+- 新向量必须由该行事实化 content 重新生成,禁止从 Pinecone/旧向量表/旧记忆表复制。
+
+### pgvector 写入格式核实(官方文档+生产库只读实证)
+- Supabase 官方 Vector columns 文档"Storing a vector"示例:经 PostgREST 以
+  JSON 数组直存 vector 列(supabase-js 与 supabase-py 同一 wire 路径);
+- 生产库只读表达式实证(纯 SELECT 求值,零写入零 DDL):
+  1) pgvector 文本入参容忍空格('[0.1, 0.2]' 可 cast);
+  2) JSON 数组文本形式可整 cast 为 extensions.vector;
+  3) 维度不匹配被数据库整句原子拒绝('expected 1024 dimensions, not 2'),无半写;
+- postgrest-py 2.31.0 源码确认:.is_(col, None) 编码为 is.null;.update() 默认
+  returning=representation,res.data 即被更新行(第18/19阶段生产验收已实证行数判断)。
+
+### 新增模块 memory_embedding.py(执行体,与路由解耦)
+- run_backfill(supabase_service, server_user_id, embedding_fn, embedding_model):
+  全部依赖注入;模块不读环境变量、不 import server/gateway、自身零打印;
+- 选择:服务端强制 user_id+status=active+embedding IS NULL,created_at 升序,
+  limit 1(代码固定,客户端不可控);SELECT 列仅 id,content,user_id,status,embedding;
+- 内存二次确认:row 为 dict/status=active/embedding 为空/content 非空字符串/
+  user scope 一致/id 存在,全部通过前不触 provider;多于一条只取第一条不批量;
+- 向量校验严格复用第28阶段规则:None/[]/空 tuple→UNAVAILABLE;非 list/tuple→
+  RESPONSE_INVALID;元素不可转 float→RESPONSE_INVALID;任一 NaN/Inf→NON_FINITE;
+  维度不等于1024→DIMENSION_MISMATCH(日志带 expected/actual);全零→ZERO_VECTOR
+  (以 any(元素≠0) 实现全零判定,规避平方和上溢/下溢);
+- 模型标识:gateway handler 内只读现有环境变量 DOUBAO_EMBEDDING_EP 传入,
+  模块校验非空否则 EMBEDDING_MODEL_NOT_CONFIGURED(先于 SELECT,零查询零 provider);
+  只写入 embedding_model 列,不返回、不打印。
+
+### 接口 POST /api/memory-embedding-backfill(gateway.py)
+- 受 /api/* 统一 API_SECRET 鉴权;仅 POST 其他 405;OPTIONS 沿用全局 CORS;
+- 请求体严格只允许 {"confirm":"BACKFILL_ONE_ACTIVE_MEMORY"};任何额外字段
+  (item_id/user_id/content/text/vector/embedding/model/provider/dimensions/
+  limit/status/force/overwrite/write_back/batch 等)→400 INVALID_BACKFILL_REQUEST;
+  confirm 不匹配→400 INVALID_CONFIRMATION;非法请求零查库零 provider 零 UPDATE;
+- 无候选→200 NO_ACTIVE_MEMORIES_NEED_EMBEDDING(provider_calls=0,database_writes=0);
+  成功→200 MEMORY_EMBEDDING_BACKFILLED(stats{selected,updated,dimension}/
+  write_result/execution);
+- 错误码→HTTP:STATE_CHANGED 409;MODEL_NOT_CONFIGURED/UNAVAILABLE/
+  RESPONSE_INVALID/NON_FINITE/DIMENSION_MISMATCH/ZERO_VECTOR 503;
+  QUERY_FAILED/CANDIDATE_INVALID/UPDATE_INVALID/UPDATE_FAILED/INTERNAL_ERROR 500。
+
+### 原子 UPDATE 与幂等并发
+- 单条 UPDATE payload 恰三列 embedding/embedding_model/embedded_at
+  (embedded_at=UTC aware ISO);条件 id+user_id+status=active+embedding IS NULL;
+  默认 representation 返回并验证行数恰 1;triplet CHECK 由同句三列满足,
+  数据库拒绝即整句失败无半写;
+- 不修改 status/content/updated_at/last_confirmed_at/valid_at/invalid_at/
+  expires_at/source_event_ids/source_batch_id/content_hash/subject_key/metadata;
+- 0 行→STATE_CHANGED(并发已回填或状态改变,不重试不覆盖);多行→UPDATE_INVALID
+  (id 主键下不可能,纯防御);异常→UPDATE_FAILED(只记异常类型);
+- 幂等依据 embedding IS NULL:成功后再次调用=NO_ACTIVE(provider 0 次);
+  并发第二个请求 UPDATE 命中 0 行返回 409;不做分布式锁/队列/advisory lock。
+
+### 安全响应与日志脱敏
+- 响应/日志不含 item id/content/vector 值/user_id/hash/source IDs/batch ID/
+  模型名/provider/endpoint/key/SQL/数据库异常原文/traceback;
+- 日志样例:成功 selected=1 updated=1 dimension=1024;失败 stage=xxx error=CODE
+  (维度不符附 expected/actual;异常附 exception_type);模块自身零打印,由 gateway _log。
+
+### 零自动化边界(源码级测试锁定)
+- 无 DELETE/UPSERT/INSERT/RPC;无 Pinecone;无 LLM;不新建 embedding 客户端;
+  不自动重试 provider;无异步任务派发/Timer/threading/自动调度;
+  模块不读环境变量;不接正式上下文;不修改 lexical 召回;
+  对数据库仅 SELECT + 单条条件 UPDATE 两种操作。
+
+### 测试结果(全部 unittest+mock,不真实调用)
+- 专项 test_memory_embedding_phase31.py:56 测试全过
+  (A 路由鉴权 8 / B 请求校验 6 / C 候选选择 7 / D provider 3 / E 校验 10 /
+   F UPDATE 8 / G 幂等并发 3 / H 写入格式 2 / I 脱敏 2 / J 隔离 7);
+- 全量记忆回归 548 测试全过(phase1/3/3events/4observability/5/10/11/13/15/
+  17/19/21/28/31/shared_experience6/legacy_isolation5);
+- 网关侧回归 test_security_phase36+test_sanitize_phase41+test_multimodal_phase38
+  65 测试全过;
+- py_compile memory_embedding.py/gateway.py/test_memory_embedding_phase31.py 通过。
+
+### Supabase 只读基线(全程 SELECT)
+- 执行前=执行后:memory_items 总数 1/active 1/active 且 embedding NULL 1/
+  三列半写 0/带向量 0;triplet CHECK、match_memory_items RPC、HNSW 索引在位;
+- memory_events 总数 991→1003 为生产 Web 双写自然增长(仅 pending 侧),
+  本阶段零写入,与该增长无关。
+
+### 边界声明
+- Supabase:SELECT=是;INSERT/UPDATE/DELETE/UPSERT=否;apply_migration=否;
+  memory_items/memory_events 及任何表未真实修改;RLS/策略/索引/RPC 未改;
+- Pinecone=否(未查询未复制未写入);真实 embedding provider=否;LLM=否;
+  backfill 接口未真实调用;正式上下文未接入;
+- 修改文件:新增 memory_embedding.py、test_memory_embedding_phase31.py;
+  gateway.py 仅新增路由分发+handler;PROJECT_NOTES.md 追加本节;
+  未改 server.py/embedding_diagnostics.py/memory_recall.py/memory_review.py/
+  memory_preview.py/memory_extractor.py/migrations/requirements.txt/VARIABLES.md;
+- 未新增环境变量;未覆盖既有未提交修改;未 commit/push/部署。
+
+### 已知风险
+1. _get_embedding 多种失败统一返回空结果,UNAVAILABLE 无法区分网络/HTTP/解析失败
+   (模型未配置已前置拦截,余下统一 503);
+2. SELECT→provider→UPDATE 非事务存在并发窗口,由 embedding IS NULL 条件兜底
+   (竞争失败方 provider 白调 1 次,返回 409,不覆盖已有向量);
+3. 模型配置变更可能改变输出维度→DIMENSION_MISMATCH 拒写,需人工确认后改
+   EXPECTED_EMBEDDING_DIMENSION 常量(不自动适配、不自动切换 halfvec);
+4. 一次一条需人工重复触发,刻意不扩批;条件量增长后需评估批量模式;
+5. active 行在回填前向量召回(match_memory_items)不可用;
+6. backfill 后新 RPC 的真实向量查询验收仍待下一阶段;
+7. _get_embedding 对超长 content 有截断嵌入的既有行为。
+
+### 下一阶段建议(部署后手动验收)
+1. 部署后手动调用一次 POST /api/memory-embedding-backfill(Bearer API_SECRET,
+   body 仅含 confirm),只核对 code/stats/write_result/execution;
+2. Supabase 只读验证:1 条 active 三列全非空;vector_dims=1024;
+   向量有限且非零(不得读取向量值本身);status/content/updated_at 未变;
+3. 再次调用应返回 NO_ACTIVE_MEMORIES_NEED_EMBEDDING,provider_calls=0;
+4. 不删除旧数据;不操作 Pinecone;不接正式上下文;
+5. 随后以该真实向量用 service_role 只读最小验证 match_memory_items RPC
+   (候选合并去重与 HTTP 剥离内部 ID 留待后续阶段设计)。
