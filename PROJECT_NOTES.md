@@ -5140,3 +5140,151 @@ VECTOR_RPC_GATE_PASS），证明 memory_items content → 当前 embedding provi
 ## 遗留与说明
 - 会话期间用户在另一终端创建 commit bfd9a57（补充遗漏文件），本阶段
   未创建任何 commit；工作区仍保留全部未提交修改，由用户决定提交时机。
+
+## 阶段 37：lexical + vector 混合召回只读预览设计与 Mock 实现（2026-09-02，未部署未 commit）
+
+### 结论与前情提要
+第 35 阶段用户自然语言向量召回已在生产真实通过（VECTOR_RECALL_PREVIEW_READY：
+query_embedded=true、dimension=1024、rpc_returned=1、命中预期 active、
+similarity≈0.649、threshold_applied=false、active_only/expired_excluded/
+user_scoped 全真、writes_executed=false）；第 21/22 阶段词面召回已单独验证：
+精确词面可命中、同义词面可能漏召回、词面门槛不降低。当前 active 数量很少、
+向量相似度阈值尚未校准。本阶段在此之上新增一个手动调用、只读、零写入的
+**混合召回预览**接口：一次 embedding + 一次 service_role RPC 取得 active 向量
+候选 → 对同一批候选以词面算法二次打分 → 服务端内部 ID 合并去重 → RRF 融合
+排名 → 返回脱敏预览。本阶段只实现 + Mock 测试，未真实调用接口/provider/RPC。
+
+### 新增接口 POST /api/memory-hybrid-recall-preview
+- 受既有 /api/* API_SECRET 统一鉴权保护；仅 POST（其余 405 零调用）；
+  OPTIONS 沿用全局 CORS 预检；
+- 请求体严格 3 字段白名单（confirm / query / top_k）：user_id、status、
+  memory_type、threshold、provider、model、namespace、include_*、
+  lexical_weight、vector_weight、rrf_k、item_id、vector、embedding、
+  write_back、update_recall_count 等 18 类注入字段一律 400 且零
+  provider/RPC/DB/词面访问；confirm 必须严格等于 HYBRID_RECALL_PREVIEW_ONLY；
+  query 字符串 trim 后非空且 ≤500 字符；top_k 整数且非 bool，缺省 5，
+  范围 1~10（handler 400 校验 + 模块防御性复验双层）。
+
+### 两侧候选来源（本阶段关键取舍）
+- vector 侧：复用现有 server._get_embedding 恰嵌入一次（1024/finite/非零，
+  复用第 31 阶段 validate_vector 同一实现）；经注入 callable 只读调用第 30
+  阶段 match_memory_items 恰一次（match_count 服务端固定 10；p_user_id 服务
+  端解析值；不调用任何旧词面召回 RPC）；结构违规整体拒绝（复用第 35 阶段
+  _parse_rpc_row 同一实现）；
+- **lexical 侧：是对 vector top-10 候选的二次排序，不是全量 active lexical
+  检索**——词面强命中但向量未进入 RPC top-10 的记忆不会被本预览返回。零额外
+  SELECT、零表访问；词面算法本体（规范化 + _score_candidate）经 import 复用
+  第 21 阶段模块（测试断言函数对象同一性，杜绝复制漂移），不修改词面算法、
+  不修改 vector RPC；
+- 若未来需要全量词面参与，必须单独增加受限 active SELECT 并说明上限与性能。
+
+### 内部 ID 与去重
+- 合并只使用内部 memory_item_id（RPC 返回列）；同一 ID 重复只保留 RPC 距离序
+  首个并计数（duplicate_filtered）；
+- 绝不使用 content / subject_key / content_hash / source_event_ids 作身份
+  （测试覆盖：同正文不同 ID 返回两条、同 subject_key 不同 ID 返回两条）；
+- 内部 ID 仅服务端内存使用，绝不进入 HTTP 响应/日志/错误响应。
+
+### RRF 融合排序（无固定权重）
+- rrf_score = 1/(RRF_K + vector_rank) + 1/(RRF_K + lexical_rank)；
+  RRF_K=60（排名融合参数，不是相似度阈值）；
+- 只使用排名参与 RRF：一侧没有的候选该侧贡献为 0；lexical_score=0（无词面
+  重合证据）的候选不进入 lexical 排名（lexical_rank=null、贡献 0），与词面
+  召回"完全无词面重合不返回"既有语义一致；
+- 无任何固定分数权重（无 0.7*vector+0.3*lexical 类混合）；vector_similarity
+  与 lexical_score 保留原值；rrf_score 只用于预览排序，不自动判定记忆正确；
+- 最终排序：rrf_score 降序 → importance 仅最终稳定 tie-break → vector
+  similarity 序稳定收尾。RPC 投影（第 30 阶段迁移固定 10 列）不含 updated_at，
+  故 tie-break 无 updated_at 可用，已在模块文档与测试中固定该排序键；
+- 行为测试证明 rrf 支配 similarity：vector rank2 + lexical rank1 的融合分
+  高于 vector rank1 单侧，即使后者 similarity 更高。
+
+### threshold 与状态隔离
+- 不设任何相似度阈值：threshold_applied 恒 false，低相似度候选照常返回
+  （测试覆盖 similarity=0.05 仍返回），是否可用由人工判断；
+- active-only/未过期：RPC SQL 固定过滤 + 模块二次过滤（复用第 35 阶段
+  _row_state 同一实现）：显式非 active 丢弃、已过期丢弃、时间不可解析保守
+  丢弃、逐行计数；pending_review/rejected/superseded/expired 绝不返回；
+  不执行任何 UPDATE、不改变过期状态。
+
+### 响应与日志脱敏
+- 响应恰 5 键：ok / code / stats（恰 7 键：query_embedded、dimension、
+  vector_candidates、lexical_candidates、merged_candidates、returned、
+  threshold_applied）/ retrieval（method=rrf_hybrid_preview_v1 +
+  vector_method=pgvector_cosine_vector_recall_v1 + lexical_method=
+  deterministic_lexical_v1 + active_only/expired_excluded/user_scoped 全真 +
+  threshold_applied=false + writes_executed=false）/ items；
+- 条目白名单恰 16 键：recall_index、rank、memory_type、content、importance、
+  confidence、subject_key、valid_at、expires_at、source、vector_similarity、
+  lexical_score、rrf_score、vector_rank、lexical_rank、retrieval_sources
+  （["vector"] / ["vector","lexical"]）；
+- 绝不返回：memory_item_id、user_id、status、embedding、embedding_model、
+  content_hash、source_event_ids、source_batch_id、metadata、created_by、
+  model、裸 similarity 键、Prompt、LLM 响应、SQL、traceback；日志仅一条安全
+  行（阶段前缀区分 + stage + 错误码 + 计数 + 维度），不含查询原文、正文、
+  ID、user_id、模型名、provider、向量、RPC 原始行、hash、来源、密钥、异常
+  原文；lexical 打分意外异常 → INTERNAL_ERROR（vector 侧计数保留），绝不
+  伪装成 vector 侧成功或失败；
+- 无结果返回 HYBRID_RECALL_NO_RESULTS（ok=true，计数完整）；HTTP 映射与
+  第 35 阶段同构（无结果 200 / 请求非法 400 / embedding 503 / RPC 与内部 500）。
+
+### 硬性边界
+- 只读零写入：模块对数据库仅一次只读 RPC（经注入 callable），自身不持有
+  数据库客户端、无任何直接表访问；无 insert/update/delete/upsert；不更新
+  recall_count / last_recalled_at / updated_at；不触碰 memory_events；
+- 不读取、不复制、不写入 Pinecone；不调用 LLM；不新建 embedding 客户端；
+  不读取环境变量；无自动调度（无异步任务派发/定时器/线程循环）；
+- 不接正式聊天上下文；不修改 _inject_context / _build_channel_context /
+  tool_loop；不修改 memory_recall.py / memory_vector_recall.py /
+  memory_vector_selftest.py / memory_embedding.py / memory_review.py /
+  memory_preview.py / memory_extractor.py / server.py / napcat.py /
+  heartbeat.py / migrations / requirements.txt / VARIABLES.md / 前端 / Docker；
+- 新增环境变量：无。
+
+### 修改文件
+- 新增 memory_hybrid_recall.py（混合召回预览执行体，约 420 行）；
+- gateway.py 仅新增路由分发 + handler（_handle_memory_hybrid_recall，
+  约 120 行，零删除）；
+- 新增 test_memory_hybrid_recall_phase37.py（专项 84 测试）；
+- PROJECT_NOTES.md 追加本节。
+
+### 测试结果（全部 unittest+mock+合成数据，不真实调用）
+- py_compile：memory_hybrid_recall.py / gateway.py /
+  test_memory_hybrid_recall_phase37.py 全过；
+- 专项 test_memory_hybrid_recall_phase37：84 测全过（A 路由鉴权与 18 类注入
+  字段拒绝 / B provider 与 RPC 恰一次+参数形状+向量校验+旧 RPC/Pinecone/LLM
+  禁令 / C lexical 仅二次排序+算法身份断言+失败不伪装 / D 内部 ID 去重与
+  身份语义 / E RRF 数值与支配性+无权重+threshold 恒 false / F 状态与过期
+  隔离 / G 响应形状+禁用键+HTTP 映射 / H 源码静态扫描+行为零写入+全路径
+  脱敏扫描）；
+- 全量记忆回归（第 17/19/21/31/33/35 阶段 6 套件）：357 测全过 OK（3 行
+  "记忆人工提交失败"为既有 mock 预期输出）；无新增回归。
+
+### Supabase 只读基线（本会话经平台注入的只读 execute_sql 核查）
+- memory_items 总数 1：active 1、active 且 embedding 非空 1、三列
+  （embedding/embedding_model/embedded_at）全非空 1、active 已过期 0、
+  pending_review 0、rejected 0、superseded 0；
+- memory_events 1437（基线记录；本阶段零写入，会话内无任何写路径触碰）；
+- match_memory_items RPC 存在、HNSW 索引 memory_items_embedding_idx 存在、
+  memory_items 三向量列存在（pg_proc/pg_indexes/information_schema 计数核实）；
+- 全部核查为只读聚合查询，未读取或输出任何正文/ID/user_id/hash/来源/metadata 值。
+
+### 数据安全声明
+- Supabase SELECT 实际执行=是（仅上述只读聚合基线核查）；
+- RPC 真实执行=否；provider 真实调用=否；新接口真实调用=否；混合召回
+  全链路未真实调用；
+- INSERT/UPDATE/DELETE/UPSERT=否；memory_items 未修改；memory_events 未修改；
+- Pinecone=否；LLM=否；正式上下文未接入；词面算法未改动；vector RPC 未改动；
+- 未 commit/push/部署；未覆盖既有未提交修改；未删除任何数据。
+
+### 下一阶段建议
+1. 用户提交、推送、部署后，手动调用一次 POST /api/memory-hybrid-recall-preview
+   （confirm=HYBRID_RECALL_PREVIEW_ONLY + query + 可选 top_k）；
+2. 先用一个同义自然语言查询（词面不重合、语义相关）观察 vector_similarity /
+   lexical_score / rrf_score / retrieval_sources 的取值与排序；
+3. 再用一个精确词面查询观察 lexical 参与后的排名变化；
+4. 只查看脱敏结果；不修改 RRF_K、不设置 similarity threshold、不引入固定
+   权重、不接正式上下文、不操作 Pinecone、不删除任何数据；
+5. 待 active 数量增加后再评估：RRF 参数校准、阈值校准、lexical 是否升级为
+   全量 active 检索（需单独设计受限 SELECT 上限）、多 memory_type 与多用户
+   场景、以及最终接入正式上下文的设计。

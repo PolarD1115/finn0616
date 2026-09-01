@@ -1913,6 +1913,11 @@ class HostFixMiddleware:
             await self._handle_memory_vector_recall(scope, receive, send)
             return
 
+        # ---------- 🔀 lexical+vector 混合召回只读预览（第37阶段：一次 embedding + 一次 RPC 取同批 active 候选 → deterministic_lexical_v1 词面二次排序 → 内部 ID 合并去重 → RRF 融合；手动、零写入、不接正式上下文；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-hybrid-recall-preview":
+            await self._handle_memory_hybrid_recall(scope, receive, send)
+            return
+
         # ---------- 🏠 Home 聚合只读视图（C6：后端读取+安全投影，GET 零写副作用；受 /api/* 统一鉴权） ----------
         if scope["path"] == "/api/home/state":
             await self._handle_home_state_api(scope, send)
@@ -3740,6 +3745,130 @@ class HostFixMiddleware:
 
         _log(log_line)
         status = _mvr.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🔀 lexical + vector 混合召回只读预览（第37阶段）
+    #    一次 embedding + 一次 service_role 只读 RPC 取得 active 向量候选，
+    #    对同批候选以 deterministic_lexical_v1 词面二次打分（本阶段 lexical
+    #    是对 vector 候选的二次排序，不是全量 active lexical 检索），服务端
+    #    内部 memory_item_id 去重合并，RRF（rrf_k=60，排名融合参数而非阈值）
+    #    融合排序后返回脱敏候选。
+    #    请求体白名单仅 confirm/query/top_k；user_id/status/memory_type/
+    #    threshold/weight/rrf_k/item_id/vector/embedding 等任何额外字段一律
+    #    400 且零调用；不设相似度阈值（threshold_applied=false）；无固定分数
+    #    权重；零写入、不更新召回统计；无 Pinecone、无 LLM、无自动调度；
+    #    不接正式上下文；不修改词面算法与向量 RPC（算法本体经模块 import
+    #    复用）。
+    # ------------------------------------------
+    async def _handle_memory_hybrid_recall(self, scope, receive, send):
+        def _safe_body(code):
+            """错误/诊断路径统一安全骨架（不含任何敏感值）。"""
+            return {"ok": False, "code": code,
+                    "stats": {"query_embedded": False, "dimension": None,
+                              "vector_candidates": 0, "lexical_candidates": 0,
+                              "merged_candidates": 0, "returned": 0,
+                              "threshold_applied": False},
+                    "retrieval": {"method": "rrf_hybrid_preview_v1",
+                                  "vector_method":
+                                      "pgvector_cosine_vector_recall_v1",
+                                  "lexical_method": "deterministic_lexical_v1",
+                                  "active_only": True,
+                                  "expired_excluded": True,
+                                  "user_scoped": True,
+                                  "threshold_applied": False,
+                                  "writes_executed": False},
+                    "items": []}
+
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库、不调 provider）
+            await _send_json_resp(send, 405, _safe_body("METHOD_NOT_ALLOWED"))
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+
+        # 严格字段白名单：只允许 confirm/query/top_k。客户端提交 user_id/
+        # status/memory_type/threshold/provider/model/lexical_weight/
+        # vector_weight/rrf_k/item_id/vector/embedding/write_back 等任何额外
+        # 字段 → 400，绝不调用 provider、绝不调用 RPC、绝不做词面打分
+        allowed_fields = {"confirm", "query", "top_k"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+        # 显式确认（必须完全匹配，与 memory_hybrid_recall.CONFIRM_TOKEN 一致）
+        if payload.get("confirm") != "HYBRID_RECALL_PREVIEW_ONLY":
+            await _send_json_resp(send, 400, _safe_body("INVALID_CONFIRMATION"))
+            return
+
+        # 惰性导入（沿用项目 handler 内按需 import 惯例）：
+        # server 仅取 service_role 客户端、_get_embedding 与服务端 user_id
+        # 解析；模块常量用于请求校验（与模块防御性复验同一来源，避免漂移）；
+        # 不新建 embedding 客户端、不读任何环境变量
+        try:
+            import memory_hybrid_recall as _mhr
+            import server as _srv_st
+        except Exception as e:
+            _log(f"⚠️ 混合召回预览失败：stage=handler_import "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        # query 校验：字符串、trim 后非空、≤ 模块定义上限
+        query = payload.get("query")
+        if not isinstance(query, str):
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+        query_text = query.strip()
+        if not query_text or len(query_text) > _mhr.QUERY_MAX_LENGTH:
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+
+        # top_k 校验：整数且非 bool；缺省 5；范围 1~模块定义上限
+        top_k = payload.get("top_k", _mhr.DEFAULT_TOP_K)
+        if (isinstance(top_k, bool) or not isinstance(top_k, int)
+                or not (_mhr.TOP_K_MIN <= top_k <= _mhr.TOP_K_MAX)):
+            await _send_json_resp(send, 400, _safe_body("INVALID_HYBRID_RECALL_REQUEST"))
+            return
+
+        try:
+            def _rpc_caller(params):
+                # 只读 RPC：第30阶段 service_role-only 的 active-only 余弦召回；
+                # 每请求至多被混合召回模块调用一次
+                return _srv_st.supabase_service.rpc(_mhr.RPC_NAME, params).execute()
+
+            result, log_line = await _mhr.run_hybrid_recall(
+                query_text,
+                _srv_st._resolve_pinecone_user_id(),
+                _srv_st._get_embedding,
+                _rpc_caller,
+                top_k)
+        except Exception as e:
+            # 模块内部已全捕获；此处仅防御意外，异常只记类型不记原文
+            _log(f"⚠️ 混合召回预览失败：stage=handler "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        _log(log_line)
+        status = _mhr.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
 
     # ------------------------------------------
