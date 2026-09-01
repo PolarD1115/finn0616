@@ -4671,3 +4671,314 @@ gateway.py 0 处引用 home_private_diaries；home/context.py 无日记引用；
   极端慢活动（>15 分钟）可能同执行双计，影响仅限防重复判断。
 - 新日记标题固定"秘密日记 YYYY-MM-DD"，UI 可读性依赖 created_at（C6 处理）。
 - 未部署；部署后无需任何 DB 迁移。
+
+
+---
+
+## 阶段 C5：统一自主活动调度与稳定 activity_id（2026-09-01，未部署未 commit）
+
+### 结论
+原"自由活动"（async_free_activity）与"Home 自主生活"（async_home_autonomy_tick）
+双独立循环合并为唯一顶层自主调度 heartbeat.async_unified_autonomy；活动以
+activity_registry.py 单一注册表的稳定 activity_id 表示；模型每次唤醒只选择一次、
+只输出一个候选内 activity_id，非法/被门控/非 JSON 一律 skipped 不随机兜底；
+Home 执行器按"phase 工具集 ∩ 活动工具组"严格限制真实工具；一次唤醒只产生一条
+activity_logs（source=unified_autonomy）；宠物 tick 与紧急照料链路不受影响；
+未修改数据库、未新增环境变量、未创建 commit。
+
+### 前置核实（原双循环根因）
+- run_background_process 原同时 create_task async_free_activity 与
+  async_home_autonomy_tick：两个 while True 各自睡眠、各自决策、各写一条
+  activity_logs（free_activity / home_autonomy 两个 source），构成双循环。
+- 活动清单在 heartbeat.py 与 tool_loop.py 各维护一份（注释要求手动同步），
+  desire_bridge.ACTION_TO_FREE_ACTIVITY 第三处持有中文活动名。
+- 旧 stage1 选择协议输出任意中文活动名，非法时 random.choice(pool) 兜底替换；
+  "做饭/照料阳台"等非固定名称会被随机换成别的活动。
+- start/finalize 均在 heartbeat 侧（两个执行器只写 meta_out），为统一留痕提供基础。
+- C4 防重复只覆盖 source=free_activity；Home 侧无跨 tick 防重复。
+
+### 活动注册表（activity_registry.py，新文件，无项目内依赖）
+- 单一权威源 ACTIVITIES：activity_id / name / description / category
+  （free|outgoing|home|legacy）/ executor（free|home）/ legacy_names；
+  Home 项另含 home_tool_group + min_phase。
+- 稳定 ID：free:secret_diary、free:virtual_house(legacy)、free:weather、free:tarot、
+  free:memory_recall、free:idle、free:bookkeeping、free:taobao、free:web_surf；
+  outgoing:miss_user、outgoing:share、outgoing:care；
+  home:observe(看看家里)、home:letters(写信或留便利贴)、home:garden(照料花园)、
+  home:kitchen(做饭和用餐)、home:rest(在家休息)、home:social(陪伴家人)。
+- 旧名映射仅用于 desire 旧输出/历史 memories/activity_logs/防重复/测试：
+  做饭(和用餐)/烹饪→home:kitchen；照料花园/照料阳台→home:garden；
+  写秘密日记→free:secret_diary；想对方了→outgoing:miss_user 等；
+  逛虚拟小屋保留独立 legacy id free:virtual_house（不映射到 home:observe，
+  避免旧 house_* 活动误抑制只读观察），不进统一候选。
+- tool_loop._FREE_ACTIVITIES 与 heartbeat._FREE_ACTIVITIES 改为由注册表派生
+  （含 legacy 共 12 项，顺序与旧一致），三处漂移根因消除；heartbeat 旧
+  _FREE_ACTIVITY_SLUGS 保留仅供旧兼容循环 finalize 使用。
+
+### 统一候选与 phase 分层
+- FREE_ACTIVITY_ENABLED（语义变更）：控制普通自由/外向/秘密日记是否加入候选；
+- HOME_AUTONOMY_ENABLED（语义变更）：控制 Home 活动是否加入候选；
+- 自由候选复用 tool_loop._gate_activities 全部门控（淘宝/冲浪情绪+配置+冷却+
+  每日上限；snap=None 时两活动不候选），category=legacy 不进候选；
+- Home 候选须 HOME_AUTONOMY_ENABLED + _HAS_HOME_RUNTIME + phase≥min_phase
+  + 工具组与 phase 工具集有交集：phase1→observe；2→+letters；3→+garden/kitchen；
+  4→+rest/social（高含低）；
+- 两者皆关：统一任务直接返回不进循环；仅 FREE=false HOME=true 时统一循环仍只跑
+  Home 候选；无候选/防重复排除后无候选：不调模型、不留痕、不从全量被门控候选兜底。
+
+### 统一选择协议
+- 候选非空 → start_activity_log(source=unified_autonomy) → 单次模型调用
+  （_ask_bg_role，temperature 0.7），Prompt 只列候选 activity_id+显示名+说明，
+  Home 项标注"选了会真正动手做"；thought_summary 可展示非思维链；不得声称已完成；
+- 模型输出 {"activity_id","thought_summary"}（reason 可省略不消费）；
+- 非法/被门控/空/非 JSON → finalize skipped "本轮没有选出可执行的活动。"，
+  日志只记 id 安全截断不记原始响应；选择模型异常 → fail_activity_log，不重试；
+- 欲望倾向：suggested 中文名经 legacy_to_id 映射，不在本轮候选即丢弃（不绕过
+  门控/开关/phase）；satisfy_action 仍用 want_action（未改），条件不变
+  （driven、非 wildcard、日记持久化成功）。
+
+### 执行分流（无二次选择）
+- free/outgoing/diary → tool_loop.run_free_activity_tool_loop 新参
+  forced_activity_id + selection_thought_summary + gate_hints：跳过 stage1 选择与
+  random 兜底，按注册表取得旧名后分流——查天气/秘密日记走原专用确定性路径
+  （草稿空）；有工具且 TOOL_LOOP 开 → 原 stage2a/2b/3 工具路径（方向提示由调度器
+  gate_hints 透传，不重复门控查询）；其余 → 新 _generate_forced_activity_log 一次
+  内容生成（外向=推送原话；内敛=第一人称记录；保留禁套话/不得假装成功约束）；
+  未知/非 free ID → None。不传 forced_activity_id 的旧路径原样保留（仅供旧测试/
+  外部调用，stage1+random 兜底仍在，生产不经过）。
+- home → run_home_autonomy_tool_loop 新参 activity_id + allowed_tool_names +
+  selection_thought_summary：最终可用工具 = phase 工具集 ∩ home_tool_group
+  (∩ allowed_tool_names)，交集为空 → None；不在组内工具不进 schema/可用性列表，
+  模型输出也被白名单拒绝（不执行/不生成 action_key/不计 fail_count/不更新冷却）；
+  meta_out["activity_name"]=活动展示名，thought 缺省回退统一选择念头；C2 五态、
+  raw.ok 判定、多轮预算、初始确定性观察（按 phase）全部保持。
+- 工具矩阵（phase4 交集实测=注册表组）：
+  observe→home_observe/garden_observe/pantry_observe/list_letters（只读）；
+  letters→home_observe/list_letters/write_letter/leave_note；
+  garden→home_observe/garden_observe/plant_seed/water_plant/harvest_plant；
+  kitchen→home_observe/pantry_observe/cook_recipe/eat_dish/feed_member；
+  rest→home_observe/home_enter_room/home_rest/home_sleep；
+  social→home_observe/home_spend_time（陪小满不混入 cat_*，避免双宠物状态源）。
+
+### activity_logs 与兼容日志
+- 一次唤醒：start 一次（uni_ 前缀 key，source=unified_autonomy，位于选择模型与
+  全部副作用之前）→ finalize 同一条；执行器内部无 start/finalize；执行器 None →
+  skipped（不进入第二个执行器）；异常 → fail_activity_log 后 raise（外层打印）。
+- home/activity_log.py：source 白名单加 "unified_autonomy"（旧两值保留）；
+  新增 get_recent_completed_activities(limit)（三 source 兼容、succeeded/partial、
+  只读四字段）；原 get_recent_completed_free_activities 原样保留（旧测试/旧闭包用）。
+- 兼容叙事日志：普通活动写 Free_Activity（🎈 自由活动·X）；Home 写 Home_Autonomy
+  （🏠 家庭自主·{展示名}，仅后缀追加展示名，前缀不变）；秘密日记只写
+  home_private_diaries（执行器内持久化，diary_persist_ok 通道不变）；外向推送一次
+  （失败 → fail_activity_log，不回退另一活动）；正文/搜索词/UUID/工具参数不入日志。
+
+### 防重复（activity_id 化）
+- 新增 heartbeat._activity_row_to_id（行内 id 在注册表即用；否则按 name 走旧名映射；
+  均失败保留原始 id 串）+ _merge_recent_activity_ids（时间倒序+15 分钟窗口去重，
+  语义同旧 _merge_recent_activity_names）+ _recent_activity_ids（activity_logs
+  三 source 优先，不足用 memories Free_Activity/Secret_Diary/Home_Autonomy 补足，
+  标题按"·"拆名映射，解析不了丢弃，不读正文）；
+- 最近两条同 id → 从候选排除；failed/skipped/running 不计；旧 home 行
+  (activity_id=home:autonomy，名"家庭自主生活") 解析为原始 id 不误伤新 id；
+  旧 outgoing 行 free:outgoing_missing 经名称映射归一到 outgoing:miss_user。
+
+### 间隔规则（环境变量语义变更，无新增变量）
+- 两者关 → 统一任务返回；
+- 仅 HOME → HOME_AUTONOMY_INTERVAL（不用动态心跳、不依赖 FREE 开关）；
+- 仅 FREE → 动态心跳（HEARTBEAT_AUTONOMY，经 desire_bridge.seconds_until_next_
+  heartbeat）有值用之，否则 FREE_ACTIVITY_INTERVAL+±900s 抖动（旧行为）；
+- 双开 → 动态心跳有值用之，否则 min(FREE_ACTIVITY_INTERVAL, HOME_AUTONOMY_
+  INTERVAL)+抖动；开关每轮重读（支持热更新），均关则循环退出。
+
+### 旧兼容处理
+- async_free_activity / async_home_autonomy_tick 函数体原样保留（docstring 加
+  "C5 兼容入口（弃用）"注释），仅供旧测试（test_activity_logs/_Stop 驱动单轮）与
+  手动诊断；run_background_process 只 create_task async_unified_autonomy
+  （name=unified_autonomy），不再调度两旧循环；
+- 宠物链路零改动：async_pet_house_tick 照常启动；_free_activity_check_cat 原样
+  迁移进统一 tick（每轮唤醒先查，_try_pet_care 冷却与归属不变）；C1 喂食优先级
+  代码未动；
+- house_do/house_put/house_take/house_update_desc 与 TOOL_REGISTRY/MCP 全部保留，
+  只是统一候选不再经"逛虚拟小屋"开放（free:virtual_house 为 legacy 不进候选）。
+
+### 测试
+- 新增 test_unified_autonomy_c5.py（.gitignore ! 例外）：55 项全过，覆盖 A-Z
+  （注册表/开关组合/phase 分层/门控/合法选择/非法 ID/非 JSON/forced 天气/日记/
+  轻量/Home 六活动工具矩阵/单任务启动/一条日志/兼容叙事/外向推送/desire 映射/
+  防重复/无候选/顺序/start 失败/执行器异常/间隔规则），全 mock 零真实依赖。
+- 回归：test_pet_feed_priority=38、test_home_autonomy_loop=26、
+  test_activity_logs=37、test_secret_diary_c4=56、test_cat_check=31、
+  test_home_pet_bridge=59 全过。
+- test_tool_loop=108 项中 5 项固定漂移失败（旧基线：schema/查天气确定性路径相关
+  断言）+ test_invalid_activity_fallback_random 偶发失败——已用 HEAD 版 tool_loop
+  对拍 20 次：HEAD 失败 7/20、工作区 5/20，为旧路径 random.choice 撞天气专用路径的
+  固有非确定性（天气路径先于 C5 存在），非本次新增回归。
+- 未运行：test_shared_experience_phase6（用户已有修改，与本阶段无关，按边界不动）。
+
+### 文档
+- VARIABLES.md：12.2/12.3 改为统一调度说明，FREE_ACTIVITY_ENABLED/
+  HOME_AUTONOMY_ENABLED/HOME_AUTONOMY_INTERVAL 标注语义变更，
+  HEARTBEAT_AUTONOMY 补充统一循环下的作用；旧变量文档未删除。
+- HOME_RUNTIME_GUIDE.md：1.3 新旧系统关系与第 11 节"当前后台行为"按 C5 现状改写
+  （第 12 节功能状态表标注为历史快照）。
+- HOME_RUNTIME_TUTORIAL.md：开头后台描述、新旧对照表、第 8 节加 C5 状态注记
+  （实施方案已按统一调度落地），8.1 历史正文保留。
+- PROJECT_NOTES.md：本节。
+
+### 已知限制 / 边界
+- 统一调度未在生产部署；部署后无任何 DB 迁移（source 为 text）。
+- 旧兼容循环若被外部手动调用仍会与统一循环并行决策（函数 docstring 已注明禁止
+  同时常驻）；生产主入口只有一条统一任务。
+- test_tool_loop 旧 stage1/random 兜底路径保留（仅兼容），生产统一调度不经过。
+- 统一 Home 活动的初始确定性观察仍按 phase 全量读取（不按活动裁剪），符合"最小
+  修改"边界；活动级只读裁剪留待后续。
+- Home memories 标题后缀新增展示名（🏠 家庭自主·做饭和用餐），若前端存在按完整
+  标题精确匹配的查询需 C6 核对（当前 console/miniapp 按标签查询，不受影响）。
+- 未部署；未创建 commit；未修改 gateway.py/embedding_diagnostics.py/server.py/
+  home/repository.py/home/service.py/migrations/prompts/reply_rules.md。
+
+
+---
+
+## 阶段 35：用户查询向量召回只读预览设计与 Mock 实现（2026-09-01，未部署未 commit）
+
+### 结论与前情提要
+第 33/34 阶段自匹配预览已通过真实生产验收（生产实测 VECTOR_SELF_MATCH_READY，
+top1_similarity=1.0，dimension=1024，rpc_returned=1，database_writes=0，
+VECTOR_RPC_GATE_PASS），证明 memory_items content → 当前 embedding provider →
+1024 维查询向量 → service_role RPC → pgvector cosine 查询 → Top1 自匹配链路
+正常。本阶段在此之上新增一个手动调用、只读、零写入的**用户自然语言查询**向量
+召回预览接口，用于人工验证：用户查询能否命中相关 active 记忆、相似度分布、
+不相关查询是否误召回。接口不接入聊天上下文，本阶段只实现 + Mock 测试，未真实
+调用接口/provider/RPC。
+
+### 新增接口 POST /api/memory-vector-recall-preview
+- 受既有 /api/* API_SECRET 统一鉴权保护；仅 POST（其余 405 零调用）；
+  OPTIONS 沿用全局 CORS 预检。
+- 请求体严格 3 字段白名单（confirm / query / top_k）：user_id、status、
+  memory_type、threshold、provider、model、namespace、include_*、write_back、
+  item_id、vector、embedding、force、batch 等任何额外字段一律 400 且零
+  provider/RPC/DB 访问；confirm 必须严格等于 VECTOR_RECALL_PREVIEW_ONLY；
+  query 字符串 trim 后非空且 ≤500 字符；top_k 整数且非 bool，缺省 5，
+  范围 1~10（handler 400 校验 + 模块防御性复验双层）。
+
+### 查询向量（query embedding）
+- 复用现有 server._get_embedding（不新建客户端），恰调用一次，输入恒为
+  trim 后查询文本，不自动重试；
+- 向量校验复用第 31 阶段 memory_embedding.validate_vector 同一实现：
+  空/非 list/元素不可转 float/NaN、Inf/维度非 1024/全零逐一拒绝
+  （EMBEDDING_UNAVAILABLE / RESPONSE_INVALID / NON_FINITE_VALUES /
+  DIMENSION_MISMATCH / ZERO_VECTOR）。
+
+### RPC 调用（第 30 阶段 match_memory_items）
+- 经注入 callable（handler 构造的 service_role 客户端）只读调用恰一次；
+  query_embedding 用已确认的 list[float] JSON 数组 wire 格式；p_user_id 为
+  服务端解析值（server._resolve_pinecone_user_id，客户端无提交入口）；
+- **match_count 服务端固定 10**：客户端 top_k 只截断预览列表，绝不作为 RPC
+  参数（请求形态不影响数据库候选集与查询计划）；不使用 anon、不调用任何
+  旧词面召回 RPC；
+- RPC 返回结构校验（信任边界，与第 33 阶段同一严格语义）：非列表/行数>10/
+  行非 dict/缺 memory_item_id/缺或空 content/similarity 缺失或不可转 float
+  或非 finite 或超出 [-1,1] 容差 → 整体 VECTOR_RPC_RESPONSE_INVALID（结构
+  违规不静默丢弃，防止掩盖契约破坏）。
+
+### active-only 与过期过滤（二次防线，逐行保守丢弃并计数）
+- 显式携带非 active 状态字段的行丢弃（status_filtered）；expires_at 已过期
+  丢弃（expired_filtered）；expires_at 存在但无法解析保守丢弃
+  （invalid_time_filtered）；内部 memory_item_id 重复只保留 RPC 距离序首个
+  （duplicate_filtered）；行未显式携带 status 时以 RPC SQL 固定过滤为准；
+- 全部丢弃后返回 NO_VECTOR_RECALL_RESULTS（ok=true，计数完整）；
+  高 importance 不构成召回理由（模块不按 importance 过滤）；低 similarity
+  不自动解释为错误。
+
+### similarity 与 threshold
+- 不设任何硬相似度过滤阈值：存活过二次过滤的候选全部返回，
+  threshold_applied 恒为 false（仅 1 条 active 自匹配样本不足以校准阈值）；
+- similarity 仅表示 pgvector cosine 相似度，不是记忆置信度、不是回答正确
+  概率；结果按 similarity 降序稳定排序后截断 top_k，rank/recall_index 为
+  最终列表 1 基序号。
+
+### 响应与日志脱敏
+- 响应恰 5 键：ok / code / stats（query_embedded、dimension、rpc_returned、
+  returned、4 个过滤计数）/ retrieval（pgvector_cosine_vector_recall_v1 +
+  active_only/expired_excluded/user_scoped/threshold_applied=false/
+  writes_executed=false）/ items；
+- 条目白名单 11 键：recall_index、rank、memory_type、content、importance、
+  confidence、subject_key、valid_at、expires_at、source、similarity；缺省
+  字段置 None；bool/垃圾类型字段拒绝为 None；
+- 绝不返回：memory_item_id（仅服务端内存用于去重与调试核对）、user_id、
+  embedding、embedding_model、content_hash、source_event_ids、
+  source_batch_id、metadata、created_by、status、superseded_by、模型名、
+  provider、SQL、异常原文；日志仅 stage+错误码+计数+维度，不含查询原文
+  与正文；错误响应不含异常正文。
+
+### 硬性边界
+- 零写入：模块对数据库仅一次只读 RPC（经注入 callable），自身不持有任何
+  数据库客户端、无任何直接表访问；不更新召回次数/任何列；不删除任何数据；
+- 不接词面召回模块；不实现词面+向量混合；不修改词面召回；
+- 不接 _inject_context / _build_channel_context 等正式上下文；
+- 不读取、不复制、不写入 Pinecone；不调用 LLM；不自动调度（无异步任务
+  派发/定时器/线程循环）；不新增环境变量（handler 也不读任何环境变量）；
+  不修改 requirements/Docker/前端/migrations/RLS/schema/RPC。
+
+### 修改文件
+- 新增 memory_vector_recall.py（只读召回预览执行体）；
+- gateway.py 仅新增路由分发 + handler（+127 行，零删除）；
+- 新增 test_memory_vector_recall_phase35.py（专项 73 测试，.gitignore 忽略
+  范围内，与既有各阶段专项测试同等地位）；
+- PROJECT_NOTES.md 追加本节；未改 server.py / memory_vector_selftest.py /
+  memory_embedding.py / memory_recall.py / memory_review.py / memory_preview.py /
+  memory_extractor.py / heartbeat.py / migrations 等任何既有文件。
+
+### 测试结果（全部 unittest+mock+合成数据，不真实调用）
+- py_compile：memory_vector_recall.py / memory_vector_selftest.py /
+  gateway.py 全过；
+- 专项 test_memory_vector_recall_phase35：73 测全过（A 路由鉴权与请求校验/
+  B embedding/C RPC 与参数形状/D 状态过期二次过滤/E 用户隔离/F 响应形状
+  语义与 HTTP 映射/G 源码静态+行为零写入+全路径脱敏扫描）；
+- 全量记忆回归（第 17/19/21/31/33 阶段 5 套件 + 本阶段）：357 测全过 OK
+  （改动前基线 284 全过，无新增回归）；
+- 独立 AST 静态核查（临时脚本，核查后已删除）：模块零禁用导入/零写入调用/
+  零环境变量/零调度/零网络；handler 仅允许 server 依赖复用与 rpc().execute()
+  只读通路，全部通过。
+
+### Supabase 只读基线
+- 本会话未注入 Supabase MCP 工具，未能执行新的 execute_sql 只读核查；
+- 采用用户提供的当日（2026-09-01）第 34 阶段生产自匹配验收响应作为基线证据：
+  rpc_returned=1（即当前用户恰有 1 条 active、未过期、embedding 非空的
+  memory_items）、dimension=1024、top1_similarity=1.0（存量向量 1024 维、
+  finite、非零）、database_writes=0、service_role RPC 通路真实可执行；
+- 第 32/34 阶段已核验的 HNSW 索引 / triplet CHECK / RLS / RPC 权限对象状态
+  自该次验收后无任何写入路径触碰（第 33~35 阶段全部零写入），维持原状。
+
+### 数据安全声明
+- Supabase SELECT 实际执行=否（本阶段全程零真实数据库访问，仅 mock）；
+- RPC 真实执行=否；provider 真实调用=否；新接口真实调用=否；
+- INSERT/UPDATE/DELETE/UPSERT=否；memory_items 未修改；memory_events 未修改；
+- active 记忆未修改；Pinecone=否；LLM=否；正式上下文未接入；词面召回未改动；
+- 未 commit/push/部署；未覆盖既有未提交修改；未删除任何数据。
+
+### 已知风险
+1. vector preview 返回记忆正文 content（白名单设计如此）：接口受 API_SECRET
+   保护，但密钥泄露即正文泄露，与 /api/memory-review 同级风险；
+2. 未设置相似度阈值：低相似度噪声候选会照常返回，人工判断时须自行甄别；
+3. 当前仅 1 条 active：排序质量/多候选截断/阈值校准均无真实样本支撑；
+4. RPC 结果数量与索引计划：match_count 固定 10，HNSW 在极小行数下的行为
+   （ef_search 默认值）未经校准；
+5. provider/模型变更：本模块不做 embedding_model 一致性核对（与自匹配预览
+   不同），若存量向量与当前 provider 不同源，similarity 数值不可比——这
+   正是预览要人工暴露的问题，但解读责任在人工；
+6. memory_items 尚未接入正式上下文：预览结果不代表任何聊天行为改变；
+7. 多用户场景：p_user_id 单用户隔离由服务端解析保证，但本阶段无跨用户
+   真实数据可验证。
+
+### 下一阶段建议（用户提交/推送/部署后）
+1. 手动调用一次 POST /api/memory-vector-recall-preview（Bearer API_SECRET，
+   body 仅含 confirm=VECTOR_RECALL_PREVIEW_ONLY、query、top_k）；
+2. query 使用一个与 active 记忆相关、但不是完整原文的自然语言改写；
+3. 只报告 code / stats / retrieval / items 的脱敏结果（正文可由用户自行
+   核对，不必回传）；
+4. 若命中：记录 similarity 数值，作为真实同义召回的首个样本；
+5. 若未命中（NO_VECTOR_RECALL_RESULTS 或低相似度）：记录为真实同义召回
+   结果，不修改阈值、不接正式上下文、不混词面召回；
+6. 不操作 Pinecone；不删除任何数据；不自动重试。

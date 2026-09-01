@@ -1908,6 +1908,30 @@ class HostFixMiddleware:
             await self._handle_memory_vector_selftest(scope, receive, send)
             return
 
+        # ---------- 🔍 用户查询向量召回只读预览（第35阶段：query 重嵌入 → service_role 只读 RPC → active-only 二次过滤；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-vector-recall-preview":
+            await self._handle_memory_vector_recall(scope, receive, send)
+            return
+
+        # ---------- 🏠 Home 聚合只读视图（C6：后端读取+安全投影，GET 零写副作用；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/home/state":
+            await self._handle_home_state_api(scope, send)
+            return
+
+        # ---------- 📋 行动日志分页查询（C6：只读、tools_used 二次白名单投影；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/activity-logs":
+            await self._handle_activity_logs_api(scope, send)
+            return
+
+        # ---------- 🔐 秘密日记统一索引（C6：仅元数据不含正文；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/secret-diaries":
+            await self._handle_secret_diaries_api(scope, send)
+            return
+        if scope["path"].startswith("/api/secret-diaries/"):
+            diary_ref = scope["path"][len("/api/secret-diaries/"):]
+            await self._handle_secret_diary_body_api(scope, send, reference=diary_ref)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -3597,6 +3621,128 @@ class HostFixMiddleware:
         await _send_json_resp(send, status, result)
 
     # ------------------------------------------
+    # 🔍 用户查询向量召回只读预览 /api/memory-vector-recall-preview（第35阶段）
+    #    手动、只读、受 API_SECRET 保护：服务端解析 user_id 后，用现有
+    #    _get_embedding 对用户查询文本恰嵌入一次（1024/finite/非零校验），
+    #    经 service_role 客户端只读调用第30阶段 match_memory_items 恰一次
+    #    （match_count 服务端固定 10，客户端 top_k 只截断预览列表），模块内
+    #    二次过滤（active-only / 过期 / 时间可解析 / 内部 ID 去重）后按
+    #    similarity 降序返回脱敏候选。
+    #    请求体白名单仅 confirm/query/top_k；user_id/status/memory_type/
+    #    threshold/provider/model 等任何额外字段一律 400 且零调用；
+    #    不设相似度硬阈值（threshold_applied=false），低相似度候选照常返回；
+    #    响应不含内部 ID/user_id/向量/模型名/provider/异常原文；零写入、
+    #    无 Pinecone、无 LLM、无自动调度；不接正式上下文；不接词面召回。
+    # ------------------------------------------
+    async def _handle_memory_vector_recall(self, scope, receive, send):
+        def _safe_body(code):
+            """错误/诊断路径统一安全骨架（不含任何敏感值）。"""
+            return {"ok": False, "code": code,
+                    "stats": {"query_embedded": False, "dimension": None,
+                              "rpc_returned": 0, "returned": 0,
+                              "status_filtered": 0, "expired_filtered": 0,
+                              "invalid_time_filtered": 0,
+                              "duplicate_filtered": 0},
+                    "retrieval": {"method": "pgvector_cosine_vector_recall_v1",
+                                  "active_only": True,
+                                  "expired_excluded": True,
+                                  "user_scoped": True,
+                                  "threshold_applied": False,
+                                  "writes_executed": False},
+                    "items": []}
+
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（不查库、不调 provider）
+            await _send_json_resp(send, 405, _safe_body("METHOD_NOT_ALLOWED"))
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+
+        # 严格字段白名单：只允许 confirm/query/top_k。客户端提交 user_id/
+        # status/memory_type/threshold/provider/model/namespace/include_*/
+        # write_back/item_id/vector/embedding/force/batch 等任何额外字段 → 400，
+        # 绝不查询数据库、绝不调用 provider、绝不调用 RPC
+        allowed_fields = {"confirm", "query", "top_k"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+        # 显式确认（必须完全匹配，与 memory_vector_recall.CONFIRM_TOKEN 一致）
+        if payload.get("confirm") != "VECTOR_RECALL_PREVIEW_ONLY":
+            await _send_json_resp(send, 400, _safe_body("INVALID_CONFIRMATION"))
+            return
+
+        # 惰性导入（沿用项目 handler 内按需 import 惯例）：
+        # server 仅取 service_role 客户端、_get_embedding 与服务端 user_id 解析；
+        # 模块常量用于请求校验（与模块防御性复验同一来源，避免漂移）；
+        # 不新建 embedding 客户端、不读任何环境变量
+        try:
+            import memory_vector_recall as _mvr
+            import server as _srv_st
+        except Exception as e:
+            _log(f"⚠️ 向量召回预览失败：stage=handler_import "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        # query 校验：字符串、trim 后非空、≤ 模块定义上限
+        query = payload.get("query")
+        if not isinstance(query, str):
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+        query_text = query.strip()
+        if not query_text or len(query_text) > _mvr.QUERY_MAX_LENGTH:
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+
+        # top_k 校验：整数且非 bool；缺省 5；范围 1~模块定义上限
+        top_k = payload.get("top_k", _mvr.DEFAULT_TOP_K)
+        if (isinstance(top_k, bool) or not isinstance(top_k, int)
+                or not (_mvr.TOP_K_MIN <= top_k <= _mvr.TOP_K_MAX)):
+            await _send_json_resp(send, 400, _safe_body("INVALID_VECTOR_RECALL_REQUEST"))
+            return
+
+        try:
+            def _rpc_caller(params):
+                # 只读 RPC：第30阶段 service_role-only 的 active-only 余弦召回；
+                # 每请求至多被 recall 模块调用一次
+                return _srv_st.supabase_service.rpc(_mvr.RPC_NAME, params).execute()
+
+            result, log_line = await _mvr.run_recall(
+                query_text,
+                _srv_st._resolve_pinecone_user_id(),
+                _srv_st._get_embedding,
+                _rpc_caller,
+                top_k)
+        except Exception as e:
+            # 模块内部已全捕获；此处仅防御意外，异常只记类型不记原文
+            _log(f"⚠️ 向量召回预览失败：stage=handler "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        _log(log_line)
+        status = _mvr.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
+        await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
     # 🎛️ 多模型管理接口 /api/models
     # ------------------------------------------
     async def _handle_models_api(self, scope, receive, send):
@@ -4702,6 +4848,181 @@ class HostFixMiddleware:
 
         except Exception as e:
             await _err("RPC_ERROR", "操作失败", 500)
+
+    # ------------------------------------------
+    # 🏠 C6: Home 聚合只读视图 /api/home/state
+    # ------------------------------------------
+    async def _handle_home_state_api(self, scope, send):
+        """GET /api/home/state — Home 前端聚合只读视图。
+
+        - 受 /api/* 全局 API_SECRET 鉴权；仅 GET；
+        - 数据全部由后端读取（浏览器不接触 Supabase），home_service 层完成安全投影：
+          不含内部 UUID、秘密日记正文、未拆信/便利贴全文与任何工具参数；
+        - 单区块失败不伪造为空：该区块置 null 并在 data.errors 标记，其余区块照常返回。
+        """
+        if scope["method"] != "GET":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 GET"})
+            return
+        try:
+            import home.service as _home_service
+            result = await asyncio.to_thread(_home_service.home_state_overview)
+        except Exception as e:
+            _log(f"⚠️ [Home聚合] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            await _send_json_resp(send, 500, {"ok": False,
+                                              "error_code": result.get("error_code") or "INTERNAL_ERROR",
+                                              "message": result.get("message") or "服务暂时不可用"})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "data": result.get("data", {})})
+
+    # ------------------------------------------
+    # 📋 C6: 行动日志分页查询 /api/activity-logs
+    # ------------------------------------------
+    async def _handle_activity_logs_api(self, scope, send):
+        """GET /api/activity-logs — 行动日志分页查询（只读、白名单投影）。
+
+        参数：page(≥1) size(1..100) source(all|unified_autonomy|free_activity|home_autonomy)
+              status(all|running|succeeded|observed|partial|failed|skipped) activity_id(≤200字)
+        """
+        if scope["method"] != "GET":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 GET"})
+            return
+        qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+        params = {}
+        from urllib.parse import unquote as _unquote
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = _unquote(v)
+        try:
+            page = int(params.get("page", "1"))
+            size = int(params.get("size", "20"))
+        except (TypeError, ValueError):
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_REQUEST",
+                                              "message": "page/size 须为整数"})
+            return
+        source = (params.get("source", "") or "").strip()
+        status = (params.get("status", "") or "").strip()
+        activity_id = (params.get("activity_id", "") or "").strip()
+        if len(activity_id) > 200:
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_REQUEST",
+                                              "message": "activity_id 过长"})
+            return
+        try:
+            import home.activity_log as _alog
+            result = await asyncio.to_thread(
+                _alog.query_activity_logs, page, size, source, status, activity_id)
+        except Exception as e:
+            _log(f"⚠️ [行动日志] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            code = result.get("error_code") or "INTERNAL_ERROR"
+            if code.startswith("INVALID"):
+                await _send_json_resp(send, 400, {"ok": False, "error_code": code,
+                                                  "message": "请求参数无效"})
+            else:
+                await _send_json_resp(send, 500, {"ok": False, "error_code": code,
+                                                  "message": "服务暂时不可用"})
+            return
+        await _send_json_resp(send, 200, {
+            "ok": True, "items": result.get("items", []),
+            "total": result.get("total", 0), "page": result.get("page", page),
+            "size": result.get("size", size), "has_more": bool(result.get("has_more", False)),
+        })
+
+    # ------------------------------------------
+    # 🔐 C6: 秘密日记统一索引 /api/secret-diaries
+    # ------------------------------------------
+    async def _handle_secret_diaries_api(self, scope, send):
+        """GET /api/secret-diaries — 新旧秘密日记统一索引（仅元数据，绝不含正文）。"""
+        if scope["method"] != "GET":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 GET"})
+            return
+        qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+        try:
+            page = int(params.get("page", "1"))
+            size = int(params.get("size", "20"))
+        except (TypeError, ValueError):
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_REQUEST",
+                                              "message": "page/size 须为整数"})
+            return
+        page = max(1, page)
+        size = min(100, max(1, size))
+        offset = (page - 1) * size
+        try:
+            import home.service as _home_service
+            result = await asyncio.to_thread(
+                _home_service.list_private_diary_index, size, offset, True)
+        except Exception as e:
+            _log(f"⚠️ [秘密日记索引] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            await _send_json_resp(send, 500, {"ok": False,
+                                              "error_code": result.get("error_code") or "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        data = result.get("data", {})
+        await _send_json_resp(send, 200, {
+            "ok": True, "items": data.get("items", []),
+            "total": data.get("total", 0), "page": page, "size": size,
+            "has_more": bool(data.get("has_more", False)),
+        })
+
+    # ------------------------------------------
+    # 🔓 C6: 秘密日记受保护正文读取 /api/secret-diaries/:reference
+    # ------------------------------------------
+    async def _handle_secret_diary_body_api(self, scope, send, reference: str = ""):
+        """GET /api/secret-diaries/:reference — 秘密日记正文受保护读取。
+
+        - reference 前端经 encodeURIComponent 编码，此处 unquote 还原；
+        - 仅此受保护接口返回正文；非法格式 400；不存在 404（不区分"存在但禁止"）；
+          数据库异常 500（不回显异常原文）；
+        - 日志只记录异常类型，不记录完整 reference/title/正文。
+        """
+        if scope["method"] != "GET":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 GET"})
+            return
+        from urllib.parse import unquote as _unquote
+        ref = _unquote(reference or "").strip()
+        if not ref or len(ref) > 300:
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_REFERENCE",
+                                              "message": "reference 非法"})
+            return
+        try:
+            import home.service as _home_service
+            result = await asyncio.to_thread(_home_service.read_private_diary_body, ref)
+        except Exception as e:
+            _log(f"⚠️ [秘密日记正文] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            code = result.get("error_code") or "INTERNAL_ERROR"
+            if code == "INVALID_REFERENCE":
+                status_code, message = 400, "reference 非法"
+            elif code == "NOT_FOUND_OR_FORBIDDEN":
+                status_code, message = 404, "日记不存在"
+            else:
+                status_code, message = 500, "服务暂时不可用"
+            await _send_json_resp(send, status_code, {"ok": False, "error_code": code, "message": message})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "item": result.get("data", {})})
 
     async def _handle_emotion_page(self, send):
         """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""
