@@ -371,29 +371,35 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 | `PET_HOUSE_TICK_INTERVAL` | ❌ | `3600` | 宠物小屋 tick 间隔（秒）。默认 1 小时触发一次状态衰减。 |
 | `PET_HOUSE_TICK_ENABLED` | ❌ | `true` | 是否启用宠物小屋 tick。`false` 时关闭状态衰减、换房捣乱和自动工资结算。 |
 
-### 12.2 自由活动 + 工具调用循环
+### 12.2 统一自主活动调度（C5 起合并自由活动与 Home 自主生活）
 
-`heartbeat.py::async_free_activity` 的自主"自由活动"行为。
+🆕 **C5 起**，原"自由活动"（`async_free_activity`）与"Home 自主生活"（`async_home_autonomy_tick`）两个独立循环已合并为**唯一顶层自主调度**：`heartbeat.py::async_unified_autonomy`。每次唤醒构建统一候选（普通自由活动 + 外向活动 + 秘密日记 + Home 活动），模型只输出一个稳定 `activity_id`（来自 `activity_registry.py` 注册表），代码校验后进入对应执行器执行真实工具，一次唤醒只写一条 `activity_logs`（`source=unified_autonomy`）。
+
+- 模型输出非法/未候选 ID 或非 JSON → 本轮 `skipped`，**不随机兜底**；
+- 欲望引擎的旧中文建议经注册表映射为 `activity_id`，只在候选内作为倾向，不能绕过门控；
+- 防连续重复以规范 `activity_id` 计（`activity_logs` 优先、旧 `memories` 补足）；
+- 兼容叙事日志不变：普通活动写 `Free_Activity`、Home 活动写 `Home_Autonomy`、秘密日记只写 `home_private_diaries`；
+- 旧函数 `async_free_activity` / `async_home_autonomy_tick` 保留为兼容入口（仅供旧测试与手动诊断），**不再由后台主进程调度**；宠物状态 tick（`async_pet_house_tick`）与紧急照料链路独立运行，不受影响。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `FREE_ACTIVITY_ENABLED` | ❌ | `true` | 自由活动总开关。`false` 时整个协程不启动。 |
-| `FREE_ACTIVITY_INTERVAL` | ❌ | `5400` | 自由活动触发间隔（秒），默认 1.5 小时；实际还会叠加 ±900s 抖动 / 自主心跳动态间隔。 |
+| `FREE_ACTIVITY_ENABLED` | ❌ | `true` | **语义已变（C5）**：控制是否把普通自由/外向/秘密日记加入统一候选。`false` 时不代表整个统一循环退出——若 `HOME_AUTONOMY_ENABLED=true`，统一循环仍只跑 Home 候选。两者都 `false` 时统一循环退出。 |
+| `FREE_ACTIVITY_INTERVAL` | ❌ | `5400` | 普通自由活动启用时的基础间隔（秒）。仅 FREE 启用：动态心跳（`HEARTBEAT_AUTONOMY`）有值用动态值，否则本值 + ±900s 抖动；FREE+HOME 双启用：动态心跳有值用动态值，否则 `min(FREE_ACTIVITY_INTERVAL, HOME_AUTONOMY_INTERVAL)` + 抖动。 |
 | `FREE_ACTIVITY_TOOL_LOOP` | ❌ | `false` | 🆕 **工具调用循环开关（灰度）**。关：所有活动只走"单次 LLM 输出 `{activity, log}`"的轻量版（行为与改造前完全一致）。开：有工具的活动（如"记点小账"→`wallet_*`、"逛虚拟小屋"→`house_*`/`cat_*`）会真正调用 `home_system` 纯函数执行副作用，再基于真实工具结果生成 log。安全护栏：工具白名单 + 按 activity 动态裁剪 + JSON Schema 参数校验 + 固定身份注入（`wallet_id`/`user_id` 不让 LLM 控制）+ 单轮上限 + 错误隔离。详见 [tool_loop.py](tool_loop.py)。 |
 | `FREE_ACTIVITY_TOOL_MAX_CALLS` | ❌ | `5` | 🆕 单轮自由活动最多调用多少个工具（防 LLM 刷工具）。超出部分截断。 |
 | `TAOBAO_MCP_URL` | ❌ | 空 | 🆕 淘宝 MCP 的完整 Streamable HTTP 端点（通常是 `http://<host>:<port>/mcp`）。留空时“逛淘宝”不进入自由活动候选。端点必须包含实际 MCP 路径（一般是 `/mcp`）。⚠️ 不要默认用 `localhost`：网关运行在容器时 localhost 指向网关容器自身，应填淘宝 MCP 服务的实际可达地址。本变量仅用于自由活动“逛淘宝”，只调用 `search_taobao_products`（只逛不买），不涉及购买、下单、支付、加购物车或 `convert_taobao_link` 转链。 |
 
 > 💡 **开启建议**：先把 `FREE_ACTIVITY_TOOL_LOOP=true`，观察日志里 `🎈 [自由活动·工具循环] 工具 ...` 的执行结果一段时间，确认工具调用合理（没乱扣钱、没误删物品）再正式常开。默认关时零行为变化。
 
-### 12.3 Home Runtime 后台自主生活
+### 12.3 Home Runtime 后台自主生活（C5 起并入统一调度）
 
-`heartbeat.py::async_home_autonomy_tick` 的 Home Runtime 自主生活循环。让 AI 在后台自主观察家庭状态并决定做什么（种植/烹饪/写信/休息等）。仿宠物照料独立循环模式，与自由活动循环隔离。
+Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什么（种植/烹饪/写信/休息等）。🆕 **C5 起**不再有独立的 Home tick 协程：Home 活动作为候选进入 `async_unified_autonomy` 统一调度，按稳定 `activity_id`（`home:observe` 看看家里 / `home:letters` 写信或留便利贴 / `home:garden` 照料花园 / `home:kitchen` 做饭和用餐 / `home:rest` 在家休息 / `home:social` 陪伴家人）选择执行，可用工具 = 当前 phase 工具集 ∩ 该活动工具组。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
-| `HOME_AUTONOMY_ENABLED` | ❌ | `false` | Home Runtime 后台自主生活总开关。`false` 时整个协程不启动。 |
-| `HOME_AUTONOMY_PHASE` | ❌ | `0` | 🆕 **分层灰度**。`0`=关闭（不进循环）；`1`=只读观察（observe/list_letters，无副作用）；`2`=+低风险写入（write_letter/leave_note，限频控制日频次）；`3`=+资源类（plant/water/harvest/cook/eat/feed，冷却+状态机）；`4`=+基础生活（enter_room/rest/sleep/spend_time，最后接）。高 phase 含低 phase 全部工具。 |
-| `HOME_AUTONOMY_INTERVAL` | ❌ | `7200` | Home 自主生活触发间隔（秒），默认 2 小时。 |
+| `HOME_AUTONOMY_ENABLED` | ❌ | `false` | **语义已变（C5）**：控制是否把 Home 活动加入统一候选。`false` 时统一循环只跑普通自由/外向/秘密日记候选（若 `FREE_ACTIVITY_ENABLED=true`）。 |
+| `HOME_AUTONOMY_PHASE` | ❌ | `0` | 🆕 **分层灰度**。`0`=关闭（不进循环）；`1`=只读观察（observe/list_letters，无副作用）；`2`=+低风险写入（write_letter/leave_note，限频控制日频次）；`3`=+资源类（plant/water/harvest/cook/eat/feed，冷却+状态机）；`4`=+基础生活（enter_room/rest/sleep/spend_time，最后接）。高 phase 含低 phase 全部工具。同时决定 Home 候选分层：phase≥1 候选 `home:observe`、≥2 增 `home:letters`、≥3 增 `home:garden`/`home:kitchen`、≥4 增 `home:rest`/`home:social`。 |
+| `HOME_AUTONOMY_INTERVAL` | ❌ | `7200` | 🆕 **语义已变（C5）**：统一调度在 Home-only / 双启用场景下的基础间隔（秒），不再是独立 Home tick 的间隔。仅 HOME 启用时直接使用本值（不依赖动态心跳与 FREE 开关）。 |
 
 > 💡 **安全护栏**：固定身份（`actor_key="ai_primary"` 由 fixed_args 注入，LLM 无法覆盖）；幂等（`action_key` 由代码自动生成 `auto_{tool}_{ts}_{hex6}`，不让 LLM 控制，service 层 UNIQUE 约束兜底）；限频（写工具按 `_HOME_TOOL_COOLDOWN` 冷却，进程内存）；熔断（连续失败 3 次跳过该工具，进程内存）；单轮上限（`MAX_TOOL_CALLS=5`）；错误隔离（`call_tool` try/except 吞异常）。
 >
@@ -433,7 +439,7 @@ Gmail 收发 & Google 日历。需要 Google OAuth 用户令牌。
 |--------|:---:|--------|------|
 | `DESIRE_DRIVEN` | ❌ | `false` | **总闸**。关：只算 + 只存快照供观测，不覆盖行为。开：把「此刻最想做的事」作为倾向注入自由活动 prompt |
 | `DESIRE_COUPLING` | ❌ | `false` | v2① 维度耦合网。开：让驱动维度间联动（如压力大→更想念、累→不想探索），带全局阻尼防自激 |
-| `HEARTBEAT_AUTONOMY` | ❌ | `false` | v2⑤ 自主心跳。开：心跳间隔按张力/疲劳/时段动态变化（张力高醒得勤、累了拉长、深夜勿扰）。关：固定 15 分钟 |
+| `HEARTBEAT_AUTONOMY` | ❌ | `false` | v2⑤ 自主心跳。开：心跳间隔按张力/疲劳/时段动态变化（张力高醒得勤、累了拉长、深夜勿扰）。关：固定 15 分钟。🆕 C5 起：动态值同时作为统一自主调度（`async_unified_autonomy`）在 FREE 启用/双启用场景下的唤醒间隔；Home-only 场景不使用动态心跳，直接用 `HOME_AUTONOMY_INTERVAL` |
 | `DESIRE_BASELINE_DRIFT` | ❌ | `false` | v2④ 想念基线漂移。开：久没互动时 attachment 地板缓慢抬高（硬封顶 0.45，主人一互动就拉回）。🛑 安全阀：想念可涨但永不压人 |
 | `SLEEP_FROM_DEVICE` | ❌ | `false` | v2⑥ 设备睡眠同步。开：心跳每拍从 `device_data` 最新一条读真实睡眠（`sleepStartMs`/`sleepWakeupMs`），检测到新的一觉时注入 `sleep_start`+`sleep_end` 事件，让疲惫按真实睡眠时长回血/起床点重算（去重 + 时长 1~16h 校验）。关：疲惫走「清醒时长 + 昼夜节律」估算 |
 | `EMOTION_TZ_OFFSET` | ❌ | `8` | 情感引擎昼夜节律用的时区偏移（UTC+N）。默认东八区 |

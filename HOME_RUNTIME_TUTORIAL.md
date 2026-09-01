@@ -38,11 +38,12 @@ Home Runtime 是网关里一套**新的、显式的家庭生活工具系统**，
 
 ### ⚠️ 最关键的一条事实
 
-> **新 Home Runtime 只有在「用户或受控 Agent 明确调用工具」时才会执行。**
-> 工具存在 ≠ AI 已经会在后台自主种菜、做饭、写信或留便利贴。
-> **当前后台进程不会调用任何 Home Runtime 工具。**
+> **🆕 C5 前**：新 Home Runtime 只有在「用户或受控 Agent 明确调用工具」时才会执行；工具存在 ≠ AI 已经会在后台自主种菜、做饭、写信或留便利贴。
+> **🆕 C5 起**：统一自主调度可按 `activity_id` 真实调用部分 Home Runtime 工具（观察/种植/烹饪/信件/休息/陪伴，受 `HOME_AUTONOMY_ENABLED`（默认 false）与 `HOME_AUTONOMY_PHASE` 分层控制；可用工具 = 当前 phase 工具集 ∩ 该活动工具组）。
 
-后台进程（`background.py`）现在只做这些事：旧自由活动、旧秘密日记（写 `memories` 表 `Secret_Diary` 标签）、旧宠物 tick（状态衰减）、以及把一份**只读的 Home Context** 注进聊天提示词让 AI「知道」家里状态——但**不给它执行 Home 工具的能力**。
+> **🆕 C5 更新（2026-09-01）**：自统一自主调度上线后，本节早期的"后台不会调用任何 Home Runtime 工具"的说法已不再成立——Home 活动已并入统一调度，按 `activity_id` 真实执行（受 `HOME_AUTONOMY_ENABLED` + `HOME_AUTONOMY_PHASE` 分层控制，默认关闭）。下文第 8 节的"实施方案"大部分已按统一调度路径落地，保留作为设计沿革。
+
+后台进程（`heartbeat.py::run_background_process`）现在跑的顶层自主任务只有一个：**统一自主调度 `async_unified_autonomy`**（C5：自由活动 + 外向 + 秘密日记 + Home 活动统一候选、模型选一个稳定 `activity_id`、执行真实工具、一条 `activity_logs`）；此外还有旧宠物 tick（状态衰减）等任务。旧 `async_free_activity` / `async_home_autonomy_tick` 双循环仅保留为兼容入口，不再由后台主进程调度。
 
 ### 新系统与旧系统的关系
 
@@ -51,9 +52,9 @@ Home Runtime 是网关里一套**新的、显式的家庭生活工具系统**，
 | | 旧系统 | 新系统（Home Runtime） |
 |---|---|---|
 | 工具前缀 | `cat_*`、`house_*` | `home_*`、`plant_*`、`cook_*`、`write_letter`、`leave_note` 等 |
-| 后台是否自动跑 | ✅ 是（宠物 tick、自由活动自动运行） | ❌ 否（只能显式调用） |
+| 后台是否自动跑 | ✅ 是（宠物 tick；🆕 C5 起自由活动并入统一调度运行，`house_*` 不再进统一候选） | 🆕 C5 起按 phase 分层被统一调度真实调用（默认关：`HOME_AUTONOMY_ENABLED=false`）；也可显式调用 |
 | 小满生理状态 | `pets` 表负责（饱食/清洁/精力） | Home 只管「关系/情绪状态」 |
-| 私密日记 | `memories` 表 `Secret_Diary` 标签（后台仍在写） | `home_private_diaries` 表存在但为空，且 MCP 工具已移除 |
+| 私密日记 | `memories` 表 `Secret_Diary` 标签（🆕 C4 起新日记不再写，旧记录只读保留） | `home_private_diaries`（🆕 C4 起新秘密日记的唯一权威写入源） |
 
 **两者是分开的，不要直接比较。** 小满的「饱食度」来自旧 `pets` 表；Home 的 `home_member_states` 里小满那行只是初始化时从 `pets` 表拍的一张只读快照，之后不再同步。
 
@@ -353,6 +354,13 @@ Home 工具大多有**不可逆副作用**（种的菜、写的信、留的便�
 ---
 
 ## 8. 接入后台自主生活需要怎么做
+
+> **🆕 C5 状态更新（2026-09-01）**：本节是 C2-C4 之前的**实施方案**。如今该方案已大体按**统一自主调度**路径落地：
+> - 顶层只有一个 `heartbeat.py::async_unified_autonomy` 循环（不再有双独立循环）；
+> - Home 活动有稳定 `activity_id`（`home:observe`/`home:letters`/`home:garden`/`home:kitchen`/`home:rest`/`home:social`，注册表在 `activity_registry.py`）；
+> - 可用工具 = `HOME_AUTONOMY_PHASE` 工具集 ∩ 活动 `home_tool_group`，phase 分层与下文阶段 0-4 的灰度思想一致；
+> - `HOME_AUTONOMY_ENABLED=false` + `HOME_AUTONOMY_PHASE=0`（默认）时 Home 候选不出现。
+> 下文保留作为设计沿革，具体行为以 `VARIABLES.md` 第 12 节与 `test_unified_autonomy_c5.py` 为准。
 
 这一节是**实施方案**，当前**尚未实现**，是需要开发的工作。基于现有架构（`background.py` + `tool_loop.py`）给出可行路径。
 

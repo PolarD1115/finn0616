@@ -797,17 +797,46 @@ def archive_private_diary(diary_key: str, action_key: str, is_internal: bool = F
 # Phase 6: 统一私密日记索引（新旧合并元数据，不返回正文）
 # ============================================================
 
-def list_private_diary_index(limit: int = 50, offset: int = 0) -> dict:
+def get_recent_private_diary_context(limit: int = 4) -> list:
+    """C4：内部受控读取新旧秘密日记中时间最近的 limit 条（含正文）。
+
+    仅用于生成新秘密日记前的情绪/生活连续性参考：
+    不注册 MCP、不进普通搜索、不写 activity_logs、不返回给前端。
+    读取失败向上抛异常，由调用方降级（Prompt 中不伪造历史）。
+    """
+    return repo.fetch_recent_private_diary_context(limit)
+
+
+def _diary_index_sort_key(item: dict):
+    """统一索引排序键：有效时间在前按时间倒序，无效时间排最后。"""
+    ts = repo.parse_diary_time(item.get("created_at"))
+    if ts is None:
+        return (1, 0.0, 0)
+    return (0, -ts.timestamp(), 0)
+
+
+def list_private_diary_index(limit: int = 50, offset: int = 0, use_service_role: bool = False) -> dict:
     """统一私密日记索引：合并旧 memories.Secret_Diary 和新 home_private_diaries 元数据。
 
     返回结构：
     - items: [{reference, source, title, mood, created_at, status, is_archived}]
     - legacy_count: 旧日记总数
     - home_count: 新日记总数
-    - total: 返回条数
+    - total: 新旧两来源总条数
+    - has_more: 是否还有下一页
+
+    C4 分页修复：
+    - 旧来源从第 0 条取 offset+limit 条候选（修复原实现旧来源在 SQL 层已应用
+      offset、合并后又二次 offset 导致的翻页丢项）；
+    - 合并全局排序后再切片 [offset:offset+limit]；
+    - total 改为两来源真实总数（原实现误为本页条数）。
 
     不返回正文、embedding 或内部 UUID。
     reference 格式：legacy:<id> 或 home:<diary_key>
+
+    C6：use_service_role=True 时新日记元数据改走 service_role 直查
+    （仅供受保护网关 API 使用；生产环境该表未授予 anon SELECT policy，
+    anon 直查会静默返回空导致新日记在索引中整体消失）。
     """
     ok, err = validate_limit(limit, max_val=200)
     if not ok:
@@ -815,12 +844,16 @@ def list_private_diary_index(limit: int = 50, offset: int = 0) -> dict:
     if offset < 0:
         return err_result("offset 须 >= 0", "INVALID_OFFSET")
 
-    # 查询旧日记元数据（不查 content/embedding）
-    legacy_items = repo.fetch_legacy_secret_diaries(limit=limit, offset=offset)
+    # 查询旧日记元数据（不查 content/embedding）：从第 0 条取 offset+limit 条候选
+    fetch_n = offset + limit
+    legacy_items = repo.fetch_legacy_secret_diaries(limit=fetch_n, offset=0)
     legacy_count = repo.count_legacy_secret_diaries()
 
     # 查询新日记元数据（不查 content）
-    home_items = repo.fetch_private_diaries()
+    if use_service_role:
+        home_items = repo.fetch_private_diaries_service()
+    else:
+        home_items = repo.fetch_private_diaries()
 
     # 合并并统一格式
     merged = []
@@ -845,17 +878,19 @@ def list_private_diary_index(limit: int = 50, offset: int = 0) -> dict:
             "is_archived": item.get("status") == "archived",
         })
 
-    # 按 created_at 统一倒序
-    merged.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    # 按 created_at 统一倒序（无效时间排最后）
+    merged.sort(key=_diary_index_sort_key)
 
-    # 分页
+    # 对合并后的全局时间线分页
     paginated = merged[offset:offset + limit]
+    total = legacy_count + len(home_items)
 
     data = {
         "items": paginated,
         "legacy_count": legacy_count,
         "home_count": len(home_items),
-        "total": len(paginated),
+        "total": total,
+        "has_more": (offset + limit) < total,
     }
     return ok_result("统一私密日记索引", data)
 
@@ -895,3 +930,250 @@ def read_private_diary_by_reference(reference: str, is_internal: bool = False) -
         return repo.rpc_read_private_diary("internal_read", key)
     else:
         return err_result("不支持的来源", "INVALID_REFERENCE")
+
+
+# ============================================================
+# C6: 受保护前端聚合视图与秘密日记正文读取
+# ============================================================
+
+def home_state_overview() -> dict:
+    """C6：Home 前端聚合只读视图（零副作用、安全投影，供受保护网关 API 使用）。
+
+    - 成员视图复用 _compose_member_view（宠物生理状态来自 pets 权威源）；
+    - 花园刻意不使用 garden_observe：其内部 fetch_plants_settled 会触发
+      rpc_home_settle_plants 结算写入，GET 聚合不允许产生任何写副作用，
+      改用 fetch_plants() 原始查询（stage/health 可能为上次结算时的快照）；
+    - 全部区块逐一 try/except：单块失败不伪造为空，该块置 None 并在
+      errors 中标记 UNAVAILABLE，其余区块照常返回；
+    - 事件只保留 visibility ∉ {private, system}，summary 截断 200 字，
+      room/actor/target UUID 全部换名为展示名；
+    - 不返回内部 UUID、秘密日记正文、未拆信与便利贴全文、任何工具参数。
+    """
+    errors = {}
+
+    # ---- 房间（id→名称/键 映射仅供本函数投影使用，不外发 id）----
+    rooms_raw = []
+    try:
+        rooms_raw = repo.fetch_rooms(enabled_only=True, include_hidden=False)
+    except Exception:
+        errors["rooms"] = "UNAVAILABLE"
+    room_name = {r.get("id"): (r.get("name") or "") for r in rooms_raw if r.get("id")}
+    room_key = {r.get("id"): (r.get("stable_key") or "") for r in rooms_raw if r.get("id")}
+    rooms = [
+        {
+            "stable_key": r.get("stable_key", ""),
+            "name": r.get("name", ""),
+            "emoji": r.get("emoji", ""),
+            "room_type": r.get("room_type", ""),
+            "description": r.get("description", ""),
+            "sort_order": r.get("sort_order", 0),
+            "is_enabled": r.get("is_enabled", True),
+            "is_hidden": r.get("is_hidden", False),
+        }
+        for r in rooms_raw
+    ]
+
+    # ---- 成员（与 observe_home 相同的组合逻辑；内部 UUID 换名为房间名）----
+    members_raw = []
+    try:
+        members_raw = repo.fetch_members(active_only=True)
+    except Exception:
+        errors["members"] = "UNAVAILABLE"
+    member_name = {m.get("id"): (m.get("name") or "") for m in members_raw if m.get("id")}
+    members = []
+    try:
+        member_ids = [m.get("id") for m in members_raw if m.get("id")]
+        states_raw = repo.fetch_member_states(member_ids)
+        state_map = {s.get("member_id"): s for s in states_raw if s.get("member_id")}
+        for m in members_raw:
+            view = _compose_member_view(m, state_map.get(m.get("id")))
+            if isinstance(view, dict):
+                room_id = view.pop("current_room_id", None)
+                if room_id and not view.get("current_room_name"):
+                    view["current_room_name"] = room_name.get(room_id)
+            members.append({
+                "stable_key": m.get("stable_key", ""),
+                "name": m.get("name", ""),
+                "member_type": m.get("member_type", ""),
+                "lifecycle_status": m.get("lifecycle_status", ""),
+                "current_room_name": view.get("current_room_name") if isinstance(view, dict) else None,
+                "state": view,
+            })
+    except Exception:
+        errors["members"] = "UNAVAILABLE"
+
+    # ---- 花园（原始查询，不结算、零写入）----
+    plants = None
+    seeds = None
+    try:
+        plants_raw = repo.fetch_plants()
+        plants = [
+            {
+                "name": p.get("name", ""),
+                "seed_key": p.get("seed_key", ""),
+                "stage": p.get("stage", ""),
+                "health": p.get("health"),
+                "water_level": p.get("water_level"),
+                "status": p.get("status", ""),
+                "is_mature": p.get("stage") == "mature",
+                "planted_at": p.get("planted_at"),
+            }
+            for p in plants_raw
+        ]
+        seeds = [
+            {"stable_key": s.get("stable_key", ""), "name": s.get("name", ""), "emoji": s.get("emoji", "")}
+            for s in repo.fetch_seed_catalog()
+        ]
+    except Exception:
+        errors["garden"] = "UNAVAILABLE"
+
+    # ---- 厨房（菜品不含 id，本阶段无喂食/烹饪写按钮）----
+    kitchen = None
+    try:
+        kitchen = {
+            "inventory": [
+                {
+                    "item_key": i.get("item_key", ""),
+                    "item_kind": i.get("item_kind", ""),
+                    "storage_location": i.get("storage_location", ""),
+                    "quantity": i.get("quantity"),
+                    "unit": i.get("unit", ""),
+                }
+                for i in repo.fetch_inventory()
+            ],
+            "dishes": [
+                {
+                    "name": d.get("name", ""),
+                    "emoji": d.get("emoji", ""),
+                    "servings": d.get("servings", 0),
+                    "quality": d.get("quality"),
+                }
+                for d in repo.fetch_dishes()
+            ],
+            "recipes": [
+                {"stable_key": r.get("stable_key", ""), "name": r.get("name", ""), "emoji": r.get("emoji", "")}
+                for r in repo.fetch_recipe_catalog()
+            ],
+        }
+    except Exception:
+        errors["kitchen"] = "UNAVAILABLE"
+
+    # ---- 信件（复用 list_letters：letter_key/title/preview/status，不含正文）----
+    letters = None
+    try:
+        lr = list_letters()
+        if lr.get("ok"):
+            letters = lr.get("data", {}).get("letters", [])
+        else:
+            errors["letters"] = lr.get("error_code") or "UNAVAILABLE"
+    except Exception:
+        errors["letters"] = "UNAVAILABLE"
+
+    # ---- 便利贴摘要（service_role，预览截断，不含全文）----
+    notes = None
+    try:
+        notes = [
+            {
+                "note_key": n.get("note_key", ""),
+                "room_key": room_key.get(n.get("room_id"), ""),
+                "room_name": room_name.get(n.get("room_id"), ""),
+                "preview": n.get("preview", ""),
+                "status": n.get("status", ""),
+                "created_at": n.get("created_at"),
+            }
+            for n in repo.fetch_recent_notes(limit=20)
+        ]
+    except Exception:
+        errors["notes"] = "UNAVAILABLE"
+
+    # ---- 家庭时间线：事件（排除 private/system，UUID 换名，summary 截断）----
+    recent_events = None
+    try:
+        recent_events = []
+        for ev in repo.fetch_recent_events(limit=20, exclude_private=True):
+            if ev.get("visibility") in ("private", "system"):
+                continue
+            summary = ev.get("summary", "")
+            recent_events.append({
+                "event_type": ev.get("event_type", ""),
+                "summary": summary[:200] if isinstance(summary, str) else "",
+                "occurred_at": ev.get("occurred_at"),
+                "room_name": room_name.get(ev.get("room_id"), ""),
+                "actor_name": member_name.get(ev.get("actor_member_id"), ""),
+                "target_name": member_name.get(ev.get("target_member_id"), ""),
+            })
+    except Exception:
+        errors["recent_events"] = "UNAVAILABLE"
+
+    # ---- 家庭时间线：行动记录（列白名单在 repository 查询层保证）----
+    recent_runs = None
+    try:
+        recent_runs = [
+            {
+                "action_type": r.get("action_type", ""),
+                "status": r.get("status", ""),
+                "error_code": r.get("error_code") or "",
+                "requested_at": r.get("requested_at"),
+                "finished_at": r.get("finished_at"),
+            }
+            for r in repo.fetch_recent_action_runs(limit=20)
+        ]
+    except Exception:
+        errors["recent_runs"] = "UNAVAILABLE"
+
+    # ---- 计数 ----
+    counts = None
+    try:
+        counts = {
+            "member_count": len(members),
+            "room_count": len(rooms),
+            "plant_count": len(plants or []),
+            "dish_count": len((kitchen or {}).get("dishes", [])),
+            "unread_letter_count": repo.fetch_unopened_letter_count(),
+            "note_count": len(notes or []),
+            "recent_event_count": len(recent_events or []),
+            "recent_run_count": len(recent_runs or []),
+        }
+    except Exception:
+        errors["counts"] = "UNAVAILABLE"
+
+    data = {
+        "rooms": rooms,
+        "members": members,
+        "plants": plants,
+        "seeds": seeds,
+        "kitchen": kitchen,
+        "letters": letters,
+        "notes": notes,
+        "recent_events": recent_events,
+        "recent_runs": recent_runs,
+        "counts": counts,
+        "errors": errors,
+    }
+    return ok_result("Home 聚合视图", data)
+
+
+def read_private_diary_body(reference: str) -> dict:
+    """C6：受保护读取秘密日记正文（仅供网关受保护 API 使用）。
+
+    与 read_private_diary_by_reference 的区别：
+    - home 引用走 repo.fetch_private_diary_by_reference（service_role 直查、
+      零副作用、不写 home_action_runs、无 action_key），同一引用可重复读取，
+      彻底避开固定 internal_read 二次读取撞 ACTION_EXISTS 的问题；
+    - 不注册 MCP、不进普通搜索、不进聊天上下文；
+    - 错误码：INVALID_REFERENCE / NOT_FOUND_OR_FORBIDDEN / SERVICE_KEY_MISSING / DB_ERROR。
+    """
+    try:
+        item = repo.fetch_private_diary_by_reference(reference)
+    except ValueError:
+        return err_result("reference 格式非法", "INVALID_REFERENCE")
+    except RuntimeError as e:
+        if "SERVICE_KEY_MISSING" in str(e):
+            return err_result("数据库服务密钥未配置", "SERVICE_KEY_MISSING")
+        return err_result("读取失败", "DB_ERROR")
+    except Exception:
+        return err_result("读取失败", "DB_ERROR")
+    if item is None:
+        # 不区分"存在但禁止"与"不存在"
+        return err_result("日记不存在", "NOT_FOUND_OR_FORBIDDEN")
+    return ok_result("秘密日记读取", item)

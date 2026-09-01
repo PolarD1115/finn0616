@@ -46,6 +46,16 @@ Thumbs.db
 
 # ====== 新增：防止测试和临时垃圾文件混入 ======
 test_*.py
+# C1.1：hungry_cat 喂食优先级专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_pet_feed_priority.py
+# C2：Home 多轮工具执行专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_home_autonomy_loop.py
+# C3：结构化行动日志专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_activity_logs.py
+# C4：秘密日记权威写入切换专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_secret_diary_c4.py
+# C5：统一自主活动调度专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_unified_autonomy_c5.py
 *_scan*
 tmp_*.py
 -p/
@@ -60,3 +70,5 @@ files.txt
 # 如果除了 requirements.txt 之外都不想追踪 txt 文件
 *.txt
 !requirements.txt
+# C6：Home/行动日志/秘密日记前端 API 专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_home_api_c6.py

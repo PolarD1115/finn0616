@@ -44,8 +44,8 @@ Home Runtime 是一套**新的、显式的工具系统**，覆盖：房间观察
 
 项目里同时存在「旧系统」和「新系统」：
 
-- **旧系统**：`cat_*` 宠物工具、`house_*` 小屋工具、旧自由活动、旧秘密日记（写在 `memories` 表，标签 `Secret_Diary`）、旧宠物 tick。这些**仍在后台自动运行**。
-- **新系统**：Home Runtime 的 `home_*`、`plant_*`、`cook_*`、`write_letter`、`leave_note` 等。这些是**显式工具**，后台不自动调用。
+- **旧系统**：`cat_*` 宠物工具、`house_*` 小屋工具、旧秘密日记（写在 `memories` 表，标签 `Secret_Diary`，只读保留）、旧宠物 tick。宠物 tick 仍在后台自动运行；🆕 C5 起旧自由活动循环不再由后台主进程调度，已并入统一自主调度（Home 活动走真实 `home_*` 工具）；`house_*` 工具保留但不再进入统一自主候选。
+- **新系统**：Home Runtime 的 `home_*`、`plant_*`、`cook_*`、`write_letter`、`leave_note` 等。这些是**显式工具**；🆕 C5 起部分工具（观察/种植/烹饪/信件/休息/陪伴，按 phase 分层）已可被统一自主调度按 `activity_id` 真实调用。
 
 小满（宠物猫）的**生理状态**（饱食度、清洁度、精力等）由旧 `pets` 系统负责；Home Runtime 的 `home_member_states` 只负责**关系/情绪状态**。两者是分开的，不应直接比较。
 
@@ -567,28 +567,31 @@ action_550e8400e29b41d4a716446655440000
 
 ## 11. 当前后台行为
 
-> ⚠️ **请特别注意以下事实**：
+> ⚠️ **C5 起本节已按统一自主调度现状更新**（更早的历史描述见下文备注）：
 
 ```text
-当前旧后台仍会：
-- 执行旧自由活动（free activity）
-- 写旧 Secret_Diary（memories 表，标签 Secret_Diary）
-- 执行旧宠物 tick（cat_tick，状态衰减）
-- 产生旧宠物事件（hungry_cat / dirty_cat / tired_cat 等阈值事件）
+当前后台（C5 统一自主调度 async_unified_autonomy）会：
+- 按统一候选（普通自由活动 + 外向 + 秘密日记 + Home 活动）让模型选择一个稳定 activity_id
+- Home 候选按 HOME_AUTONOMY_PHASE 分层，选中后执行真实 Home 工具
+  （home:observe 看看家里 / home:garden 照料花园 / home:kitchen 做饭和用餐 等），
+  可用工具 = 当前 phase 工具集 ∩ 该活动工具组
+- 执行旧宠物 tick（cat_tick，状态衰减）与紧急照料链路（不属于统一调度）
+- 秘密日记只写 home_private_diaries（C4 起权威源）
 
-当前旧后台不会：
-- 调用新种植工具（plant_seed 等）
-- 调用新烹饪工具（cook_recipe 等）
-- 写新 Home Runtime 信件（write_letter）
-- 写新便利贴（leave_note）
-- 写新 home_private_diaries
+当前后台不会：
+- 再启动旧 async_free_activity / async_home_autonomy_tick 双循环（仅保留为兼容入口）
+- 通过"逛虚拟小屋"开放 house_do/house_put/house_take/house_update_desc（旧工具保留但不进统一候选）
+- 模型输出非法 activity_id 时随机兜底执行另一个活动
+- 写旧 memories.Secret_Diary（C4 起新日记不写旧表）
 ```
 
 进一步说明：
 
-- **Home Context 注入后台 ≠ 后台执行 Home 工具**。后台的 LLM 调用会注入只读的 Home Context 文本（让模型"知道"家里状态），但后台的工具白名单里**没有任何 Home 工具**，模型无法调用它们。
-- 若希望 AI 真正在后台自主使用新系统（自动种植、烹饪等），需要**未来单独开发和验收**，当前项目**明确没有实现**该功能。
+- **统一调度每次唤醒只产生一条 `activity_logs`**（`source=unified_autonomy`），start 位于选择模型与所有真实副作用之前；两个旧执行器内部都不再管理顶层日志。
+- 欲望引擎（DESIRE_DRIVEN）的旧中文建议经 `activity_registry.py` 映射为 `activity_id`，只在本轮候选内作为倾向，不能绕过淘宝/冲浪门控、Home phase 与 FREE/HOME 开关。
+- 防连续重复以规范 `activity_id` 计（`activity_logs` 的 `unified_autonomy`/`free_activity`/`home_autonomy` 三个 source 兼容，旧 `memories` 补足）。
 - `pet_agent_outbound` 表当前有 9 条 `pending` 记录，但**没有消费者**（死队列）——后台的宠物照料实际走的是 RPC 返回值里的 `threshold_event`，不经过这个队列。
+- 下文第 12 节"功能状态表"为 C2 之前的历史快照，其中"后台自主调用 ❌"的表述已被 C5 统一调度的 Home 工具执行取代；真实数据库写链仍以实际验收为准。
 
 ---
 

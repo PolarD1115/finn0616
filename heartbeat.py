@@ -390,31 +390,123 @@ async def _perform_deep_dreaming():
 # 1.6 自由活动 (自主决定这段时间做什么)
 # ==========================================
 
-# 可选活动清单：模型从中自选。描述用于提示，key 用于行动日志去重判断。
-_FREE_ACTIVITIES = [
-    ("写秘密日记", "记录此刻的心情或一个只属于自己的小念头"),
-    ("逛虚拟小屋", "在小家里做点事——看书/做饭/听音乐/发呆/照料阳台"),
-    ("查天气", "看看外面的天气，联想到和对方有关的事"),
-    ("抽张塔罗", "给自己或对方今天的状态抽一张塔罗，随便玩玩"),
-    ("翻旧回忆", "想起一段和对方的旧记忆，回味一下"),
-    ("发呆放空", "什么正事都不做，单纯发会儿呆，想点有的没的"),
-    ("记点小账", "回想有没有值得记的小花销，或往储蓄罐里存点心意"),
-    # ↓↓↓ 外向型：这几种会真的把内容推送给对方（见 _OUTGOING_ACTIVITIES） ↓↓↓
-    ("想对方了", "突然想她了，给她发一条短短的话——可以是撒娇/担心/分享/想念"),
-    ("分享发现", "看到/想到一个有趣的东西想跟她分享"),
-    ("偷偷关心", "惦记她最近的状态，发一条不经意的关心"),
-    # ↓↓↓ 真实工具活动：依赖外部工具结果，工具循环关闭(TAOBAO_MCP_URL空/FREE_ACTIVITY_TOOL_LOOP=false)时不进入候选 ↓↓↓
-    ("逛淘宝", "逛逛淘宝看看新奇东西或挑礼物灵感（只逛不买）"),
-    ("网上冲浪", "搜搜网页看看新知识、热点或有趣话题"),
-]
+# C5：活动清单单一权威源为 activity_registry.py（稳定 activity_id 注册表）。
+# 此处与 tool_loop._FREE_ACTIVITIES 均由注册表派生，不再各自维护两份列表。
+# 旧兼容循环（async_free_activity，不由后台主进程调度）与统一调度共用此源。
+import activity_registry as _areg
+
+_FREE_ACTIVITIES = _areg.free_activity_entries()
 
 # 外向型活动：这些做完后除了写日志，还会通过 _push_wechat 真的推送给对方
-_OUTGOING_ACTIVITIES = {"想对方了", "分享发现", "偷偷关心"}
+_OUTGOING_ACTIVITIES = _areg.outgoing_names()
+
+# 📒 C3 行动日志：旧循环用的自由活动名 → slug 映射（legacy 兼容，仅旧 finalize 路径
+# 使用；统一调度直接使用注册表稳定 activity_id，不走本映射）。
+_FREE_ACTIVITY_SLUGS = {
+    "写秘密日记": "secret_diary", "逛虚拟小屋": "virtual_house", "查天气": "weather",
+    "抽张塔罗": "tarot", "翻旧回忆": "memory_recall", "发呆放空": "idle",
+    "记点小账": "bookkeeping", "想对方了": "outgoing_missing", "分享发现": "outgoing_share",
+    "偷偷关心": "outgoing_care", "逛淘宝": "taobao", "网上冲浪": "web_surf",
+}
+
+
+def _free_activity_log_meta(activity: str, meta: dict, log_text: str):
+    """C3：从工具循环元数据得到 (status, thought_summary, result_summary)。
+
+    - 状态映射（基于真实工具业务结果）：无工具调用 → succeeded；
+      全部业务失败 → failed；有成功也有失败/跳过 → partial；否则 succeeded。
+    - 敏感活动固定文案脱敏：秘密日记/外向消息的正文绝不进入行动日志；
+      翻旧回忆/逛淘宝/网上冲浪的工具结果与查询词不进入 result_summary。
+    - thought_summary 来自模型 stage1 明确生成的可展示摘要（已清洗），
+      秘密日记与外向活动改用固定文案，防止正文经 thought 泄露。
+    - C4：秘密日记以新表（home_private_diaries）写入结果为准——
+      meta["diary_persist_ok"] 为 False（写入失败/异常）→ 强制 failed
+      + 固定脱敏失败文案；成功或未标记（兼容旧 meta）→ 固定成功文案。
+    """
+    tool_total = int(meta.get("tool_total") or 0)
+    tool_ok = int(meta.get("tool_ok") or 0)
+    tool_fail = int(meta.get("tool_fail") or 0)
+    tool_skip = int(meta.get("tool_skip") or 0)
+    if tool_total == 0:
+        status = "succeeded"
+    elif tool_ok == 0 and tool_fail > 0:
+        status = "failed"
+    elif tool_ok > 0 and (tool_fail > 0 or tool_skip > 0):
+        status = "partial"
+    else:
+        status = "succeeded"
+    thought = meta.get("thought_summary") or ""
+    if activity == "写秘密日记":
+        if meta.get("diary_persist_ok") is False:
+            return "failed", "想写点只给自己看的记录", "尝试写秘密日记，但这次没有保存成功。"
+        return status, "想写点只给自己看的记录", "写了一篇秘密日记。"
+    if activity in _OUTGOING_ACTIVITIES:
+        sent = ("生成并发送了一条主动消息。" if status != "failed"
+                else "想发条消息，但这次没有发送成功。")
+        return status, "想跟她说句话。", sent
+    if activity == "翻旧回忆":
+        return status, thought, "翻了翻旧回忆。"
+    if activity == "逛淘宝":
+        return status, thought, "逛了逛淘宝找礼物灵感。"
+    if activity == "网上冲浪":
+        return status, thought, "浏览了一些网页内容。"
+    return status, thought, (log_text or "")[:300]
+
+
+def _parse_activity_row_time(value):
+    """解析 Supabase 时间字符串为 aware datetime；失败返回 None（不抛异常）。"""
+    try:
+        ts = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        return ts if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _merge_recent_activity_names(log_rows, memory_rows, limit=2, window_seconds=900):
+    """C4：合并 activity_logs 与旧 memories 两个来源的最近活动名（防连续重复用）。
+
+    - log_rows：activity_logs 行（activity_name/started_at），C3 起的权威源；
+    - memory_rows：memories 行（title="🎈 自由活动·X" / "🔒 秘密日记·X"、
+      created_at），C3 之前的历史兼容源；
+    - 按时间倒序（无效时间排后、保持稳定次序）；同一次执行在两个来源各出现一次
+      （活动名相同且时间接近），按 15 分钟窗口去重；
+    - 只返回活动名列表（最多 limit 条），不读取任何正文。
+    """
+    rows = []
+    for seq, r in enumerate(log_rows or []):
+        name = (r.get("activity_name") or "").strip() if isinstance(r, dict) else ""
+        if name:
+            rows.append((name, _parse_activity_row_time(r.get("started_at")), seq))
+    for seq, m in enumerate(memory_rows or []):
+        t = (m.get("title") or "") if isinstance(m, dict) else ""
+        if "·" in t:
+            name = t.split("·", 1)[1].strip()
+            if name:
+                rows.append((name, _parse_activity_row_time(m.get("created_at")), seq))
+    rows.sort(key=lambda x: (0 if x[1] is not None else 1,
+                             -x[1].timestamp() if x[1] is not None else 0.0,
+                             x[2]))
+    merged = []
+    for name, ts, _seq in rows:
+        if len(merged) >= limit:
+            break
+        dup = any(n == name and ts is not None and t2 is not None
+                  and abs((ts - t2).total_seconds()) <= window_seconds
+                  for n, t2, _s in merged)
+        if dup:
+            continue
+        merged.append((name, ts, _seq))
+    return [n for n, _t, _s in merged]
 
 
 async def async_free_activity():
     """🎈 自由活动：随机间隔醒来一次，让模型自主决定这段时间做点什么，
     做完写一条行动日志留档。带防连续重复机制（连续两轮做同一件事会被强制换）。
+
+    ⚠️ C5 兼容入口（弃用）：不由后台主进程（run_background_process）调度——
+    生产主入口只启动 async_unified_autonomy 统一自主循环。本函数保留旧
+    while True 循环供旧测试/手动诊断调用，禁止与统一循环同时常驻：
+    若与统一循环并发启动，会出现两个独立决策过程与重复 activity_logs。
     """
     from server import (
         _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
@@ -432,25 +524,37 @@ async def async_free_activity():
         return
 
     _TAG = "Free_Activity"
-    # 防连续重复要同时覆盖普通自由活动与秘密日记（两者标题都按 "·" 提取活动名）
+    # 防连续重复：memories 兼容源同时覆盖普通自由活动与旧秘密日记（标题都按 "·" 提取）。
+    # C4：新秘密日记只写 home_private_diaries、不再新增 memories.Secret_Diary，
+    # 防重复改为 activity_logs（C3 起权威源）优先、旧 memories 按时间补足。
     _ACTIVITY_TAGS = ["Free_Activity", "Secret_Diary"]
+    # C4：_recent_activity_keys 闭包依赖 home.activity_log（activity_logs 权威源读取），
+    # 必须在首次调用前完成导入。
+    import home.activity_log as _alog
 
     def _recent_activity_keys(limit=2):
-        """读最近 N 条行动日志的活动名，用于判断是否连续重复。"""
-        if not supabase:
-            return []
+        """读最近 N 条已完成自由活动的活动名（activity_logs 优先，memories 补足）。
+
+        - activity_logs：source=free_activity 且 succeeded/partial（failed/skipped
+          不算"已经做过"；running 的当前/残留活动不参与）；
+        - 不足 limit 条时用旧 memories（Free_Activity/Secret_Diary）补足；
+        - 只返回活动名，不读取任何正文。
+        """
+        log_rows = []
         try:
-            r = (supabase.table("memories").select("title")
-                 .in_("tags", _ACTIVITY_TAGS).order("created_at", desc=True).limit(limit).execute())
-            # title 形如 "🎈 自由活动·写秘密日记"
-            keys = []
-            for row in (r.data or []):
-                t = row.get("title", "")
-                if "·" in t:
-                    keys.append(t.split("·", 1)[1].strip())
-            return keys
-        except Exception:
-            return []
+            log_rows = _alog.get_recent_completed_free_activities(limit=limit)
+        except Exception as _ale:
+            print(f"📒 [防重复] activity_logs 读取失败，回退 memories：{type(_ale).__name__}")
+        memory_rows = []
+        if len(log_rows) < limit and supabase:
+            try:
+                r = (supabase.table("memories").select("title,created_at")
+                     .in_("tags", _ACTIVITY_TAGS).order("created_at", desc=True)
+                     .limit(limit).execute())
+                memory_rows = r.data or []
+            except Exception:
+                memory_rows = []
+        return _merge_recent_activity_names(log_rows, memory_rows, limit=limit)
 
     while True:
         # v2⑤ 自主心跳：若开启（HEARTBEAT_AUTONOMY），用上一拍算出的动态间隔醒来；
@@ -549,53 +653,96 @@ async def async_free_activity():
             #   再基于真实工具结果生成 log。安全护栏：白名单 + 按 activity 动态裁剪
             #   + JSON Schema 参数校验 + 单轮上限 + 错误隔离 + 固定身份注入。
             import tool_loop
-            _fa_result = await tool_loop.run_free_activity_tool_loop(
-                client=None,
-                ask_llm=_ask_bg_role,
-                system_ctx=system_ctx,
-                now_bj=now_bj,
-                avoid=avoid,
-                desire_hint=desire_hint,
-                desire_snapshot=snap,
-                desire_suggested_activity=suggested,
-            )
-            if _fa_result is None:
-                # 循环内部已打印跳过原因
+            # 📒 C3：start-before-side-effect——running 记录建立失败则本轮不执行任何真实副作用
+            import secrets as _secrets
+            import home.activity_log as _alog
+            _act_key = f"fa_{now_bj.strftime('%Y%m%d%H%M%S')}_{_secrets.token_hex(3)}"
+            _started = await asyncio.to_thread(_alog.start_activity_log, _act_key, "free_activity")
+            if not _started.get("ok") or _started.get("already_final"):
+                print(f"📒 [行动日志] running 记录建立失败"
+                      f"（{_started.get('error_code', '已存在')}），本轮自由活动跳过")
                 continue
-            activity, log_text = _fa_result
 
-            # 🔒 写秘密日记单独保存为 Secret_Diary（不进 Free_Activity，不发 Telegram）；
-            # 其余活动（含外向）继续保存为普通自由活动日志。
-            if activity == "写秘密日记":
-                await asyncio.to_thread(
-                    _save_memory_to_db,
-                    "🔒 秘密日记·写秘密日记", log_text, "日记", "平静", "Secret_Diary"
+            _meta = {}
+            try:
+                _fa_result = await tool_loop.run_free_activity_tool_loop(
+                    client=None,
+                    ask_llm=_ask_bg_role,
+                    system_ctx=system_ctx,
+                    now_bj=now_bj,
+                    avoid=avoid,
+                    desire_hint=desire_hint,
+                    desire_snapshot=snap,
+                    desire_suggested_activity=suggested,
+                    meta_out=_meta,
+                    activity_key=_act_key,
                 )
-            else:
-                await asyncio.to_thread(
-                    _save_memory_to_db,
-                    f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
-                )
+                if _fa_result is None:
+                    # 循环内部已打印跳过原因
+                    await asyncio.to_thread(
+                        _alog.finalize_activity_log, _act_key,
+                        activity_id="free:unknown", activity_name="",
+                        status="skipped", result_summary="本轮未执行任何活动。")
+                    continue
+                activity, log_text = _fa_result
 
-            # 欲望驱动：做完活动后对相关驱动条做针对性回落 + 进入不应期。
-            # 规则（对齐 gating）：
-            #   - DESIRE_DRIVEN=False：只观测、不执行 satisfy（不覆盖行为也不改冷却）。
-            #   - wildcard 触发：不可归因，"说不上来就突然想"，不 satisfy。
-            #   - 其余：satisfy_action 回落对应维度并置入不应期。
-            if desire_intent is not None and desire_driven and not desire_intent.is_wildcard:
+                # 🔒 C4 写入源切换：秘密日记正文已由工具循环写入
+                # home_private_diaries（唯一权威源，失败不回退旧表不双写），
+                # heartbeat 不再写 memories.Secret_Diary；
+                # 其余活动（含外向）仍保存为普通 Free_Activity 日志。
+                _diary_persist_failed = _meta.get("diary_persist_ok") is False
+                if activity != "写秘密日记":
+                    await asyncio.to_thread(
+                        _save_memory_to_db,
+                        f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
+                    )
+
+                # 欲望驱动：做完活动后对相关驱动条做针对性回落 + 进入不应期。
+                # 规则（对齐 gating）：
+                #   - DESIRE_DRIVEN=False：只观测、不执行 satisfy（不覆盖行为也不改冷却）。
+                #   - wildcard 触发：不可归因，"说不上来就突然想"，不 satisfy。
+                #   - C4：秘密日记新表写入失败时不 satisfy（持久化未成功）。
+                #   - 其余：satisfy_action 回落对应维度并置入不应期。
+                if (desire_intent is not None and desire_driven
+                        and not desire_intent.is_wildcard and not _diary_persist_failed):
+                    try:
+                        import desire_bridge
+                        await asyncio.to_thread(desire_bridge.satisfy_action, desire_intent.want_action)
+                    except Exception as _se:
+                        print(f"💗 [欲望驱动] satisfy 跳过：{_se}")
+
+                # 外向型活动（想对方了/分享发现/偷偷关心）：除了写日志，还真的把内容推送出去。
+                # plain=True → 不带标题前缀，像平时聊天一样自然发出。
+                if activity in _OUTGOING_ACTIVITIES:
+                    await asyncio.to_thread(_push_wechat, log_text, "想你了", True)
+                    print(f"💭 [自由活动] 外向活动「{activity}」已推送：{log_text[:30]}...")
+                elif activity == "写秘密日记":
+                    # 🔒 正文永不入服务日志（C4）
+                    print("🔒 [自由活动] 秘密日记已处理（正文不入日志）")
+                else:
+                    print(f"🎈 [自由活动] 做了「{activity}」：{log_text[:30]}...")
+
+                # 📒 C3 finalize：按真实工具结果定状态；秘密日记/外向/搜索类脱敏固定文案
+                _aid = ("free:secret_diary" if activity == "写秘密日记"
+                        else "free:" + _FREE_ACTIVITY_SLUGS.get(activity, "unknown_activity"))
+                _status, _thought, _result = _free_activity_log_meta(activity, _meta, log_text)
+                _fin = await asyncio.to_thread(
+                    _alog.finalize_activity_log, _act_key,
+                    activity_id=_aid, activity_name=activity, status=_status,
+                    thought_summary=_thought, result_summary=_result,
+                    tools_used=_meta.get("tools_used") or [])
+                if not _fin.get("ok"):
+                    print(f"📒 [行动日志] finalize 失败（{_fin.get('error_code')}），"
+                          f"该活动可能停留 running，需人工核查 activity_logs")
+            except Exception as _act_err:
+                # 📒 C3：异常路径尝试 finalize 为 failed（堆栈只进服务日志，不入库）
                 try:
-                    import desire_bridge
-                    await asyncio.to_thread(desire_bridge.satisfy_action, desire_intent.want_action)
-                except Exception as _se:
-                    print(f"💗 [欲望驱动] satisfy 跳过：{_se}")
-
-            # 外向型活动（想对方了/分享发现/偷偷关心）：除了写日志，还真的把内容推送出去。
-            # plain=True → 不带标题前缀，像平时聊天一样自然发出。
-            if activity in _OUTGOING_ACTIVITIES:
-                await asyncio.to_thread(_push_wechat, log_text, "想你了", True)
-                print(f"💭 [自由活动] 外向活动「{activity}」已推送：{log_text[:30]}...")
-            else:
-                print(f"🎈 [自由活动] 做了「{activity}」：{log_text[:30]}...")
+                    await asyncio.to_thread(
+                        _alog.fail_activity_log, _act_key,
+                        f"自由活动异常：{type(_act_err).__name__}")
+                except Exception as _fe:
+                    print(f"📒 [行动日志] 异常路径 finalize 失败: {_fe}")
+                raise
         except Exception as e:
             print(f"❌ 自由活动出错: {e}")
 
@@ -1449,6 +1596,10 @@ async def async_home_autonomy_tick():
 
     灰度分层由 HOME_AUTONOMY_PHASE 控制（在 tool_loop.run_home_autonomy_tool_loop 内检查）：
       0=关 1=只读 2=+信件便利贴 3=+种植烹饪 4=+基础生活
+
+    ⚠️ C5 兼容入口（弃用）：不由后台主进程（run_background_process）调度——
+    Home 活动已并入 async_unified_autonomy 统一自主循环（按 activity_id 选择）。
+    本函数保留旧 while True 循环供旧测试/手动诊断调用，禁止与统一循环同时常驻。
     """
     from server import (
         _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
@@ -1465,20 +1616,39 @@ async def async_home_autonomy_tick():
 
     while True:
         await asyncio.sleep(interval)
+        _act_key = None
+        _alog = None
         try:
+            import secrets as _secrets
+            import home.activity_log as _alog_mod
+            _alog = _alog_mod
             now_bj = _get_now_bj()
             system_ctx = await _build_channel_context(
                 "家庭自主生活观察", channel_tag="TG_MSG", source="home_autonomy"
             )
 
+            # 📒 C3：start-before-side-effect——留痕失败则本轮不执行任何 Home 副作用
+            _act_key = f"home_{now_bj.strftime('%Y%m%d%H%M%S')}_{_secrets.token_hex(3)}"
+            _started = await asyncio.to_thread(_alog.start_activity_log, _act_key, "home_autonomy")
+            if not _started.get("ok") or _started.get("already_final"):
+                print(f"📒 [行动日志] running 记录建立失败"
+                      f"（{_started.get('error_code', '已存在')}），本轮 Home 自主跳过")
+                continue
+
+            _meta = {}
             result = await tool_loop.run_home_autonomy_tool_loop(
                 client=None,
                 ask_llm=_ask_bg_role,
                 system_ctx=system_ctx,
                 now_bj=now_bj,
+                meta_out=_meta,
             )
             if result is None:
                 # 循环内部已打印跳过原因
+                await asyncio.to_thread(
+                    _alog.finalize_activity_log, _act_key,
+                    activity_id="home:autonomy", activity_name="家庭自主生活",
+                    status="skipped", result_summary="本轮未进入自主生活流程。")
                 continue
             log_text, tools_used = result
 
@@ -1488,8 +1658,481 @@ async def async_home_autonomy_tick():
                 "🏠 家庭自主·生活", log_text, "记事", "平静", "Home_Autonomy"
             )
             print(f"🏠 [Home自主] 做了 {tools_used}: {log_text[:30]}...")
+
+            # 📒 C3 finalize：状态来自 C2 真实业务结果（观察/部分成功/失败/成功）
+            if _meta.get("planning_failed"):
+                _status = "failed"
+            elif _meta.get("has_write_ok"):
+                _status = ("partial" if (_meta.get("write_fail") or _meta.get("skip_count"))
+                           else "succeeded")
+            elif _meta.get("write_fail"):
+                _status = "failed"
+            else:
+                _status = "observed"
+            _ok_names = "、".join(sorted(set(tools_used))) if tools_used else "无"
+            _result_summary = (f"真实成功动作：{_ok_names}；"
+                               f"失败 {_meta.get('write_fail', 0)} 项；"
+                               f"跳过 {_meta.get('skip_count', 0)} 项。")
+            _fin = await asyncio.to_thread(
+                _alog.finalize_activity_log, _act_key,
+                activity_id="home:autonomy", activity_name="家庭自主生活",
+                status=_status, thought_summary=_meta.get("thought_summary") or "",
+                result_summary=_result_summary, tools_used=_meta.get("tools_used") or [])
+            if not _fin.get("ok"):
+                print(f"📒 [行动日志] Home finalize 失败（{_fin.get('error_code')}），"
+                      f"该活动可能停留 running，需人工核查 activity_logs")
         except Exception as e:
+            # 📒 C3：异常路径尝试 finalize 为 failed（堆栈只进服务日志，不入库）
+            if _alog is not None and _act_key:
+                try:
+                    await asyncio.to_thread(
+                        _alog.fail_activity_log, _act_key,
+                        f"Home 自主活动异常：{type(e).__name__}")
+                except Exception as _fe:
+                    print(f"📒 [行动日志] 异常路径 finalize 失败: {_fe}")
             print(f"❌ Home 自主生活出错: {e}")
+
+
+# ==========================================
+# C5 统一自主活动调度器（自由活动 + Home 自主生活合并为唯一顶层调度）
+# ==========================================
+
+def _unified_switches() -> tuple[bool, bool]:
+    """读统一调度两个开关（每次唤醒重读，支持 env 热更新语义）。
+
+    - FREE_ACTIVITY_ENABLED：是否把普通自由/外向/秘密日记加入统一候选；
+    - HOME_AUTONOMY_ENABLED：是否把 Home 活动加入统一候选。
+    """
+    free_on = os.environ.get("FREE_ACTIVITY_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    home_on = os.environ.get("HOME_AUTONOMY_ENABLED", "false").strip().lower() not in ("0", "false", "no")
+    return free_on, home_on
+
+
+def _dynamic_heartbeat_secs():
+    """v2⑤ 自主心跳：HEARTBEAT_AUTONOMY 开且有存储值 → 动态间隔秒数；否则 None。"""
+    try:
+        import desire_bridge
+        hb = desire_bridge.seconds_until_next_heartbeat()
+        return int(hb) if hb is not None else None
+    except Exception as _hbe:
+        print(f"💓 [自主心跳] 读取失败，回退固定间隔：{_hbe}")
+        return None
+
+
+def _unified_interval_secs(free_on: bool, home_on: bool):
+    """统一循环间隔规则（C5）：
+
+    - 两者都关 → None（统一任务退出）；
+    - 仅 HOME → HOME_AUTONOMY_INTERVAL（不依赖动态心跳与 FREE 开关）；
+    - 仅 FREE → 动态心跳有值用动态值，否则 FREE_ACTIVITY_INTERVAL + 抖动（旧行为）；
+    - 双开 → 动态心跳有值用动态值，否则 min(两个间隔) + 抖动。
+    """
+    if not free_on and not home_on:
+        return None
+    try:
+        free_interval = int(os.environ.get("FREE_ACTIVITY_INTERVAL", 5400))
+    except (TypeError, ValueError):
+        free_interval = 5400
+    try:
+        home_interval = int(os.environ.get("HOME_AUTONOMY_INTERVAL", "7200"))
+    except (TypeError, ValueError):
+        home_interval = 7200
+    if home_on and not free_on:
+        return max(300, home_interval)
+    if not home_on:
+        hb = _dynamic_heartbeat_secs()
+        if hb is not None:
+            return hb
+        return max(300, free_interval + random.randint(-900, 900))
+    hb = _dynamic_heartbeat_secs()
+    if hb is not None:
+        return hb
+    return max(300, min(free_interval, home_interval) + random.randint(-900, 900))
+
+
+def _activity_row_to_id(row) -> str:
+    """activity_logs 行 → 注册表规范的 activity_id（C5 防重复用）。
+
+    优先行内 activity_id（在注册表中即原样采用）；否则按 activity_name 走
+    旧名兼容映射；两者都解析不了时保留原始 id 串（不误伤同 id 去重）。
+    不读取任何正文。
+    """
+    if not isinstance(row, dict):
+        return ""
+    rid = (row.get("activity_id") or "").strip()
+    name = (row.get("activity_name") or "").strip()
+    if rid and _areg.get(rid):
+        return rid
+    if name:
+        mapped = _areg.legacy_to_id(name)
+        if mapped:
+            return mapped
+    return rid
+
+
+def _merge_recent_activity_ids(log_rows, memory_rows, limit=2, window_seconds=900):
+    """C5：合并 activity_logs 与旧 memories 两个来源的最近 activity_id（防连续重复）。
+
+    语义与 _merge_recent_activity_names 一致（时间倒序 + 15 分钟窗口去重），
+    只是去重键从活动名换成规范 activity_id；不读取任何正文。
+    """
+    rows = []
+    for seq, r in enumerate(log_rows or []):
+        aid = _activity_row_to_id(r)
+        if aid:
+            rows.append((aid, _parse_activity_row_time(r.get("started_at")), seq))
+    for seq, m in enumerate(memory_rows or []):
+        t = (m.get("title") or "") if isinstance(m, dict) else ""
+        if "·" in t:
+            aid = _areg.legacy_to_id(t.split("·", 1)[1].strip())
+            if aid:
+                rows.append((aid, _parse_activity_row_time(m.get("created_at")), seq))
+    rows.sort(key=lambda x: (0 if x[1] is not None else 1,
+                             -x[1].timestamp() if x[1] is not None else 0.0,
+                             x[2]))
+    merged = []
+    for aid, ts, _seq in rows:
+        if len(merged) >= limit:
+            break
+        dup = any(a == aid and ts is not None and t2 is not None
+                  and abs((ts - t2).total_seconds()) <= window_seconds
+                  for a, t2, _s in merged)
+        if dup:
+            continue
+        merged.append((aid, ts, _seq))
+    return [a for a, _t, _s in merged]
+
+
+def _recent_activity_ids(limit=2):
+    """C5：读最近 N 条已完成活动的规范 activity_id（activity_logs 优先，memories 补足）。
+
+    - activity_logs：source ∈ {unified_autonomy, free_activity, home_autonomy}
+      且 succeeded/partial（failed/skipped 不算"已经做过"；running 不参与）；
+    - 不足 limit 条时用旧 memories（Free_Activity/Secret_Diary/Home_Autonomy 标签）
+      补足；标题按"·"拆出活动名后走旧名映射，解析不了的丢弃；
+    - 只返回规范 activity_id，不读取任何正文。
+    """
+    import home.activity_log as _alog
+    log_rows = []
+    try:
+        log_rows = _alog.get_recent_completed_activities(limit=limit)
+    except Exception as _ale:
+        print(f"📒 [防重复] activity_logs 读取失败，回退 memories：{type(_ale).__name__}")
+    memory_rows = []
+    if len(log_rows) < limit:
+        try:
+            from server import supabase as _sb
+        except Exception:
+            _sb = None
+        if _sb:
+            try:
+                r = (_sb.table("memories").select("title,created_at")
+                     .in_("tags", ["Free_Activity", "Secret_Diary", "Home_Autonomy"])
+                     .order("created_at", desc=True).limit(limit).execute())
+                memory_rows = r.data or []
+            except Exception:
+                memory_rows = []
+    return _merge_recent_activity_ids(log_rows, memory_rows, limit=limit)
+
+
+def _build_unified_selection_prompt(candidates, now_bj, avoid_id: str,
+                                    suggested_id: str, desire_intent) -> str:
+    """C5 统一选择协议 Prompt：只列候选稳定 activity_id，模型只选一个。
+
+    - 候选必须含 ID、显示名与简短说明；Home 活动明确"选了会真正动手做"；
+    - thought_summary 是可展示念头，不是思维链；不得声称动作已完成；
+    - desire 倾向与防重复只作提示，不构成强制，也不能绕过候选门控。
+    """
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+    lines = []
+    for e in candidates:
+        tag = "【家里·会真正动手做】" if e["category"] == "home" else ""
+        lines.append(f"- {e['activity_id']}「{e['name']}」{tag}——{e['description']}")
+    options_text = "\n".join(lines)
+    avoid_hint = ""
+    if avoid_id:
+        _avoid_name = _areg.display_name(avoid_id)
+        if _avoid_name:
+            avoid_hint = f"\n注意：你最近连着做了两次「{_avoid_name}」，这次换点别的。"
+    desire_hint = ""
+    if suggested_id and desire_intent is not None:
+        _s_name = _areg.display_name(suggested_id)
+        if _s_name:
+            desire_hint = (f"\n（你此刻内心最想做的：{desire_intent.reason}"
+                           f" 若合适，优先考虑「{_s_name}」（{suggested_id}）。）")
+    return f"""现在是 {now_str}。你刚在自主生活中醒来，接下来有一段时间可以自己安排一件事。
+
+从下面的候选里选恰好一件事（activity_id 必须原样来自这个清单）：
+{options_text}
+
+标记【家里】的活动选了之后会真正动手去做（做饭、浇花、休息等都会真实发生），不是想想而已。
+
+{avoid_hint}{desire_hint}
+
+thought_summary 怎么写——
+一句愿意直接展示给用户看的"当时为什么想做这件事"的念头（20-80字，第一人称，普通文本）。
+这不是隐藏推理：不写分析步骤、不提系统或后台、不提模型或任务，只写当下的心思。
+不要声称任何事已经做完——选完之后才会真的去做。
+
+只输出一行 JSON：
+{{"activity_id": "候选里的某个 activity_id", "thought_summary": "可展示的念头一句话"}}
+"""
+
+
+async def _unified_autonomy_tick():
+    """C5：统一自主唤醒一次的完整流程（候选 → start → 选择 → 执行 → 兼容日志 → finalize）。
+
+    - 只产生一条 activity_logs（source=unified_autonomy）；start 位于选择模型
+      与所有真实副作用之前；两个执行器内部都不再 start/finalize；
+    - 模型只输出一个稳定 activity_id；非法/被门控/空/非 JSON 一律 finalize
+      skipped，不随机兜底、不执行任何工具；
+    - 防重复以规范 activity_id 为准（activity_logs 优先 + memories 补足）；
+    - 兼容叙事日志：普通自由活动→Free_Activity；Home→Home_Autonomy；
+      秘密日记只写 home_private_diaries；外向活动照旧推送一次。
+    """
+    from server import (
+        _save_memory_to_db, _get_now_bj, _push_wechat, _build_channel_context
+    )
+    import tool_loop
+    import secrets as _secrets
+    import home.activity_log as _alog
+
+    now_bj = _get_now_bj()
+
+    # 🐱 猫状态检查（自旧自由活动循环原样迁移；宠物紧急照料链路不是顶层活动，不受合并影响）
+    try:
+        await _free_activity_check_cat(now_bj)
+    except Exception as _cate:
+        print(f"🐱 [统一自主·猫检查] 异常（不影响自主活动）: {_cate}")
+
+    free_on, home_on = _unified_switches()
+    if not free_on and not home_on:
+        return
+
+    # ── 统一候选构建（先于 start；无候选不调模型、不留痕、不兜底）──
+    candidates = []
+    gate_hints = {}
+    snap = None
+    suggested = None
+    desire_intent = None
+    desire_driven = False
+    if free_on:
+        # 欲望驱动引擎（与旧自由活动循环同构）：算一拍情感→驱动→意图快照
+        try:
+            import gateway as _gw
+            _emo_on = _gw._emotion_enabled()
+        except Exception:
+            _emo_on = True
+        if _emo_on:
+            try:
+                import desire_bridge
+                snap = await asyncio.to_thread(desire_bridge.tick)
+                desire_intent = snap.intent
+                desire_driven = snap.driven
+                if desire_driven:
+                    suggested = desire_bridge.suggest_free_activity(desire_intent)
+                _cooling = "、".join(f"{k}:{v}" for k, v in (snap.refractory or {}).items()) or "无"
+                _wild = "triggered" if desire_intent.is_wildcard else "not"
+                print(f"💗 [统一自主·欲望] intent={desire_intent.want_action} "
+                      f"drive={desire_intent.drive_key} score={desire_intent.score:.2f} "
+                      f"[不应期: {_cooling}] [wildcard: {_wild}]")
+            except Exception as _de:
+                print(f"💗 [统一自主·欲望] 跳过：{_de}")
+        # 门控（淘宝/冲浪：情绪+配置+冷却+每日上限；倾向不能绕过门控）
+        gated, gate_hints = await tool_loop._gate_activities(snap, now_bj)
+        candidates.extend(e for e in _areg.unified_free_candidates()
+                          if e["name"] in gated)
+    if home_on and tool_loop._HAS_HOME_RUNTIME:
+        _phase = tool_loop.HOME_AUTONOMY_PHASE
+        _phase_tools = tool_loop._HOME_PHASE_TOOLS.get(_phase, [])
+        candidates.extend(_areg.home_candidates(_phase, _phase_tools))
+    if not candidates:
+        print("🎲 [统一自主] 本轮无候选，跳过（不调模型、不留痕）")
+        return
+
+    # ── 防重复（activity_id）：最近连续两次同 ID → 本轮排除；排除后无候选不兜底 ──
+    recent_ids = await asyncio.to_thread(_recent_activity_ids, 2)
+    avoid_id = recent_ids[0] if len(recent_ids) >= 2 and recent_ids[0] == recent_ids[1] else ""
+    if avoid_id:
+        candidates = [e for e in candidates if e["activity_id"] != avoid_id]
+    if not candidates:
+        print("🎲 [统一自主] 防重复排除后无候选，本轮跳过")
+        return
+
+    # 🧠 注入与平时聊天相同的上下文（人设+画像+记忆+设备）
+    system_ctx = await _build_channel_context(
+        "最近的近况、想对她说的话", channel_tag="TG_MSG", source="background_heartbeat")
+
+    # 📒 C3：start-before-selection-and-side-effect——候选非空后立刻 start，
+    # 失败则本轮不调选择模型、不执行任何真实副作用
+    _act_key = f"uni_{now_bj.strftime('%Y%m%d%H%M%S')}_{_secrets.token_hex(3)}"
+    _started = await asyncio.to_thread(_alog.start_activity_log, _act_key, "unified_autonomy")
+    if not _started.get("ok") or _started.get("already_final"):
+        print(f"📒 [行动日志] running 记录建立失败"
+              f"（{_started.get('error_code', '已存在')}），本轮统一自主跳过")
+        return
+
+    # ── 统一选择：只调一次模型，只输出一个稳定 activity_id ──
+    suggested_id = _areg.legacy_to_id(suggested) if suggested else ""
+    if suggested_id and suggested_id not in {e["activity_id"] for e in candidates}:
+        suggested_id = ""   # 欲望倾向不在本轮候选 → 丢弃（不绕过门控/开关/phase）
+    prompt = _build_unified_selection_prompt(candidates, now_bj, avoid_id,
+                                             suggested_id, desire_intent)
+    try:
+        raw_sel = await _ask_bg_role(None, prompt, system_prompt=system_ctx, temperature=0.7)
+    except Exception as _sel_err:
+        print(f"🎲 [统一自主] 选择模型异常: {type(_sel_err).__name__}")
+        await asyncio.to_thread(_alog.fail_activity_log, _act_key, "统一自主选择模型异常")
+        return
+    _sel = tool_loop._parse_json_block(raw_sel)
+    chosen_id = (_sel.get("activity_id") or "").strip() if isinstance(_sel, dict) else ""
+    sel_thought = (tool_loop._sanitize_thought(_sel.get("thought_summary"))
+                   if isinstance(_sel, dict) else "")
+    _valid_ids = {e["activity_id"] for e in candidates}
+    if chosen_id not in _valid_ids:
+        # 非法/被门控/空/非 JSON：不随机换活动、不执行任何工具，安全结束本轮
+        print(f"🎲 [统一自主] 未选出可执行活动（id 截断: {chosen_id[:40]!r}），finalize skipped")
+        await asyncio.to_thread(
+            _alog.finalize_activity_log, _act_key,
+            activity_id="unified:unknown", activity_name="",
+            status="skipped", result_summary="本轮没有选出可执行的活动。")
+        return
+
+    entry = _areg.get(chosen_id)
+    _meta = {}
+    try:
+        # ── 执行分流：Home 走 Home 执行器（phase ∩ 工具组），其余走自由执行器 ──
+        if entry["category"] == "home":
+            _h_result = await tool_loop.run_home_autonomy_tool_loop(
+                client=None, ask_llm=_ask_bg_role, system_ctx=system_ctx,
+                now_bj=now_bj, activity_id=chosen_id,
+                allowed_tool_names=entry.get("home_tool_group"),
+                selection_thought_summary=sel_thought, meta_out=_meta)
+        else:
+            _h_result = await tool_loop.run_free_activity_tool_loop(
+                client=None, ask_llm=_ask_bg_role, system_ctx=system_ctx,
+                now_bj=now_bj, avoid="", desire_hint="", desire_snapshot=snap,
+                meta_out=_meta, activity_key=_act_key,
+                forced_activity_id=chosen_id, selection_thought_summary=sel_thought,
+                gate_hints=gate_hints)
+
+        if _h_result is None:
+            # 执行器放弃（观察失败/无产出等）：finalize skipped，不进入第二个执行器
+            await asyncio.to_thread(
+                _alog.finalize_activity_log, _act_key,
+                activity_id="unified:unknown", activity_name="",
+                status="skipped", result_summary="本轮活动没有产出可记录的内容。")
+            return
+
+        if entry["category"] == "home":
+            log_text, tools_used = _h_result
+            # 兼容叙事日志：继续写 Home_Autonomy memories（标题附活动展示名，仅后缀变化）
+            await asyncio.to_thread(
+                _save_memory_to_db,
+                f"🏠 家庭自主·{entry['name']}", log_text, "记事", "平静", "Home_Autonomy")
+            print(f"🏠 [统一自主] 做了「{entry['name']}」{tools_used}: {log_text[:30]}...")
+            # 📒 C3 finalize：状态来自 C2 真实业务结果（观察/部分成功/失败/成功）
+            if _meta.get("planning_failed"):
+                _status = "failed"
+            elif _meta.get("has_write_ok"):
+                _status = ("partial" if (_meta.get("write_fail") or _meta.get("skip_count"))
+                           else "succeeded")
+            elif _meta.get("write_fail"):
+                _status = "failed"
+            else:
+                _status = "observed"
+            _ok_names = "、".join(sorted(set(tools_used))) if tools_used else "无"
+            _result_summary = (f"真实成功动作：{_ok_names}；"
+                               f"失败 {_meta.get('write_fail', 0)} 项；"
+                               f"跳过 {_meta.get('skip_count', 0)} 项。")
+            _fin = await asyncio.to_thread(
+                _alog.finalize_activity_log, _act_key,
+                activity_id=chosen_id, activity_name=entry["name"],
+                status=_status, thought_summary=_meta.get("thought_summary") or "",
+                result_summary=_result_summary, tools_used=_meta.get("tools_used") or [])
+            if not _fin.get("ok"):
+                print(f"📒 [行动日志] finalize 失败（{_fin.get('error_code')}），"
+                      f"该活动可能停留 running，需人工核查 activity_logs")
+        else:
+            activity, log_text = _h_result
+            # 🔒 C4：秘密日记只写 home_private_diaries（执行器内已完成持久化），
+            # 不写 memories；其余活动（含外向）继续写 Free_Activity
+            _diary_persist_failed = _meta.get("diary_persist_ok") is False
+            if chosen_id != "free:secret_diary":
+                await asyncio.to_thread(
+                    _save_memory_to_db,
+                    f"🎈 自由活动·{activity}", log_text, "记事", "惬意", "Free_Activity")
+            # 欲望 satisfy：条件与旧自由活动循环一致（driven、非 wildcard、日记持久化成功）
+            if (desire_intent is not None and desire_driven
+                    and not desire_intent.is_wildcard and not _diary_persist_failed):
+                try:
+                    import desire_bridge
+                    await asyncio.to_thread(desire_bridge.satisfy_action, desire_intent.want_action)
+                except Exception as _se:
+                    print(f"💗 [统一自主] satisfy 跳过：{_se}")
+            if entry["category"] == "outgoing":
+                # 外向活动：推送一次（plain=True），正文不入行动日志
+                await asyncio.to_thread(_push_wechat, log_text, "想你了", True)
+                print(f"💭 [统一自主] 外向活动「{activity}」已推送")
+            elif chosen_id == "free:secret_diary":
+                print("🔒 [统一自主] 秘密日记已处理（正文不入日志）")
+            else:
+                print(f"🎈 [统一自主] 做了「{activity}」：{log_text[:30]}...")
+            _status, _thought, _result = _free_activity_log_meta(activity, _meta, log_text)
+            _fin = await asyncio.to_thread(
+                _alog.finalize_activity_log, _act_key,
+                activity_id=chosen_id, activity_name=activity, status=_status,
+                thought_summary=_thought, result_summary=_result,
+                tools_used=_meta.get("tools_used") or [])
+            if not _fin.get("ok"):
+                print(f"📒 [行动日志] finalize 失败（{_fin.get('error_code')}），"
+                      f"该活动可能停留 running，需人工核查 activity_logs")
+    except Exception as _act_err:
+        # 📒 C3：异常路径 finalize failed（堆栈只进服务日志，不入库）；
+        # 不重试、不换活动、不进入第二个执行器
+        try:
+            await asyncio.to_thread(
+                _alog.fail_activity_log, _act_key,
+                f"统一自主活动异常：{type(_act_err).__name__}")
+        except Exception as _fe:
+            print(f"📒 [行动日志] 异常路径 finalize 失败: {_fe}")
+        raise
+
+
+async def async_unified_autonomy():
+    """🎲 C5 统一自主活动循环：自由活动与 Home 自主生活合并后的唯一顶层调度。
+
+    流程：统一唤醒 → 构建统一候选（FREE/HOME 开关 + 门控 + Home phase）→
+    防重复（activity_id）→ start_activity_log(source=unified_autonomy) →
+    模型选择一个稳定 activity_id（只选一次）→ 代码校验 → 进入对应执行器 →
+    执行真实工具 → 写兼容叙事日志 → finalize 同一条 activity_logs。
+
+    间隔规则（_unified_interval_secs）：
+    - 两者都关：任务直接返回，不进入循环（宠物 tick 等其他后台任务不受影响）；
+    - 仅 HOME：HOME_AUTONOMY_INTERVAL；
+    - 仅 FREE：动态心跳（HEARTBEAT_AUTONOMY）有值用之，否则 FREE_ACTIVITY_INTERVAL+抖动；
+    - 双开：动态心跳有值用之，否则 min(FREE_ACTIVITY_INTERVAL, HOME_AUTONOMY_INTERVAL)+抖动。
+    """
+    print("🎲 统一自主活动神经已上线（C5：自由活动 + Home 自主生活）...")
+    free_on, home_on = _unified_switches()
+    if not free_on and not home_on:
+        print("🎲 统一自主活动已关闭 (FREE_ACTIVITY_ENABLED=false 且 HOME_AUTONOMY_ENABLED=false)")
+        return
+    while True:
+        # 每轮重读开关：支持运行中通过环境变量热更新启停组合
+        free_on, home_on = _unified_switches()
+        if not free_on and not home_on:
+            print("🎲 [统一自主] 两个开关均已关闭，统一循环退出")
+            return
+        sleep_secs = _unified_interval_secs(free_on, home_on)
+        if sleep_secs is None:
+            return
+        print(f"🎲 [统一自主] 下次唤醒约 {sleep_secs}s 后")
+        await asyncio.sleep(sleep_secs)
+        try:
+            await _unified_autonomy_tick()
+        except Exception as e:
+            print(f"❌ 统一自主活动出错: {e}")
 
 
 async def run_background_process():
@@ -1501,13 +2144,16 @@ async def run_background_process():
     tasks = [
         asyncio.create_task(async_env_sync(),           name="env_sync"),
         asyncio.create_task(async_autonomous_life(),    name="autonomous_life"),
-        asyncio.create_task(async_free_activity(),      name="free_activity"),
+        # C5 统一自主活动：自由活动 + Home 自主生活合并为唯一顶层自主循环；
+        # 旧 async_free_activity / async_home_autonomy_tick 保留为兼容入口，
+        # 不再由后台主进程调度（禁止双循环并存与重复 activity_logs）。
+        asyncio.create_task(async_unified_autonomy(),   name="unified_autonomy"),
         asyncio.create_task(async_diary_worker(),       name="diary"),
         asyncio.create_task(async_message_summarizer(), name="msg_summarizer"),
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
         asyncio.create_task(async_schedule_secretary(), name="schedule"),
-        asyncio.create_task(async_pet_house_tick(),    name="pet_house_tick"),
-        asyncio.create_task(async_home_autonomy_tick(), name="home_autonomy"),
+        # 宠物状态 tick：不属于本阶段合并的顶层自主活动，保持独立运行
+        asyncio.create_task(async_pet_house_tick(),     name="pet_house_tick"),
     ]
 
     # 信箱巡视默认关闭 (需配置 GMAIL_BRIDGE_URL 才有意义)；配了才启用

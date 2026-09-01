@@ -9,6 +9,7 @@ home/repository.py — Supabase 查询封装层
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,10 +31,14 @@ def _get_supabase():
 
 
 def _get_supabase_service():
-    """获取 service_role 客户端（仅用于 RPC 写操作，绕过 RLS）。
+    """获取 service_role 客户端（绕过 RLS）。
 
     Home Runtime 的 RPC 对 anon/authenticated 撤销了执行权限，
-    只有 service_role 能调。读操作仍用 _get_supabase()（anon + RLS 保护）。
+    只有 service_role 能调。C4 起部分内部只读查询也刻意走 service_role：
+    目标表（如 home_private_diaries、activity_logs）不给 anon/authenticated
+    读权限（activity_logs 甚至 REVOKE 全部权限），只能 service_role 直查
+    （秘密日记最近 4 条上下文读取、activity_logs 防重复读取）。
+    其余普通读操作仍用 _get_supabase()（anon + RLS 保护）。
     """
     try:
         import server
@@ -743,3 +748,254 @@ def count_legacy_secret_diaries() -> int:
         return resp.count or 0
     except Exception:
         return 0
+
+
+# ============================================================
+# C4: 新旧秘密日记历史连续性（内部受控读取）
+# ============================================================
+
+def parse_diary_time(value):
+    """解析日记时间字符串为 aware datetime；失败返回 None。
+
+    兼容 'Z' 后缀、'+08:00' 等偏移与纯日期（如 '2026-08-01'）；
+    naive 值按 UTC 处理，避免混合时区比较抛异常。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        ts = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _diary_sort_key(value, seq: int):
+    """排序键：有效时间在前按时间倒序；无效时间排最后并保持稳定次序。"""
+    ts = parse_diary_time(value)
+    if ts is None:
+        return (1, 0.0, seq)
+    return (0, -ts.timestamp(), seq)
+
+
+def fetch_recent_private_diary_context(limit: int = 4) -> list:
+    """C4：读取新旧两个秘密日记来源中时间最近的 limit 条（含正文，仅内部受控调用）。
+
+    - 旧来源：memories.tags = Secret_Diary（只读保留，不再新增）；
+    - 新来源：home_private_diaries 中未归档记录；
+    - 每个来源最多取 limit 条候选，合并按 created_at 倒序后取前 limit 条
+      （两个来源合并后总共 limit 条，不是每来源各 limit 条）；
+    - 使用 service_role 直查（只读 SELECT），不走 rpc_home_read_private_diary
+      （该 RPC 会写 home_action_runs，产生副作用）；
+    - 仅用于生成新秘密日记前的连续性参考：不注册 MCP、不进普通搜索、
+      不返回给前端；数据库异常向上抛出，由调用方降级（不伪造历史）；
+    - 不查询 embedding/action_key/UUID，不记录正文日志。
+    """
+    limit = max(1, min(int(limit), 4))
+    sb = _get_supabase_service()
+    if sb is None:
+        raise RuntimeError("SERVICE_KEY_MISSING")
+    try:
+        legacy = (sb.table("memories")
+                  .select("title,content,mood,created_at")
+                  .eq("tags", "Secret_Diary")
+                  .order("created_at", desc=True)
+                  .limit(limit)
+                  .execute()).data or []
+    except Exception as e:
+        logger.warning("fetch_recent_private_diary_context 旧来源读取失败: %s", type(e).__name__)
+        raise
+    try:
+        home_rows = (sb.table("home_private_diaries")
+                     .select("title,content,mood,created_at")
+                     .neq("status", "archived")
+                     .order("created_at", desc=True)
+                     .limit(limit)
+                     .execute()).data or []
+    except Exception as e:
+        logger.warning("fetch_recent_private_diary_context 新来源读取失败: %s", type(e).__name__)
+        raise
+
+    candidates = []
+    for seq, row in enumerate(legacy):
+        candidates.append({
+            "title": row.get("title") or "",
+            "content": row.get("content") or "",
+            "mood": row.get("mood") or "",
+            "created_at": row.get("created_at"),
+            "source": "legacy",
+            "_key": _diary_sort_key(row.get("created_at"), seq),
+        })
+    for seq, row in enumerate(home_rows):
+        candidates.append({
+            "title": row.get("title") or "",
+            "content": row.get("content") or "",
+            "mood": row.get("mood") or "",
+            "created_at": row.get("created_at"),
+            "source": "home",
+            "_key": _diary_sort_key(row.get("created_at"), seq),
+        })
+    candidates.sort(key=lambda c: c["_key"])
+    return [{k: c[k] for k in ("title", "content", "mood", "created_at", "source")}
+            for c in candidates[:limit]]
+
+
+# ============================================================
+# C6: 受保护前端只读查询（service_role，零副作用）
+# ============================================================
+
+def fetch_private_diaries_service(author_member_id: str = "") -> list[dict]:
+    """C6：service_role 版私密日记元数据查询（不返回 content）。
+
+    与 fetch_private_diaries 相同的列与排序，但走 service_role：
+    生产环境该表只给 authenticated SELECT policy、未给 anon，
+    anon 直查会静默返回空，导致统一索引中新日记整体消失。
+    """
+    sb = _get_supabase_service()
+    if sb is None:
+        return []
+    try:
+        q = (sb.table("home_private_diaries")
+             .select("id,diary_key,author_member_id,title,mood,status,created_at")
+             .neq("status", "archived"))
+        if author_member_id:
+            q = q.eq("author_member_id", author_member_id)
+        q = q.order("created_at", desc=True)
+        resp = q.execute()
+        return resp.data or []
+    except Exception as e:
+        logger.warning("home.repository.fetch_private_diaries_service 失败: %s", type(e).__name__)
+        return []
+
+
+def fetch_private_diary_by_reference(reference: str) -> Optional[dict]:
+    """C6：按统一引用受控读取秘密日记正文（service_role 只读 SELECT，零副作用）。
+
+    - reference 格式：legacy:<memories.id> 或 home:<diary_key>；
+    - legacy 强制 tags='Secret_Diary' 且 id 为正整数，防止借 id 读取普通记忆；
+    - home 直接 service_role SELECT，不调用 rpc_home_read_private_diary
+      （该 RPC 会写 home_action_runs 且 action_key 唯一，固定 key 二次读取必撞
+      ACTION_EXISTS），因此同一引用可无限次重复读取；
+    - 不返回 embedding/action_key/UUID；content 只经返回值交付，不写日志；
+    - 非法格式抛 ValueError；service_role 缺失抛 RuntimeError("SERVICE_KEY_MISSING")；
+      数据库异常向上抛出；未找到返回 None（由调用方映射 404，不区分"存在但禁止"）。
+    """
+    if not isinstance(reference, str):
+        raise ValueError("INVALID_REFERENCE")
+    reference = reference.strip()
+    if not reference or ":" not in reference:
+        raise ValueError("INVALID_REFERENCE")
+    source, key = reference.split(":", 1)
+    source = source.strip().lower()
+    key = key.strip()
+    if source not in ("legacy", "home") or not key or len(key) > 300:
+        raise ValueError("INVALID_REFERENCE")
+    sb = _get_supabase_service()
+    if sb is None:
+        raise RuntimeError("SERVICE_KEY_MISSING")
+    if source == "legacy":
+        try:
+            legacy_id = int(key)
+        except (TypeError, ValueError):
+            raise ValueError("INVALID_REFERENCE")
+        if legacy_id <= 0:
+            raise ValueError("INVALID_REFERENCE")
+        resp = (sb.table("memories")
+                .select("id,title,content,mood,created_at")
+                .eq("tags", "Secret_Diary")
+                .eq("id", legacy_id)
+                .limit(1)
+                .execute())
+        rows = resp.data or []
+        if not rows:
+            return None
+        d = rows[0]
+        return {
+            "reference": f"legacy:{legacy_id}",
+            "source": "legacy",
+            "title": d.get("title") or "",
+            "content": d.get("content") or "",
+            "mood": d.get("mood") or "",
+            "created_at": d.get("created_at"),
+        }
+    # source == "home"
+    resp = (sb.table("home_private_diaries")
+            .select("id,diary_key,title,content,mood,status,created_at")
+            .eq("diary_key", key)
+            .limit(1)
+            .execute())
+    rows = resp.data or []
+    if not rows:
+        return None
+    d = rows[0]
+    return {
+        "reference": f"home:{d.get('diary_key', '')}",
+        "source": "home",
+        "title": d.get("title") or "",
+        "content": d.get("content") or "",
+        "mood": d.get("mood") or "",
+        "created_at": d.get("created_at"),
+    }
+
+
+def fetch_recent_notes(limit: int = 20) -> list[dict]:
+    """C6：跨房间最近便利贴摘要（service_role；不返回全文，预览在 Python 层截断）。
+
+    供 Home 聚合只读视图使用：visibility='private' 与已归档行在查询层排除；
+    content 仅在函数内部用于截取预览，不进入返回值与日志。
+    """
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 20
+    sb = _get_supabase_service()
+    if sb is None:
+        return []
+    try:
+        resp = (sb.table("home_notes")
+                .select("note_key,room_id,content,status,visibility,created_at")
+                .neq("status", "archived")
+                .neq("visibility", "private")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute())
+        out = []
+        for n in (resp.data or []):
+            content = n.get("content") or ""
+            out.append({
+                "note_key": n.get("note_key", ""),
+                "room_id": n.get("room_id"),
+                "preview": content[:60],
+                "status": n.get("status", ""),
+                "created_at": n.get("created_at"),
+            })
+        return out
+    except Exception as e:
+        logger.warning("home.repository.fetch_recent_notes 失败: %s", type(e).__name__)
+        return []
+
+
+def fetch_recent_action_runs(limit: int = 20) -> list[dict]:
+    """C6：最近行动执行记录（service_role；只 SELECT 安全列）。
+
+    列白名单不含 input/result/action_key/actor_member_id/error_message，
+    从查询层杜绝参数、UUID 与完整错误正文外泄。
+    """
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 20
+    sb = _get_supabase_service()
+    if sb is None:
+        return []
+    try:
+        resp = (sb.table("home_action_runs")
+                .select("action_type,status,error_code,requested_at,finished_at")
+                .order("requested_at", desc=True)
+                .limit(limit)
+                .execute())
+        return resp.data or []
+    except Exception as e:
+        logger.warning("home.repository.fetch_recent_action_runs 失败: %s", type(e).__name__)
+        return []

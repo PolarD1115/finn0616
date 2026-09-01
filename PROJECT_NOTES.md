@@ -4982,3 +4982,161 @@ VECTOR_RPC_GATE_PASS），证明 memory_items content → 当前 embedding provi
 5. 若未命中（NO_VECTOR_RECALL_RESULTS 或低相似度）：记录为真实同义召回
    结果，不修改阈值、不接正式上下文、不混词面召回；
 6. 不操作 Pinecone；不删除任何数据；不自动重试。
+
+==================================================
+阶段 C6：Home、行动日志与秘密日记前端 UI（2026-09-01）
+==================================================
+
+## 目标
+为 Console 与 Mini App 提供「家 / 行动日志 / 秘密日记」三个页面所需的
+受保护后端读取接口，并修复 Home 私密日记内部读取使用固定 action_key
+`internal_read` 导致二次读取撞 `home_action_runs.action_key` 唯一约束
+（ACTION_EXISTS）的问题。本阶段不修改数据库结构、不迁移/不删除/不双写
+任何数据、不修改统一自主调度与 C1-C5 工具执行逻辑。
+
+## 前置核实（Supabase 只读）
+- activity_logs：0 行，零 RLS policy（deny-by-default）+ 已 REVOKE
+  anon/authenticated——只能 service_role 读写，与 C3 设计一致；
+- home_private_diaries：0 行，RLS 开启但只有 authenticated SELECT policy、
+  无 anon policy——anon 直查静默返回空。由此确认统一索引的新日记源
+  必须走 service_role，否则新日记会在索引里整体消失；
+- home_rooms 9 / home_members 2 / home_member_states 2 / home_plants 13 /
+  home_inventory 5 / home_dishes 6 / home_letters 7（全部 unopened）/
+  home_notes 11（全部 active）/ home_events 104（全部 visibility=home）/
+  home_action_runs 112（104 succeeded + 8 failed）；
+- memories.tags='Secret_Diary'：160 条（会话结束时 161，为线上生产网关
+  正常写入，与本阶段无关，本阶段零数据库写入）。
+
+## 新增网关 API（全部受现有全局 API_SECRET 鉴权，仅 GET，405/400/404/500）
+1. GET /api/home/state — Home 聚合只读视图：
+   - 数据全部由后端读取（浏览器不接触 Supabase），home/service.py 新增
+     `home_state_overview()` 完成安全投影；
+   - 区块：rooms / members / plants / seeds / kitchen(inventory+dishes+
+     recipes) / letters / notes / recent_events / recent_runs / counts /
+     errors；
+   - 成员视图复用 _compose_member_view（宠物生理状态保持 pets 权威源）；
+   - 花园刻意不用 garden_observe：其内部 fetch_plants_settled 会触发
+     rpc_home_settle_plants 结算写入，GET 聚合必须零写副作用，改用
+     fetch_plants() 原始查询（stage/health 为上次结算快照，已知取舍）；
+   - 隐私投影：不返回内部 UUID（member/room/plant/dish id 全部剥离或
+     换名为展示名）、事件过滤 visibility private/system 且 summary 截断
+     200 字、信件/便利贴只有 preview 不含正文、不含秘密日记正文与任何
+     工具参数；
+   - 单区块失败不伪造为空：该块置 null 并在 data.errors 标记 UNAVAILABLE，
+     其余区块照常返回；handler 层异常只记异常类型，500 返回 INTERNAL_ERROR。
+2. GET /api/activity-logs — 行动日志分页查询：
+   - 参数 page(≥1)/size(1..100)/source/status/activity_id(≤200)，
+     非法整数 400，非法枚举 400；
+   - home/activity_log.py 新增 `query_activity_logs()`：service_role 只读，
+     列白名单（activity_id/activity_name/source/status/thought_summary/
+     result_summary/tools_used/started_at/finished_at），不返回 id/
+     activity_key；tools_used 经 sanitize_tools_used 二次白名单投影
+     （不信任库内已有 JSON，多余字段如 params/raw 丢弃）；
+   - started_at DESC，count="exact" 计总数，has_more=(page*size)<total；
+   - 数据库异常 → 500 DB_ERROR（不回显异常原文）。
+3. GET /api/secret-diaries — 新旧秘密日记统一索引（仅元数据）：
+   - home/service.py `list_private_diary_index` 新增 use_service_role 参数
+     （默认 False 保持旧行为，C4 测试不受影响）；网关传 True，新日记元
+     数据走 service_role（见前置核实：anon 无 policy）；
+   - 返回 items[{reference,source,title,mood,created_at,status,
+     is_archived}]/total/page/size/has_more；不含 content/embedding/
+     diary_key/action_key；全局 created_at 倒序分页沿用 C4 修复语义。
+4. GET /api/secret-diaries/:reference — 秘密日记正文受保护读取：
+   - home/repository.py 新增 `fetch_private_diary_by_reference()`：
+     legacy 强制 tags='Secret_Diary' 且 id 正整数校验（防止借 id 读普通
+     记忆）；home 直接 service_role SELECT by diary_key；
+     不调用 rpc_home_read_private_diary（该 RPC 写 home_action_runs 且
+     action_key 唯一，固定 internal_read 二次读取必撞 ACTION_EXISTS）；
+   - home/service.py 新增 `read_private_diary_body()` 做错误码映射
+     （INVALID_REFERENCE/NOT_FOUND_OR_FORBIDDEN/SERVICE_KEY_MISSING/
+     DB_ERROR）；404 不区分"存在但禁止"与"不存在"；
+   - 同一引用可无限次重复读取，全程零写入、零 home_action_runs；
+   - 仅此受保护接口返回正文；前端 encodeURIComponent(reference)，
+     服务端 unquote 还原；日志只记异常类型，不记完整 reference/title/正文；
+   - 旧 `read_private_diary_by_reference`（tool_loop 内部路径）保留不动：
+     其固定 internal_read 行为是 C4 专项测试的锚点
+     （test_home_source_uses_read_rpc），前端不再经过该路径。
+
+## 前端（console.html 与 miniapp.html 同步实现）
+- 导航新增「家」「行动日志」；「秘密日记」保留原入口改造；
+- 家页面（p-home）：成员（含状态条：宠物 饱食/快乐/清洁/精力/健康，
+  AI 心情/精力/舒适/健康）、房间（emoji/描述/房间内成员/便利贴摘要）、
+  花园（阶段/水分/健康/可收获标签）、厨房（库存/菜品份数品质/菜谱）、
+  信件（标题/预览/未拆标签）、便利贴（房间/预览）、家庭时间线
+  （事件+行动记录按时间合并、成功/失败标签）；
+- 行动日志页面（p-logs）：source/status 筛选 + 分页 + 刷新；每条展示
+  activity_name/activity_id 小标签/source/status/时间区间/想法/
+  结果/tools_used 状态标签（succeeded/failed/skipped 三态配色）；
+- 秘密日记页面：改用 /api/secret-diaries 统一索引（不再从
+  /api/memories?category=secret_diary 读取，移除旧编辑/删除/搜索入口）；
+  列表只含日期/标题/心情/来源标签（历史|Home）/归档标记/阅读按钮；
+  正文点击后经受保护接口单独加载，关闭 modal 即清空 modalRoot DOM，
+  正文不落 localStorage、不进 console 日志；
+- 所有动态文本经 esc() 转义；旧「小屋」区块（状态面板内，Supabase anon
+  直连）保留为兼容历史展示，未与新「家」页面混合；
+- 两个 HTML 的内联 JS 均通过 node --check 语法检查（Node v24）。
+
+## 修改文件
+- gateway.py：4 条路由分发 + 4 个 handler（_handle_home_state_api、
+  _handle_activity_logs_api、_handle_secret_diaries_api、
+  _handle_secret_diary_body_api）；
+- home/repository.py：fetch_private_diaries_service /
+  fetch_private_diary_by_reference / fetch_recent_notes /
+  fetch_recent_action_runs（后两个只 SELECT 安全列）；
+- home/service.py：home_state_overview / read_private_diary_body /
+  list_private_diary_index 增加 use_service_role 参数（向后兼容）；
+- home/activity_log.py：query_activity_logs（只读分页查询）；
+- console.html / miniapp.html：三页面；
+- test_home_api_c6.py：新专项测试（.gitignore 精确例外
+  !test_home_api_c6.py，总忽略规则 test_*.py 保持不变）；
+- PROJECT_NOTES.md：本节。
+
+## 不变量与隔离
+- 未修改数据库结构，无迁移，无 INSERT/UPDATE/DELETE，未调用任何写 RPC；
+  home_action_runs 会话前后均为 112 行（证明受保护读取零副作用）；
+- 未新增环境变量（VARIABLES.md 不变）；复用现有 API_SECRET 与
+  SUPABASE_SERVICE_KEY；
+- gateway.py / server.py 仍不包含字符串 home_private_diaries（C4 静态
+  隔离断言保持通过）；普通搜索/聊天上下文/Home context/Pinecone 不读取
+  新秘密正文；/api/memories 不自动混入新日记；
+- anon 权限未放宽（本阶段无任何 policy/GRANT 变更）；
+- tool_loop.py / heartbeat.py / activity_registry.py / prompts/reply_rules.md /
+  migrations/* / C1-C5 专项测试 / gateway.py 既有 embedding 诊断修改
+  全部未触碰。
+
+## 测试结果（python -B -m unittest，PYTHONDONTWRITEBYTECODE=1）
+- test_home_api_c6：66 项全过（A 聚合投影/UUID 泄漏/区块失败、B 白名单
+  投影/分页/只读、C 索引全局分页/无正文、D legacy 只读 Secret_Diary/home
+  直查/重复读取零 RPC/错误映射/未授权、E C4 隔离锚点、F activity_logs
+  只读锚点、G 前端静态 + node --check）；
+- C1-C5 回归：test_pet_feed_priority 38 OK / test_home_autonomy_loop 26 OK /
+  test_activity_logs 37 OK / test_secret_diary_c4 56 OK /
+  test_unified_autonomy_c5 55 OK / test_cat_check 31 OK /
+  test_home_pet_bridge 59 OK / test_home_diary_compat 16 OK；
+- test_tool_loop：108 项中 5 项失败，均为既有漂移基线
+  （test_build_tool_schema_block_empty_activity、
+  test_avout_hint_passed_to_stage1、test_disabled_degrades_single_call、
+  test_empty_draft_no_tools_returns_none、
+  test_enabled_no_tools_activity_single_call），无新增失败；
+- 相邻套件 test_home_expressions / test_home_garden 各有 1 项既有失败
+  （Test10DBUnavailable.test_write_letter_no_db /
+  Test11DBUnavailable.test_plant_no_db），已通过基线对比确认为既有问题，
+  非本阶段引入；这两个模块不在 C6 规定的 H 回归清单内。
+
+## 已知限制
+1. 花园区块不结算：GET /api/home/state 为零副作用改用原始植物查询，
+   stage/health/water_level 是上次结算时的快照（AI 侧 garden_observe
+   工具仍会正常结算）；
+2. 便利贴预览为新截取（前 60 字），信件预览沿用写信时生成的 preview 列；
+3. activity_logs 当前 0 行（C5 部署后尚未产生生产记录），行动日志页面的
+   真实数据展示待统一自主循环下一次生产运行；
+4. 秘密日记正文接口属高敏感面：受 API_SECRET 保护，但密钥泄露即正文
+   泄露（与 /api/memory-review 同级风险）；
+5. 旧固定 internal_read 的内部读取路径保留（tool_loop 兼容），其二次
+   读取 ACTION_EXISTS 行为未改变，仅前端/网关路径已绕开；
+6. 旧秘密日记编辑/删除入口随页面改造移除（旧 memories 仍可通过
+   /api/memories 管理，未删除任何数据）。
+
+## 遗留与说明
+- 会话期间用户在另一终端创建 commit bfd9a57（补充遗漏文件），本阶段
+  未创建任何 commit；工作区仍保留全部未提交修改，由用户决定提交时机。
