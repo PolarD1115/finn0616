@@ -646,7 +646,7 @@ async function api(path,opts={}){
   let data;
   try{data=await r.json();}catch(e){data={error:"非 JSON 响应"};}
   if(r.status===401){toast("鉴权失败：请填写正确的 API_SECRET","err");setNet("no","未鉴权");return null;}
-  if(!r.ok){const msg=data&&data.error?data.error:("HTTP "+r.status);throw new Error(msg);}
+  if(!r.ok){const msg=data&&(data.error||data.message)?(data.error||data.message):("HTTP "+r.status);throw new Error(msg);}
   return data;
 }
 function toast(msg,type="ok"){
@@ -1149,8 +1149,16 @@ async function loadHome(force){
     const letters=s.letters||[];
     document.getElementById("homeLettersSub").textContent=letters.length?(letters.filter(l=>l.is_unopened).length+" 封未拆"):"";
     document.getElementById("homeLetters").innerHTML=letters.length?letters.map(l=>
-      '<div class="item" style="margin-bottom:8px"><div class="meta"><span><b>'+esc(l.title||"(无标题)")+'</b>'+(l.is_unopened?' <span class="tag no">未拆</span>':' <span class="tag ok">已拆</span>')+'</span><span>'+esc(fmtCN8(l.created_at))+'</span></div>'+
-      '<div class="body" style="margin-top:4px">'+esc(l.preview||"")+'</div></div>').join(""):'<div class="empty"><i data-lucide="mail"></i><br>还没有信件</div>';
+      '<div class="item" style="margin-bottom:8px"><div class="meta"><span><b>'+esc(l.title||"(无标题)")+'</b>'+
+      (l.is_unopened?' <span class="tag no">未拆</span>':(l.status==="archived"?' <span class="tag mute">已归档</span>':' <span class="tag ok">已拆</span>'))+
+      '</span><span>'+esc(fmtCN8(l.created_at))+'</span></div>'+
+      '<div class="body" style="margin-top:4px">'+esc(l.preview||"")+'</div>'+
+      '<div class="acts" style="margin-top:6px">'+(l.is_unopened
+        ?'<button class="ghost" onclick="openLetter(\''+encodeURIComponent(l.letter_key||"")+'\')"><i data-lucide="mail-open"></i>拆信</button>'
+        :(l.status==="archived"
+          ?'<span class="tag mute">已归档</span>'
+          :'<button class="ghost" onclick="readLetter(\''+encodeURIComponent(l.letter_key||"")+'\')"><i data-lucide="book-open"></i>阅读</button>'))+
+      '</div></div>').join(""):'<div class="empty"><i data-lucide="mail"></i><br>还没有信件</div>';
     // 便利贴
     const notes=s.notes||[];
     document.getElementById("homeNotesSub").textContent=notes.length?("共 "+notes.length+" 张"):"";
@@ -1265,6 +1273,38 @@ async function readDiary(refEncoded){
       '</div></div>';
     document.getElementById("modalRoot").innerHTML=html;refreshIcons();
   }catch(e){toast(e.message,"err");closeModal();}
+}
+
+/* ============ C9：信件拆阅（正文仅在点击后加载；关闭 modal 时 closeModal() 清空 modalRoot，正文不落 localStorage、不写日志） ============ */
+async function openLetter(keyEncoded){
+  // 立即弹全屏加载 modal：遮罩阻断连续点击，避免重复拆信
+  document.getElementById("modalRoot").innerHTML='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal"><h3>拆信中…<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3></div></div>';
+  try{
+    const d=await api("/api/home/letters/"+keyEncoded+"/open",{method:"POST"});
+    if(!d){closeModal();return;}
+    showLetterModal(d.item||{});
+    loadHome();
+  }catch(e){toast(e.message||"拆信失败，请稍后再试","err");closeModal();}
+}
+async function readLetter(keyEncoded){
+  document.getElementById("modalRoot").innerHTML='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal"><h3>加载中…<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3></div></div>';
+  try{
+    const d=await api("/api/home/letters/"+keyEncoded);
+    if(!d){closeModal();return;}
+    showLetterModal(d.item||{});
+  }catch(e){toast(e.message||"读取信件失败，请稍后再试","err");closeModal();}
+}
+function showLetterModal(it){
+  const st=it.status==="unopened"?"未拆":(it.status==="archived"?"已归档":"已拆");
+  const stCls=it.status==="unopened"?"no":(it.status==="archived"?"mute":"ok");
+  const html='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">'+
+    '<h3>'+esc(it.title||"(无标题)")+'<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3>'+
+    '<div class="meta" style="margin-bottom:8px"><span class="tag '+stCls+'">'+st+'</span>'+
+    '<span>'+esc(fmtCN8(it.created_at))+'</span></div>'+
+    '<div class="body" style="white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto">'+esc(it.content||"(空)")+'</div>'+
+    '<div class="btn-row"><button class="ghost" onclick="closeModal()">关闭</button></div>'+
+    '</div></div>';
+  document.getElementById("modalRoot").innerHTML=html;refreshIcons();
 }
 
 /* ============ 注入提示词快照（最近5轮 volatile_block） ============ */

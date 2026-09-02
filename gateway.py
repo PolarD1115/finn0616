@@ -1937,6 +1937,15 @@ class HostFixMiddleware:
             await self._handle_secret_diary_body_api(scope, send, reference=diary_ref)
             return
 
+        # ---------- ✉️ 信件拆阅入口（C9：POST 拆信有副作用 / GET 已拆信零副作用阅读；受 /api/* 统一鉴权） ----------
+        if scope["path"].startswith("/api/home/letters/"):
+            letter_rest = scope["path"][len("/api/home/letters/"):]
+            if letter_rest.endswith("/open"):
+                await self._handle_letter_open_api(scope, send, raw_key=letter_rest[:-len("/open")])
+            else:
+                await self._handle_letter_read_api(scope, send, raw_key=letter_rest)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -5153,6 +5162,91 @@ class HostFixMiddleware:
             return
         await _send_json_resp(send, 200, {"ok": True, "item": result.get("data", {})})
 
+    # ------------------------------------------
+    # ✉️ C9: 信件拆阅受保护入口 /api/home/letters/:letter_key(/open)
+    # ------------------------------------------
+    async def _handle_letter_open_api(self, scope, send, raw_key: str = ""):
+        """POST /api/home/letters/:letter_key/open — 拆信（有副作用）。
+
+        - action_key 由后端 service 层生成，前端/模型不参与；
+        - 已拆信（含已拆后归档）不重复执行状态转换，改走零副作用只读返回
+          already_opened=true；归档且从未拆开的信 409 LETTER_ARCHIVED；
+          不存在 404（不区分"存在但禁止"）；
+        - 响应只含 letter_key/title/content/status/created_at/opened_at，
+          不含 action_key/event_id/内部 UUID/数据库原始 result；
+        - 日志只记录异常类型，不记录完整 letter_key/标题/正文。
+        """
+        if scope["method"] != "POST":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 POST"})
+            return
+        key = _normalize_letter_key(raw_key)
+        if key is None:
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_LETTER_KEY",
+                                              "message": "letter_key 非法"})
+            return
+        try:
+            import home.service as _home_service
+            result = await asyncio.to_thread(_home_service.request_open_letter, key)
+        except Exception as e:
+            _log(f"⚠️ [拆信] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            code = result.get("error_code") or "INTERNAL_ERROR"
+            if code == "NOT_FOUND_OR_FORBIDDEN":
+                status_code, message = 404, "信件不存在或无法访问"
+            elif code == "LETTER_ARCHIVED":
+                status_code, message = 409, "这封信已归档"
+            elif code == "LETTER_UNOPENED":
+                status_code, message = 409, "这封信还没有拆开"
+            else:
+                status_code, message = 500, "服务暂时不可用"
+            await _send_json_resp(send, status_code, {"ok": False, "error_code": code, "message": message})
+            return
+        data = result.get("data") or {}
+        await _send_json_resp(send, 200, {"ok": True,
+                                          "already_opened": bool(data.get("already_opened")),
+                                          "item": data.get("item") or {}})
+
+    async def _handle_letter_read_api(self, scope, send, raw_key: str = ""):
+        """GET /api/home/letters/:letter_key — 已拆信再次阅读（零副作用）。
+
+        - service_role 直接 SELECT，不调用拆信 RPC，不写 home_action_runs/home_events，
+          多次读取均成功且不改变任何状态；
+        - unopened（含归档未拆）409 LETTER_UNOPENED，不返回正文、不自动拆信；
+        - 响应投影与拆信接口一致；日志只记录异常类型，不记录 key/正文。
+        """
+        if scope["method"] != "GET":
+            await _send_json_resp(send, 405, {"ok": False, "error_code": "METHOD_NOT_ALLOWED",
+                                              "message": "仅支持 GET"})
+            return
+        key = _normalize_letter_key(raw_key)
+        if key is None:
+            await _send_json_resp(send, 400, {"ok": False, "error_code": "INVALID_LETTER_KEY",
+                                              "message": "letter_key 非法"})
+            return
+        try:
+            import home.service as _home_service
+            result = await asyncio.to_thread(_home_service.read_opened_letter, key)
+        except Exception as e:
+            _log(f"⚠️ [信件阅读] 接口异常: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"ok": False, "error_code": "INTERNAL_ERROR",
+                                              "message": "服务暂时不可用"})
+            return
+        if not result.get("ok"):
+            code = result.get("error_code") or "INTERNAL_ERROR"
+            if code == "NOT_FOUND_OR_FORBIDDEN":
+                status_code, message = 404, "信件不存在或无法访问"
+            elif code == "LETTER_UNOPENED":
+                status_code, message = 409, "这封信还没有拆开"
+            else:
+                status_code, message = 500, "服务暂时不可用"
+            await _send_json_resp(send, status_code, {"ok": False, "error_code": code, "message": message})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "item": result.get("data") or {}})
+
     async def _handle_emotion_page(self, send):
         """返回情绪/欲望 Mini App 静态页面（同目录 emotion_miniapp.html）。"""
         try:
@@ -5174,6 +5268,29 @@ class HostFixMiddleware:
 # ==========================================
 # 辅助函数
 # ==========================================
+
+def _normalize_letter_key(raw_key: str):
+    """C9：校验并规范化 letter_key 路径参数。合法返回 key 字符串，非法返回 None。
+
+    - unquote 还原前端 encodeURIComponent 编码；拒绝空值/超长(>200)/路径分隔符/
+      控制字符/%残留（畸形编码如 %ZZ 经 unquote 后仍含 %，一并拒绝）；
+    - 值只进入 Supabase 查询构造器参数绑定，不拼 SQL；
+    - 校验先行：非法 key 在任何数据库调用之前就被拒绝。
+    """
+    from urllib.parse import unquote as _unquote
+    try:
+        key = _unquote(raw_key or "")
+    except Exception:
+        return None
+    key = key.strip()
+    if not key or len(key) > 200:
+        return None
+    if "/" in key or "\\" in key or "%" in key:
+        return None
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in key):
+        return None
+    return key
+
 
 async def _check_api_secret(scope, send):
     """校验 API_SECRET。返回 True=通过，False=已拒绝(已发送 401)"""

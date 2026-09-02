@@ -667,6 +667,47 @@ def fetch_unopened_letter_count() -> int:
     except Exception:
         return 0
 
+
+def fetch_letter_read_state(letter_key: str) -> Optional[dict]:
+    """C9：查询单封信件的读取路由状态（service_role 只读 SELECT，不含正文）。
+
+    - 供拆信/阅读入口做零副作用预检路由，避免对已拆/归档信重复调用写 RPC；
+    - 不调用任何写 RPC，不产生 home_action_runs；不存在的信返回 None；
+    - 数据库异常向上抛出（由 service 层映射错误码）。
+    """
+    sb = _get_supabase_service()
+    if sb is None:
+        raise RuntimeError("SERVICE_KEY_MISSING")
+    resp = (sb.table("home_letters")
+            .select("status,opened_at")
+            .eq("letter_key", letter_key)
+            .limit(1)
+            .execute())
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
+def fetch_opened_letter_by_key(letter_key: str) -> Optional[dict]:
+    """C9：按 letter_key 受控读取已拆信正文（service_role 只读 SELECT，零副作用）。
+
+    - 仅在调用方确认信件可读（opened，或 archived 且 opened_at 非空）后调用；
+    - 不调用 rpc_home_open_letter（该 RPC 每次调用都会写一条 home_action_runs），
+      因此同一封信可无限次重复读取，多次 GET 均零写入；
+    - 投影只含 letter_key/title/content/status/created_at/opened_at，
+      不含 author/recipient/room/metadata/action_key/UUID；content 只经返回值交付，不写日志；
+    - 数据库异常向上抛出；未找到返回 None（由调用方映射 404）。
+    """
+    sb = _get_supabase_service()
+    if sb is None:
+        raise RuntimeError("SERVICE_KEY_MISSING")
+    resp = (sb.table("home_letters")
+            .select("letter_key,title,content,status,created_at,opened_at")
+            .eq("letter_key", letter_key)
+            .limit(1)
+            .execute())
+    rows = resp.data or []
+    return rows[0] if rows else None
+
 def fetch_notes_by_room(room_id: str, include_read: bool = False) -> list[dict]:
     """查询指定房间的便利贴（SQL 层不查询 content 列，用 left() 生成预览）。"""
     sb = _get_supabase()

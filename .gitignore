@@ -72,3 +72,5 @@ files.txt
 !requirements.txt
 # C6：Home/行动日志/秘密日记前端 API 专项测试纳入版本控制（其余 test_*.py 保持忽略）
 !test_home_api_c6.py
+# C9：受保护拆信与已拆信阅读专项测试纳入版本控制（其余 test_*.py 保持忽略）
+!test_letter_open_c9.py

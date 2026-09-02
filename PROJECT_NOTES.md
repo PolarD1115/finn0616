@@ -5288,3 +5288,112 @@ user_scoped 全真、writes_executed=false）；第 21/22 阶段词面召回已�
 5. 待 active 数量增加后再评估：RRF 参数校准、阈值校准、lexical 是否升级为
    全量 active 检索（需单独设计受限 SELECT 上限）、多 memory_type 与多用户
    场景、以及最终接入正式上下文的设计。
+
+
+---
+
+## 阶段 C9：受保护的拆信与已拆信阅读入口
+
+### 原问题
+Home 页面能看到信件标题和摘要，但没有拆信入口；未拆信正文被 `/api/home/state`
+正确隔离，但用户无入口读到正文，已拆信也无法再次阅读。
+
+### 新增接口（均受现有 /api/* 全局 API_SECRET 鉴权保护，不注册 MCP）
+- `POST /api/home/letters/:letter_key/open` —— 拆信（有副作用）。
+  后端 service 层生成 action_key（`open_letter_<UTC时间戳14位>_<token_hex(4)>`，
+  与 tool_loop._gen_home_action_key 同族），前端/模型不参与、响应与日志均不含全文；
+  状态转换唯一权威路径是现有 `rpc_home_open_letter`（不在 Python 侧复刻 RPC 逻辑）；
+  成功后重读一次取完整投影（RPC 返回的 opened_at 是更新前旧值）。
+  零副作用预检路由（repo.fetch_letter_read_state：service_role 只查 status/opened_at）：
+  已拆信（含已拆后归档）改走只读返回 200 + already_opened=true，不重复执行状态转换、
+  不产生冗余 action_run；归档且从未拆开 → 409 LETTER_ARCHIVED（不擅自恢复状态）；
+  不存在 → 404 NOT_FOUND_OR_FORBIDDEN；RPC 业务失败一律单次调用、不重试、不循环
+  生成 action_key。错误映射：400 非法 key（在任何 DB 调用前拒绝）/ 404 不存在 /
+  409 归档或未拆 / 500 系统错误（脱敏固定文案）。
+- `GET /api/home/letters/:letter_key` —— 已拆信再次阅读（完全零副作用）。
+  service_role 直接 SELECT，不调用拆信 RPC、不写 home_action_runs/home_events，
+  可无限次重复读取；unopened（含归档未拆，opened_at 非空是"曾经拆过"的唯一证明，
+  因 archive RPC 允许未拆先归档）→ 409 LETTER_UNOPENED，不返回正文、不自动拆信。
+- 路径参数校验 `_normalize_letter_key`：unquote 还原 → 拒空/超长(>200)/路径分隔符/
+  控制字符/%残留（双编码 %252F 亦拒）；值只进 Supabase 查询构造器参数绑定。
+
+### 数据访问与隐私边界
+- 新增 repo 只读函数：`fetch_letter_read_state`（status+opened_at，路由预检）、
+  `fetch_opened_letter_by_key`（service_role 只读 SELECT，零副作用）；
+  新增 service 函数：`request_open_letter`（POST 编排）、`read_opened_letter`（GET）、
+  `_gen_letter_open_action_key`、`_letter_read_projection`（安全投影仅
+  letter_key/title/content/status/created_at/opened_at 六字段）。
+- `/api/home/state` 信件投影保持不变（letter_key/title/preview/status/is_unopened/
+  created_at），严禁且未添加 content；列表接口不返回未拆正文。
+- 正文不写 localStorage/sessionStorage、不 console.log、不写服务日志（异常日志只记
+  type(e).__name__）、不写 activity_logs、不写普通 memories、不写秘密日记、
+  不调用模型；拆信失败后无任何路径 SELECT 未拆正文。
+- RPC 复用说明：rpc_home_open_letter 每次调用都会写一条 home_action_runs
+  （action_key 唯一）；重复拆信用新 action_key 不报错但产生冗余 run——这正是
+  预检路由改为只读返回的原因；ACTION_EXISTS 仅在预检竞态理论可发生，映射 500
+  且不重试。
+
+### 前端（Console + Mini App 同步）
+- 未拆信显示"拆信"按钮 → POST /open；已拆信显示"阅读"按钮 → GET 阅读；
+  归档信显示"已归档"禁用标签（不新增恢复功能）。
+- 点击后立即弹全屏"拆信中…/加载中…"遮罩（阻断连续点击）；正文仅在点击后加载、
+  不预加载；modal 关闭 closeModal() 清空 modalRoot；请求失败 toast + closeModal
+  不残留旧正文；标题/日期/状态/正文全部经 esc() 转义，正文 white-space:pre-wrap
+  保留换行；letter_key 经 encodeURIComponent 拼入路径。
+- api() 错误消息回退扩为 `data.error||data.message`（C6 式 {ok,error_code,message}
+  响应的固定中文文案可显示给用户；未扩大暴露面）；401 时新入口会关闭加载遮罩。
+
+### 测试结果（全部 unittest+mock，零真实 Supabase/RPC/HTTP）
+- py_compile：gateway.py / home/repository.py / home/service.py /
+  test_letter_open_c9.py 全过；
+- 专项 test_letter_open_c9：42 测全过（A 拆信成功投影与 action_key 格式 /
+  B action_key 不受前端控制 / C 重复拆信转只读+归档语义 / D 双击并发与竞态
+  already_opened / E GET 零副作用可重复且字段集精确 / F 未拆 409 不读正文不自动拆 /
+  G 归档已拆可读归档未拆拒 / H 八类非法 key 400 且不触达 service+200 字符合法通过 /
+  I 404 不泄露 / J 业务失败不重试不读正文+异常脱敏 / K Home state 投影无 content /
+  L 401/503 不触达 service / M 四方法×两路径 405 / N+O 两前端静态检查+node --check v24）；
+- 回归全绿零新增失败：test_home_api_c6=66、test_pet_feed_priority=38、
+  test_home_autonomy_loop=26、test_activity_logs=37、test_secret_diary_c4=56、
+  test_unified_autonomy_c5=55、test_home_diary_compat=16；
+- 安全复核子智能体 R1-R14 逐项 PASS（方法限制/key 校验/action_key 独占/幂等/
+  零副作用/投影/日志脱敏/Home state 不受影响/前端转义/api() 回退/service_role
+  只读/失败路径不泄露未拆正文/TOCTOU 兜底/测试真实性）。
+
+### Supabase 只读核实（全程只读 execute_sql/list_tables，未调用任何写 RPC）
+- 部署前基线：home_letters 16 列（letter_key UNIQUE、action_key UNIQUE、
+  status CHECK∈{unopened,opened,archived}、metadata jsonb、opened_at/archived_at
+  可空）；status 分布 unopened=7/opened=0/archived=0；
+  rpc_home_open_letter(p_action_key text, p_letter_key text) RETURNS jsonb
+  security definer（函数体逐条核实：ACTION_EXISTS/NOT_FOUND_OR_FORBIDDEN/
+  LETTER_ARCHIVED/条件更新+写 home_events/成功返回六字段/首拆 opened_at 为旧值）；
+  rpc_home_archive_letter 不校验 opened（允许未拆先归档）；
+  RLS 仅两条 SELECT policy（anon/authenticated 且 status<>'archived'）。
+- 完成后复核：home_letters 仍 unopened=7（前后不变）；RLS policy 无变化；
+  home_action_runs 142→163、home_events 130→151 为生产自主活动循环期间的自然
+  增长（1:1 关系，与信件无关；本阶段零写操作、测试全 mock）。
+- **既有缺口报告（本阶段未修，禁止改数据库结构）**：home_letters 表上无任何列级
+  ACL（pg_attribute.attacl 全 NULL），anon/authenticated 有表级 SELECT——
+  PROJECT_NOTES 早期记录的"REVOKE SELECT (content)"实际未生效，anon key 理论上
+  可直读未归档信件正文。建议后续单独阶段处理（REVOKE 后重建列级授权或收紧表级
+  授权），需用户决定。
+
+### 数据安全声明
+- INSERT/UPDATE/DELETE/TRUNCATE/DROP/ALTER/CREATE=否；未应用迁移；未创建/修改/
+  删除/归档任何信件；未调用任何写 RPC；
+- Supabase SELECT=是（仅上述只读结构/计数核实，未读取或输出任何信件正文/标题/
+  preview/letter_key/UUID/action_key）；
+- 未新增环境变量、未修改 VARIABLES.md、未修改 prompts/reply_rules.md、
+  未修改 heartbeat/tool_loop/activity_registry/home/activity_log/home_system/
+  migrations/C1-C6 专项测试；
+- 用户已有未提交修改（pyc/reply_rules.md/test_shared_experience_phase6.py/
+  全部未跟踪文件）原样保留未覆盖；credentials.json/token.json 未读取；
+- 未 commit/push（用户未要求）；.gitignore 精确新增 `!test_letter_open_c9.py`
+  （test_*.py 总体忽略不变），专项测试可提交（check-ignore 实证 NOT_IGNORED）；
+  git diff --check 干净。
+
+### 已知限制
+- 未实现信件回复、归档 UI、删除、便利贴写入（本阶段边界外）；
+- 归档信 UI 不提供阅读入口（API 层面已拆归档信可读，前端保守显示"已归档"）；
+- 并发双击同一未拆信在极端竞态下 RPC 会多写一条 succeeded action_run
+  （RPC 自身账本语义，无重复事件、无状态破坏）；
+- 上述 home_letters 列级权限缺口留待用户决定后续处理。

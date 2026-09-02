@@ -660,6 +660,147 @@ def archive_letter(letter_key: str, action_key: str) -> dict:
     return repo.rpc_archive_letter(action_key.strip(), letter_key.strip())
 
 
+# ============================================================
+# C9: 信件拆阅入口（仅供网关受保护 API 使用）
+# ============================================================
+
+def _gen_letter_open_action_key() -> str:
+    """C9：后端生成拆信 action_key（与 tool_loop._gen_home_action_key 同族格式）。
+
+    前端与模型均不参与生成；每次首次拆信使用唯一值；不在日志中打印全文。
+    """
+    import secrets
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"open_letter_{ts}_{secrets.token_hex(4)}"
+
+
+def _letter_read_projection(row: dict) -> dict:
+    """C9：信件正文安全投影。只保留前端展示字段，不含内部 UUID/action_key/metadata。"""
+    return {
+        "letter_key": row.get("letter_key", ""),
+        "title": row.get("title", ""),
+        "content": row.get("content", ""),
+        "status": row.get("status", ""),
+        "created_at": row.get("created_at"),
+        "opened_at": row.get("opened_at"),
+    }
+
+
+def _fetch_letter_row_safe(key: str) -> dict | None:
+    """C9：读取信件完整投影，数据库异常时返回 None（由调用方决定兜底行为）。"""
+    try:
+        return repo.fetch_opened_letter_by_key(key)
+    except Exception:
+        return None
+
+
+def read_opened_letter(letter_key: str) -> dict:
+    """C9：已拆信再次阅读（零副作用，不注册 MCP、不进普通搜索/聊天上下文）。
+
+    - service_role 直接 SELECT，不调用 rpc_home_open_letter，
+      不写 home_action_runs/home_events，同一封信可无限次重复读取；
+    - unopened（含归档未拆）不返回正文，错误码 LETTER_UNOPENED，不自动拆信；
+      archive RPC 允许未拆先归档，opened_at 非空是"曾经拆过"的唯一证明；
+    - 错误码：EMPTY_LETTER_KEY / NOT_FOUND_OR_FORBIDDEN / LETTER_UNOPENED /
+      SERVICE_KEY_MISSING / DB_ERROR。
+    """
+    if not letter_key or not letter_key.strip():
+        return err_result("信件标识为空", "EMPTY_LETTER_KEY")
+    key = letter_key.strip()
+    try:
+        state = repo.fetch_letter_read_state(key)
+    except RuntimeError as e:
+        if "SERVICE_KEY_MISSING" in str(e):
+            return err_result("数据库服务密钥未配置", "SERVICE_KEY_MISSING")
+        return err_result("读取失败", "DB_ERROR")
+    except Exception:
+        return err_result("读取失败", "DB_ERROR")
+    if state is None:
+        # 不区分"存在但禁止"与"不存在"
+        return err_result("信件不存在", "NOT_FOUND_OR_FORBIDDEN")
+    status = state.get("status") or ""
+    if status == "unopened" or (status == "archived" and not state.get("opened_at")):
+        return err_result("这封信还没有拆开", "LETTER_UNOPENED")
+    try:
+        row = repo.fetch_opened_letter_by_key(key)
+    except Exception:
+        return err_result("读取失败", "DB_ERROR")
+    if row is None:
+        return err_result("信件不存在", "NOT_FOUND_OR_FORBIDDEN")
+    return ok_result("信件读取", _letter_read_projection(row))
+
+
+def request_open_letter(letter_key: str) -> dict:
+    """C9：用户前端拆信入口（有副作用，仅供网关受保护 POST 使用）。
+
+    - action_key 由后端生成（前端/模型不参与），状态转换唯一权威路径是现有
+      rpc_home_open_letter（不在 Python 侧复刻 RPC 业务逻辑）；
+    - 只读预检路由：已拆信（含已拆后归档）改走零副作用只读返回 already_opened=true，
+      不重复执行状态转换、不产生冗余 home_action_runs；
+      归档且从未拆开的信返回 LETTER_ARCHIVED，不擅自恢复状态；
+    - RPC 成功后重读一次取完整投影（RPC 返回的 opened_at 是更新前旧值）；
+    - 不写 activity_logs、不写 memories、不写秘密日记、不调用模型；
+    - RPC 返回业务失败不重试、不循环生成 action_key（ACTION_EXISTS 等一律安全失败）；
+    - 错误码：EMPTY_LETTER_KEY / NOT_FOUND_OR_FORBIDDEN / LETTER_ARCHIVED /
+      SERVICE_KEY_MISSING / DB_ERROR。
+    """
+    if not letter_key or not letter_key.strip():
+        return err_result("信件标识为空", "EMPTY_LETTER_KEY")
+    key = letter_key.strip()
+    # 零副作用预检路由（避免对已拆/归档信重复调用写 RPC 产生冗余 action_run）
+    try:
+        state = repo.fetch_letter_read_state(key)
+    except RuntimeError as e:
+        if "SERVICE_KEY_MISSING" in str(e):
+            return err_result("数据库服务密钥未配置", "SERVICE_KEY_MISSING")
+        return err_result("拆信失败", "DB_ERROR")
+    except Exception:
+        return err_result("拆信失败", "DB_ERROR")
+    if state is not None:
+        status = state.get("status") or ""
+        if status == "opened" or (status == "archived" and state.get("opened_at")):
+            # 已拆信：不重复执行状态转换，改走只读阅读
+            row = _fetch_letter_row_safe(key)
+            if row is None:
+                return err_result("信件不存在", "NOT_FOUND_OR_FORBIDDEN")
+            return ok_result("信件已拆开", {"item": _letter_read_projection(row),
+                                            "already_opened": True})
+        if status == "archived":
+            # 归档且从未拆开：拆信动作被业务拒绝，不擅自恢复状态
+            return err_result("这封信已归档", "LETTER_ARCHIVED")
+        # status == "unopened"：继续走下方正常拆信
+    action_key = _gen_letter_open_action_key()
+    try:
+        raw = open_letter(key, action_key)
+    except Exception:
+        # RPC 调用异常（网络/DB）：不重试，安全失败
+        return err_result("拆信失败", "DB_ERROR")
+    if not isinstance(raw, dict):
+        return err_result("拆信失败", "DB_ERROR")
+    if raw.get("ok") is True:
+        # RPC 成功后重读一次：RPC 返回的 opened_at 是更新前旧值，需取新投影；
+        # RPC 响应中 opened_at 非空说明该信在预检后已被并发拆开（无重复事件，无状态破坏）
+        already_opened = raw.get("opened_at") is not None
+        row = _fetch_letter_row_safe(key)
+        if row is None:
+            row = {"letter_key": key, "title": raw.get("title", ""),
+                   "content": raw.get("content", ""), "status": "opened",
+                   "created_at": None, "opened_at": raw.get("opened_at")}
+        return ok_result("信已拆开", {"item": _letter_read_projection(row),
+                                      "already_opened": already_opened})
+    # RPC 业务失败：不重试、不生成第二次状态修改
+    code = raw.get("error_code") or ""
+    if code == "NOT_FOUND_OR_FORBIDDEN":
+        return err_result("信件不存在", "NOT_FOUND_OR_FORBIDDEN")
+    if code == "LETTER_ARCHIVED":
+        return err_result("这封信已归档", "LETTER_ARCHIVED")
+    if code == "SERVICE_KEY_MISSING":
+        return err_result("数据库服务密钥未配置", "SERVICE_KEY_MISSING")
+    # ACTION_EXISTS / RPC_ERROR / RPC_EMPTY / 其他未知码：安全失败
+    return err_result("拆信失败", "DB_ERROR")
+
+
 def leave_note(author_key: str, room_key: str, content: str, action_key: str) -> dict:
     """在房间留便利贴。"""
     if not action_key or not action_key.strip():
