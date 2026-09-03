@@ -2493,19 +2493,21 @@ class HostFixMiddleware:
         #      既不污染缓存前缀，又落在模型注意力最高的末尾位置。
         #   ③ 时间戳放在 volatile_block 的最末行、紧贴用户消息，避免被 AI 漏看。
         # ==========================================
-        stable_parts = []
+        # 角色层（人设/表情包/回复规则）→ stable_system（可缓存）
+        # 审计层（画像/阶段总结）→ volatile_block（不污染人设）
+        character_parts = []
         if persona:
-            stable_parts.append(persona)
+            character_parts.append(persona)
         if _WORLD_BOOK_TEXT:
-            stable_parts.append(_WORLD_BOOK_TEXT)
-        stable_parts.append(f"【{user_name}的核心画像】:\n{user_prof}")
-        if not _skip_core_summaries:
-            stable_parts.append(f"【近3次阶段总结】:\n{core_summaries}")
+            character_parts.append(_WORLD_BOOK_TEXT)
         if _REPLY_RULES_TEXT:
-            stable_parts.append(_REPLY_RULES_TEXT)
-        stable_system = "\n\n".join(stable_parts)
+            character_parts.append(_REPLY_RULES_TEXT)
+        stable_system = "\n\n".join(character_parts)
 
+        # 原来拼接 stable_parts 的位置改成 volatile
         volatile_block = (
+            f"【{user_name}的核心画像】:\n{user_prof}\n"
+            f"【近3次阶段总结】:\n{core_summaries}\n"
             f"[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]\n"
             f"【深层关联记忆】:\n{pinecone_context}\n"
         )

@@ -1026,14 +1026,22 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     device_snapshot = r.get("device") or ""
 
     # 📦 缓存友好的两段式拼装（与网页渠道 _inject_context 对齐）：
-    #   稳定前缀（人设 + 画像 + 阶段总结）在前，作为可命中 prompt cache 的公共前缀；
-    #   易变尾块（深层记忆 / 历史回顾 / 设备快照 / 实时时间+渠道）在后，
+    #   角色层（人设/回复规则）在前，作为可命中 prompt cache 的公共前缀；
+    #   审计层/易变尾块（画像/总结/深层记忆/历史回顾/设备快照/实时时间+渠道）在后，
     #   时间戳放最末行紧贴用户消息，避免污染缓存前缀 & 避免被 AI 漏看。
-    stable_parts = [
+    # 角色层（人设/回复规则）
+    # 审计层（画像/总结）→ volatile
+    character_parts = [persona]
+    try:
+        import gateway as _gw
+        if getattr(_gw, "_REPLY_RULES_TEXT", ""):
+            character_parts.append(_gw._REPLY_RULES_TEXT)
+    except Exception:
+        pass
+
+    volatile_parts = [
         f"【{user_name}的核心画像】:\n{user_prof}",
         f"【近3次阶段总结】:\n{core_summaries}",
-    ]
-    volatile_parts = [
         "[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]",
         f"【深层关联记忆】:\n{pinecone_context}",
     ]
@@ -1082,8 +1090,6 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
-    parts = stable_parts + volatile_parts
-
     # Feed injection statistics into the shared gateway buffer without logging private context.
     try:
         import gateway as _gw
@@ -1104,7 +1110,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
-    return f"{persona}\n\n" + "\n\n".join(parts)
+    return "\n\n".join(character_parts) + "\n\n" + "\n\n".join(volatile_parts)
 
 
 def _format_time_cn(iso_str: str) -> str:
