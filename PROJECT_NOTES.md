@@ -5497,5 +5497,29 @@ Home 页面能看到信件标题和摘要，但没有拆信入口；未拆信正
 - 未对 Supabase 进行任何写/删操作。
 
 
+---
+
+## 阶段 4：人设强制置于 System 消息最前端进行身份锚定（2026-09-03）
+
+### 变更背景与目的
+- 增强模型的自我身份认同，避免模型在生成思维链时先陷入外部画像与事实核验（"Observing Compliance..."），强化先识别自我恋人身份（"我是 Finn..."）。
+- 确保在 system 消息组装时，`persona` 被绝对置于最前列（前置于所有表情包世界书、回复规则、用户输入拼接）。
+
+### 实际修改文件
+1. `gateway.py`（`HostFixMiddleware._inject_context`，约 2565-2585 行）：
+   - `character_parts` 移出 `persona` 避免重复拼接。
+   - 在注入 system 消息分支中，显式前置 `{persona}\n\n{stable_system}`，确保人设永远位于最顶部。
+2. `server.py`（`_build_channel_context`，约 1035 行与 1118 行）：
+   - `character_parts` 去除 `persona` 避免多重累加。
+   - 最终返回显式采用 `f"{persona}\n\n" + "\n\n".join(character_parts) + "\n\n" + "\n\n".join(volatile_parts)`。
+
+### 验证标准检查
+- 网页链路端（Gateway）的第一条 system 消息以 `persona` 纯净开头。
+- 渠道链路端（Server）的输出以 `persona` 纯净开头。
+- `python -m py_compile gateway.py server.py` 编译通过。
+- 未新增环境变量，未触碰 Supabase 数据库。
+
+
+
 
 

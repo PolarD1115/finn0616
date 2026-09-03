@@ -1036,7 +1036,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     #   时间戳放最末行紧贴用户消息，避免污染缓存前缀 & 避免被 AI 漏看。
     # 角色层（人设/回复规则）
     # 审计层（画像/总结）→ volatile
-    character_parts = [persona]
+    character_parts = []
     try:
         import gateway as _gw
         if getattr(_gw, "_REPLY_RULES_TEXT", ""):
@@ -1115,7 +1115,8 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
-    return "\n\n".join(character_parts) + "\n\n" + "\n\n".join(volatile_parts)
+    # 把 persona 放最前面，确保模型先读到"我是 Finn"
+    return f"{persona}\n\n" + "\n\n".join(character_parts) + "\n\n" + "\n\n".join(volatile_parts)
 
 
 def _format_time_cn(iso_str: str) -> str:

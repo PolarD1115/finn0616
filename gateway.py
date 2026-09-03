@@ -2498,11 +2498,9 @@ class HostFixMiddleware:
         #      既不污染缓存前缀，又落在模型注意力最高的末尾位置。
         #   ③ 时间戳放在 volatile_block 的最末行、紧贴用户消息，避免被 AI 漏看。
         # ==========================================
-        # 角色层（人设/表情包/回复规则）→ stable_system（可缓存）
+        # 角色层（人设/表情包/回复规则）
         # 审计层（画像/阶段总结）→ volatile_block（不污染人设）
         character_parts = []
-        if persona:
-            character_parts.append(persona)
         if _WORLD_BOOK_TEXT:
             character_parts.append(_WORLD_BOOK_TEXT)
         if _REPLY_RULES_TEXT:
@@ -2569,15 +2567,20 @@ class HostFixMiddleware:
 
         # ① 注入稳定前缀到 system：已有 system 就「前置」拼接（保证稳定内容仍在最前，
         #    维持缓存前缀不被前端自带 system 内容顶开），没有就插入到最前。
+        #    把 persona 放最前面，强制身份锚定，确保模型最先读到自身角色。
         has_system = False
         for m in req_data.get("messages", []):
             if m.get("role") == "system":
                 existing = str(m.get("content", ""))
-                m["content"] = f"{stable_system}\n\n{existing}" if existing else stable_system
+                if persona:
+                    m["content"] = f"{persona}\n\n{stable_system}\n\n{existing}" if existing else f"{persona}\n\n{stable_system}"
+                else:
+                    m["content"] = f"{stable_system}\n\n{existing}" if existing else stable_system
                 has_system = True
                 break
         if not has_system and req_data.get("messages"):
-            req_data["messages"].insert(0, {"role": "system", "content": stable_system})
+            content_to_insert = f"{persona}\n\n{stable_system}" if persona else stable_system
+            req_data["messages"].insert(0, {"role": "system", "content": content_to_insert})
 
         # 清理：去掉末尾的 assistant 尾巴（防止前端误带）
         while req_data.get("messages") and req_data["messages"][-1].get("role") == "assistant":
