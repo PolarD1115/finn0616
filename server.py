@@ -976,7 +976,12 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     if pr and pr.data:
         import gateway as _gw
         rows = [row for row in pr.data if _gw._is_profile_key(row.get("key", ""))]
-        user_prof = "\n".join([f"- {row['key']}: {str(row['value'])[:200]}" for row in rows[:60]])
+        profile_lines = []
+        for row in rows[:30]:
+            val = str(row.get("value", "")).strip()
+            if val:
+                profile_lines.append(f"• {val[:150]}")
+        user_prof = "\n".join(profile_lines) if profile_lines else "暂无"
 
     core_summaries = "无长期记忆"
     sr = r.get("summaries")
@@ -1040,7 +1045,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         pass
 
     volatile_parts = [
-        f"【{user_name}的核心画像】:\n{user_prof}",
+        f"关于{user_name}：\n{user_prof}",
         f"【近3次阶段总结】:\n{core_summaries}",
         "[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]",
         f"【深层关联记忆】:\n{pinecone_context}",

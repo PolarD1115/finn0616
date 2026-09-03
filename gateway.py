@@ -2391,7 +2391,12 @@ class HostFixMiddleware:
                 pr = await asyncio.to_thread(lambda: sb.table("user_facts").select("key, value").neq("key", "sys_config").neq("key", "llm_settings").neq("key", "llm_models").order("key").execute())
                 if pr and pr.data:
                     rows = [r for r in pr.data if _is_profile_key(r.get("key", ""))]
-                    user_prof = "\n".join([f"- {r['key']}: {str(r['value'])[:200]}" for r in rows[:60]])
+                    profile_lines = []
+                    for r in rows[:30]:
+                        val = str(r.get("value", "")).strip()
+                        if val:
+                            profile_lines.append(f"• {val[:150]}")
+                    user_prof = "\n".join(profile_lines) if profile_lines else "暂无"
             except Exception:
                 pass
             _stable_set("user_prof", user_prof)
@@ -2506,7 +2511,7 @@ class HostFixMiddleware:
 
         # 原来拼接 stable_parts 的位置改成 volatile
         volatile_block = (
-            f"【{user_name}的核心画像】:\n{user_prof}\n"
+            f"关于{user_name}：\n{user_prof}\n"
             f"【近3次阶段总结】:\n{core_summaries}\n"
             f"[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]\n"
             f"【深层关联记忆】:\n{pinecone_context}\n"
