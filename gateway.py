@@ -1404,6 +1404,56 @@ def _is_profile_key(key: str) -> bool:
 _SYSTEM_PROFILE_KEYS = {"sys_config", "llm_settings", "llm_models", "sys_ai_persona"}
 
 
+# 设备快照逆地理编码（经纬度 → 文本地址）：设备端绝大多数上报只有经纬度
+# （device_data 中有坐标的行 98% 无文本地址），此处用高德 regeo 补齐后注入 prompt。
+# AMAP_API_KEY 未配置 / 请求失败时静默降级（不输出位置行），不影响快照其余内容。
+_regeo_cache = {}          # 进程内缓存："lat4,lon4" → 文本位置；位置不变则零请求
+_REGEO_CACHE_MAX = 64
+_regeo_fail_until = 0.0    # 失败冷却截止时间戳：避免网络/Key 异常时每条聊天都重试
+
+
+def _reverse_geocode(lat, lon):
+    """高德逆地理编码：返回 '地址（附近：POI）' 文本；无 Key/失败/冷却中返回 None。"""
+    global _regeo_fail_until
+    amap_key = os.environ.get("AMAP_API_KEY", "").strip()
+    if not amap_key or lat is None or lon is None:
+        return None
+    cache_key = f"{round(float(lat), 4)},{round(float(lon), 4)}"
+    if cache_key in _regeo_cache:
+        return _regeo_cache[cache_key]
+    if time.time() < _regeo_fail_until:
+        return None
+    try:
+        # 高德 regeo：location 经度在前、纬度在后，小数不超 6 位；extensions=all 附带附近 POI
+        url = (
+            "https://restapi.amap.com/v3/geocode/regeo"
+            f"?location={round(float(lon), 6)},{round(float(lat), 6)}&key={amap_key}&extensions=all"
+        )
+        res = requests.get(url, timeout=4).json()
+        if res.get("status") != "1":
+            raise ValueError(f"status={res.get('status')} info={res.get('info')}")
+        reg = res.get("regeocode") or {}
+        addr = str(reg.get("formatted_address") or "").strip()
+        pois = reg.get("pois") or []
+        poi_txt = ""
+        if pois and isinstance(pois[0], dict):
+            name = str(pois[0].get("name") or "").strip()
+            dist = str(pois[0].get("distance") or "").strip()
+            if name:
+                poi_txt = f"{name}({dist}米)" if dist else name
+        if not addr and not poi_txt:
+            return None
+        out = f"{addr}（附近：{poi_txt}）" if addr and poi_txt else (addr or poi_txt)
+        if len(_regeo_cache) >= _REGEO_CACHE_MAX:
+            _regeo_cache.clear()
+        _regeo_cache[cache_key] = out
+        return out
+    except Exception as e:
+        _regeo_fail_until = time.time() + 600
+        _log(f"⚠️ [设备快照] 逆地理编码失败（冷却10分钟）: {e}")
+        return None
+
+
 def _fetch_device_snapshot(sb):
     """
     拉取 device_data 最新一条，渲染成可注入 prompt 的文本块。
@@ -1425,10 +1475,12 @@ def _fetch_device_snapshot(sb):
         return ""
 
     # 富数据行判定：任一字段有值即算（app_usage/health_data/notifications/位置/前台应用）
+    # 位置含经纬度：device_data 事件行均无坐标，不会误选事件行（已查证）
     def _has_payload(r):
         return bool(
             r.get("app_usage") or r.get("health_data") or r.get("notifications")
             or (r.get("location_address") and str(r.get("location_address")).strip())
+            or (r.get("location_latitude") is not None and r.get("location_longitude") is not None)
             or (r.get("foreground_app") and str(r.get("foreground_app")).strip())
         )
 
@@ -1448,12 +1500,16 @@ def _fetch_device_snapshot(sb):
 
     lines = [f"【设备状态快照】更新时间：{updated}"]
 
-    # 位置
+    # 位置：优先设备端文本地址；缺失但有经纬度时用高德逆地理编码补齐
     loc = "".join([x or "" for x in (row.get("location_city"), row.get("location_district"), row.get("location_street"))])
     if row.get("location_address"):
         lines.append(f"📍 位置：{row['location_address']}")
     elif loc:
         lines.append(f"📍 位置：{loc}")
+    elif row.get("location_latitude") is not None and row.get("location_longitude") is not None:
+        regeo = _reverse_geocode(row.get("location_latitude"), row.get("location_longitude"))
+        if regeo:
+            lines.append(f"📍 位置：{regeo}")
 
     # 前台应用
     if row.get("foreground_app"):
