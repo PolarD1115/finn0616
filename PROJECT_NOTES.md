@@ -5523,3 +5523,61 @@ Home 页面能看到信件标题和摘要，但没有拆信入口；未拆信正
 
 
 
+---
+
+## 阶段 5：设备快照定位注入（经纬度逆地理编码补齐）（2026-09-03）
+
+### 变更背景与目的
+- 根因：`_fetch_device_snapshot` 位置行只读 `location_address`/`location_city`/`location_district`/`location_street` 文本字段，而设备端上报的定位几乎全是经纬度（device_data 1354 行中 490 行有 `location_latitude/longitude`，仅 21 行有文本地址；最近的快照行全部只有坐标）→ prompt「📍 位置」行基本永远为空。
+- 修复：坐标存在且设备端无文本地址时，调用高德逆地理编码（regeo）补齐「地址（附近：POI）」后注入；设备端已有文本地址时优先使用现成值，不调 API。
+- 附带修正：`_has_payload` 富数据行判定补上经纬度条件（已查证 device_event 事件行 846 条均无坐标，不会误选事件行）。
+
+### 实际修改文件
+1. `gateway.py`（`_fetch_device_snapshot` 及其上方新增 `_reverse_geocode`）：
+   - 新增进程内缓存 `_regeo_cache`（坐标舍入 4 位小数 ≈ 11m 作 key，上限 64 条，位置不变则零请求）。
+   - 失败冷却：API 失败/网络异常后 10 分钟内不再重试，避免每条聊天消息都白等超时。
+   - 降级：`AMAP_API_KEY` 未配置 / 失败 / 冷却中 → 不输出位置行，快照其余内容不受影响（与改前行为一致）。
+   - 位置行优先级：`location_address` → city/district/street 拼接 → 经纬度 regeo 兜底。
+   - regeo 调用：`restapi.amap.com/v3/geocode/regeo`，location 经度在前、小数不超 6 位，`extensions=all` 取最近 POI，timeout 4s（与 server.py where_is_user 同款用法）。
+
+### 验证标准检查
+- `python3 -m py_compile gateway.py` 通过。
+- mock 测试 11 项全过：坐标行注入位置、事件行补充、经度在前、缓存命中零请求、失败不崩且冷却零请求、异常不崩、无 Key 降级、文本地址优先不调 API、空事件行仍被跳过。
+- `AMAP_API_KEY` 为既有环境变量（VARIABLES.md 已登记），无新增变量。
+- 本地无该 Key，真实 regeo 响应解析依赖 mock 样例（已核对 server.py 现用同接口的同名字段 `formatted_address`/`pois`）。
+- 未触碰 Supabase 数据库。
+
+### 已知风险
+- 坐标系：若设备上报为 WGS-84（GPS 原始）而非 GCJ-02，地址会偏移约 100-600m；与 server.py/weather_tools.py 现有用法一致，对「知道用户大概位置」用途可接受。
+
+---
+
+## 修复：关闭流式输出报 Index 0 out of bounds for length 0（2026-09-04）
+
+### 现象
+客户端（RikkaHub 等 Kotlin/Java App）关闭流式后请求 `/v1/chat/completions`（`stream: false`），立刻报 `Index 0 out of bounds for length 0`。开流式正常。
+
+### 已确认根因
+`gateway.py` `_handle_chat` 旧逻辑无条件执行 `req_data["stream"] = True`，并把响应头写成 `text/event-stream`。
+
+客户端关流式时期待一份完整 JSON：`{"object":"chat.completion","choices":[{"index":0,"message":{...}}]}`。网关却回了 SSE。Kotlin 客户端按非流式解析后读 `choices[0]`，碰到空数组（常见于 SSE 末尾 usage 块 `choices: []`，或整段 SSE 根本解析不出 choices）就会越界。
+
+这不是上游模型的锅，是网关把客户端声明的响应模式丢掉了。
+
+### 实际修改
+1. `gateway.py`
+   - 新增 `_client_wants_stream()`：只有显式 `stream=false` 才走非流式；缺字段仍默认 SSE（兼容现有网页控制台）。
+   - 新增 `_handle_chat_non_stream()`：向上游要完整 JSON，回 `application/json` 的 `chat.completion`。
+   - 新增 `_ensure_non_stream_choices()`：上游若给空 `choices`，补一条空 assistant，避免客户端再读 `[0]` 崩。
+   - 天气 tool loop 按客户端 `stream` 标志分流：流式仍 SSE，非流式走 `_json_final_text`。
+2. `test_non_stream_chat.py`：12 项 mock 测试（解析开关、空 choices 占位、非流式 JSON、流式仍 SSE、上游 400 也回 JSON）。
+
+### 验证
+- `python3 -m py_compile gateway.py test_non_stream_chat.py` 通过。
+- `python3 -m unittest test_non_stream_chat -v`：12/12 通过。
+- 未新增环境变量。
+- 未触碰 Supabase。
+
+### 已知限制
+- 未对真实 RikkaHub / 真实上游做端到端联调（沙箱无密钥）。部署后用 `stream:false` 打一条 `/v1/chat/completions`，确认 `Content-Type: application/json` 且 `choices` 长度 ≥ 1 即可。
+- 未声明 `stream` 的请求仍默认 SSE，网页控制台不受影响。

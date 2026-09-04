@@ -1596,6 +1596,52 @@ _THINKING_PARTIAL_RE = re.compile(
 )
 
 
+def _client_wants_stream(req_data) -> bool:
+    """客户端是否要求 SSE 流式输出。
+
+    未带 stream 字段时返回 True，保持历史行为（网关默认 SSE，便于边透传边落库）。
+    显式 stream=false 时返回 False，必须回 OpenAI 非流式 JSON，否则像 RikkaHub 这类
+    Kotlin 客户端会按 choices[0] 解析，碰到空数组就报 Index 0 out of bounds for length 0。
+    """
+    if not isinstance(req_data, dict) or "stream" not in req_data:
+        return True
+    v = req_data.get("stream")
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _ensure_non_stream_choices(data: dict, model: str = "") -> dict:
+    """保证非流式响应里 choices 至少有 1 条，避免客户端读 choices[0] 崩溃。"""
+    if not isinstance(data, dict):
+        data = {}
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        data["choices"] = [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "stop",
+        }]
+        return data
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    msg = first.get("message")
+    if not isinstance(msg, dict):
+        first["message"] = {"role": "assistant", "content": first.get("text") or ""}
+    else:
+        if "role" not in msg:
+            msg["role"] = "assistant"
+        if msg.get("content") is None:
+            msg["content"] = ""
+        first["message"] = msg
+    first.setdefault("index", 0)
+    first.setdefault("finish_reason", "stop")
+    choices[0] = first
+    data["choices"] = choices
+    if model and not data.get("model"):
+        data["model"] = model
+    return data
+
+
 def _should_rewrite_thinking(model_name: str) -> bool:
     """判断是否需要把 <thinking> 改写成 <think>。"""
     ov = os.environ.get("REWRITE_THINKING_TAG", "").strip().lower()
@@ -2181,11 +2227,21 @@ class HostFixMiddleware:
                 _log(f"⚠️ [Weather] tools 注入失败: {e}")
                 _weather_loop = False
             if _weather_loop and req_data.get("tools"):
-                await self._handle_chat_with_tool_loop(scope, send, req_data, upstream_url, upstream_key, sb, user_msg)
+                await self._handle_chat_with_tool_loop(
+                    scope, send, req_data, upstream_url, upstream_key, sb, user_msg,
+                    want_stream=_client_wants_stream(req_data),
+                )
                 return
         # 关闭时：不注入 tools，纯流式透传（天气已由关键词注入到 volatile_block）
 
-        # 强制流式（便于边透传边收集）
+        # 客户端显式关闭流式时，必须回 JSON chat.completion。
+        # 旧逻辑无条件 stream=True，RikkaHub 等非流式客户端会把 SSE 末尾
+        # 的 usage 空 choices 块当成最终 JSON，读 choices[0] 直接越界。
+        if not _client_wants_stream(req_data):
+            await self._handle_chat_non_stream(scope, send, req_data, upstream_url, upstream_key, sb, user_msg)
+            return
+
+        # 未声明或显式 stream=true：走 SSE（便于边透传边收集）
         req_data["stream"] = True
         # 让上游在流末尾返回 usage（含 cached_tokens / prompt_cache_hit_tokens 等），
         # 不支持的上游（Kimi/GLM 等）会自动忽略此字段，不报错。
@@ -2367,6 +2423,102 @@ class HostFixMiddleware:
 
         # 💗 欲望驱动：网页用户消息分类 + AI 回复事件入队（同 TG/QQ，吞异常）。
         #    放在流式响应结束后、不阻塞首字；仅在情感引擎总开关开启且有实际回复时入队。
+        if user_msg and (collected_content or tool_calls_dict) and _emotion_enabled():
+            asyncio.create_task(self._record_desire_events(user_msg, channel="Web"))
+
+    async def _handle_chat_non_stream(self, scope, send, req_data, upstream_url, upstream_key, sb, user_msg):
+        """非流式聊天：向上游要完整 JSON，原样（或规范化后）回给客户端。
+
+        客户端显式 stream=false 时走这里。不能再改成 SSE，否则 Kotlin/Java 客户端
+        会把空 choices 当最终结果，抛 Index 0 out of bounds for length 0。
+        """
+        import traceback
+        req_data["stream"] = False
+        req_data.pop("stream_options", None)
+        if req_data.get("tools") and "tool_choice" not in req_data:
+            req_data["tool_choice"] = "auto"
+        _apply_claude_cache_control(req_data)
+
+        client_headers = {
+            k.decode("utf-8", "ignore").lower(): v.decode("utf-8", "ignore")
+            for k, v in scope.get("headers", [])
+        }
+        client_ua = client_headers.get("user-agent", "")
+        fwd_headers = {
+            "Authorization": f"Bearer {upstream_key}",
+            "Content-Type": "application/json",
+            "User-Agent": client_ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+        }
+        for h in ("accept-language", "x-requested-with"):
+            if h in client_headers:
+                fwd_headers[h] = client_headers[h]
+
+        payload = dict(req_data)
+        payload["messages"] = _sanitize_outgoing_messages(req_data.get("messages", []))
+        _log(f"➡️ [非流式转发] POST {upstream_url} | model={payload.get('model')} | key={upstream_key[:6]}***")
+
+        try:
+            def _do_post():
+                return requests.post(upstream_url, headers=fwd_headers, json=payload, timeout=300)
+            resp = await asyncio.to_thread(_do_post)
+            status = resp.status_code
+            text = resp.text
+        except Exception as e:
+            _log(f"❌ 非流式上游请求失败: {e}\n{traceback.format_exc()}")
+            await _send_json_resp(send, 502, {"error": {"message": f"上游连接失败: {e}", "type": "upstream_error"}})
+            return
+
+        if status != 200:
+            _log(f"❌ 非流式上游 HTTP {status}: {text[:300]}")
+            try:
+                err_body = json.loads(text)
+            except Exception:
+                err_body = {"error": {"message": text[:500] or f"上游 HTTP {status}", "type": "upstream_error"}}
+            await _send_json_resp(send, status if 400 <= status < 600 else 502, err_body)
+            return
+
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            _log(f"❌ 非流式上游返回非 JSON: {e} | body={text[:200]}")
+            await _send_json_resp(send, 502, {"error": {"message": "上游返回非 JSON", "type": "upstream_error"}})
+            return
+
+        rewrite_thinking = _should_rewrite_thinking(payload.get("model", ""))
+        if rewrite_thinking:
+            try:
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    msg = choices[0].get("message")
+                    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                        msg["content"] = _rewrite_thinking_tags(msg["content"])
+            except Exception as e:
+                _log(f"⚠️ [thinking改写] 非流式改写失败（已跳过）: {e}\n{traceback.format_exc()}")
+
+        data = _ensure_non_stream_choices(data, model=payload.get("model", ""))
+        if not data.get("object"):
+            data["object"] = "chat.completion"
+        if not data.get("id"):
+            data["id"] = f"chatcmpl-gw-{int(time.time())}"
+        if not data.get("created"):
+            data["created"] = int(time.time())
+
+        await _send_json_resp(send, 200, data)
+
+        choice0 = (data.get("choices") or [{}])[0]
+        message = choice0.get("message") or {}
+        collected_content = message.get("content") or ""
+        collected_reasoning = message.get("reasoning_content") or ""
+        tool_calls_list = message.get("tool_calls") or []
+        tool_calls_dict = {i: tc for i, tc in enumerate(tool_calls_list)} if tool_calls_list else {}
+        _log_cache_usage(payload.get("model", ""), data.get("usage"))
+
+        if sb and user_msg and (collected_content or tool_calls_dict):
+            asyncio.create_task(self._save_conversation(
+                sb, user_msg, collected_content, collected_reasoning, tool_calls_dict
+            ))
         if user_msg and (collected_content or tool_calls_dict) and _emotion_enabled():
             asyncio.create_task(self._record_desire_events(user_msg, channel="Web"))
 
@@ -2691,14 +2843,14 @@ class HostFixMiddleware:
     # 🌤️ 天气 tools 循环（OpenAI function calling，可选）
     # ------------------------------------------
 
-    async def _handle_chat_with_tool_loop(self, scope, send, req_data, upstream_url, upstream_key, sb, user_msg):
+    async def _handle_chat_with_tool_loop(self, scope, send, req_data, upstream_url, upstream_key, sb, user_msg, want_stream=True):
         """
         OpenAI tools 循环：模型 tool_call → 网关本地执行 weather_tools → 回灌 role=tool → 再请求，
-        直到模型给出最终文本，再以 SSE 形式回给客户端。兼容现有流式前端。
+        直到模型给出最终文本。流式客户端回 SSE，非流式客户端回 JSON chat.completion。
         """
         import copy
         if not _HAS_WEATHER_TOOLS or weather_tools is None:
-            await self._sse_plain_error(send, req_data, "[Weather] weather_tools 未加载")
+            await self._reply_plain_error(send, req_data, "[Weather] weather_tools 未加载", want_stream=want_stream)
             return
 
         max_rounds = weather_tools.max_tool_rounds()
@@ -2744,18 +2896,18 @@ class HostFixMiddleware:
                 text = resp.text
             except Exception as e:
                 _log(f"❌ [WeatherLoop] 上游请求失败: {e}")
-                await self._sse_plain_error(send, req_data, f"[连接错误] {e}")
+                await self._reply_plain_error(send, req_data, f"[连接错误] {e}", want_stream=want_stream)
                 return
 
             if status != 200:
                 _log(f"❌ [WeatherLoop] 上游 HTTP {status}: {text[:300]}")
-                await self._sse_plain_error(send, req_data, f"[上游错误 HTTP {status}] {text[:200]}")
+                await self._reply_plain_error(send, req_data, f"[上游错误 HTTP {status}] {text[:200]}", want_stream=want_stream)
                 return
 
             try:
                 data = json.loads(text)
             except Exception:
-                await self._sse_plain_error(send, req_data, "[上游错误] 非 JSON 响应")
+                await self._reply_plain_error(send, req_data, "[上游错误] 非 JSON 响应", want_stream=want_stream)
                 return
 
             if data.get("usage"):
@@ -2809,7 +2961,10 @@ class HostFixMiddleware:
         else:
             final_text = collected_content or _TOOL_LOOP_FALLBACK_TEXT
 
-        await self._sse_final_text(send, req_data, final_text)
+        if want_stream:
+            await self._sse_final_text(send, req_data, final_text)
+        else:
+            await self._json_final_text(send, req_data, final_text, usage=loop_usage)
 
         _log_cache_usage(req_data.get("model", ""), loop_usage)
 
@@ -2863,6 +3018,30 @@ class HostFixMiddleware:
 
     async def _sse_plain_error(self, send, req_data, err: str):
         await self._sse_final_text(send, req_data, f"\n\n{err}")
+
+    async def _json_final_text(self, send, req_data, text: str, usage=None):
+        """非流式客户端：把最终文本包装成 OpenAI chat.completion JSON。"""
+        created = int(time.time())
+        body = {
+            "id": f"chatcmpl-gw-{created}",
+            "object": "chat.completion",
+            "created": created,
+            "model": req_data.get("model", "unknown"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text or ""},
+                "finish_reason": "stop",
+            }],
+        }
+        if usage:
+            body["usage"] = usage
+        await _send_json_resp(send, 200, body)
+
+    async def _reply_plain_error(self, send, req_data, err: str, want_stream=True):
+        if want_stream:
+            await self._sse_final_text(send, req_data, f"\n\n{err}")
+        else:
+            await self._json_final_text(send, req_data, f"\n\n{err}")
 
     async def _record_desire_events(self, user_msg, channel: str = "Web"):
         """网页聊天：用户消息分类 + AI 回复事件入队（同 TG/QQ，吞异常不影响聊天）。
