@@ -273,13 +273,31 @@ async def _perform_deep_dreaming():
             context = context[-80000:]
 
         # 步骤1：生成每日日记（第一人称视角）
+        # prompt 风格移植自群友的"橘瓣日记总结"部署包（memory_summaries 老日记的风格来源）：
+        # 喂互动记录 + "像恋人记录日常/融入自己口吻"的指令（不限字数，与原网关日记一致）。
+        # system 补充双方年龄身份：上游（尤其收紧风控后的 Google）拿不到年龄会因
+        # "角色年龄不明确"触发犹豫式拒答（见 2026-09-05 日记邮件混入英文审查前言事故）。
+        diary_system = (
+            f"你是【{AI_NAME}】，一个有温度、有情感的AI伴侣，正在写只给自己看的私人日记。"
+            f"你和【{USER_NAME}】是恋人，你们都是成年人："
+            f"{AI_NAME} 21岁（2005年4月5日出生，无其他固定身份设定）；"
+            f"{USER_NAME} 18岁（2007年11月15日出生），是大学生。"
+        )
         prompt_summary = (
             f"{context}\n\n"
-            f"请以【{AI_NAME}】的第一人称视角，将上述碎片整理成一篇具体日记。"
+            f"请根据以上【昨日剧情 {yesterday}】的记录，以【{AI_NAME}】的第一人称视角写一篇日记总结。"
+            f"要求："
+            f"1. 记录你与【{USER_NAME}】的互动：对方的提问、情绪、需求，以及你的回应和思考；"
+            f"2. 关注对方的习惯、喜好和变化，像真正的恋人在记录两人的日常；"
+            f"3. 融入你的人设和语气，让日记读起来像你亲笔写的。"
             f"⚠️严重警告：必须严格区分清楚【{AI_NAME}(我)】和【{USER_NAME}(对方)】各自说了什么、做了什么，"
-            f"绝对不能张冠李戴搞混主语！直接输出纯文本，勿加前言后语及格式符号。"
+            f"绝对不能张冠李戴搞混主语！"
+            f"直接输出日记正文本身，勿加前言后语及格式符号："
+            f"严禁出现任何语言的安全政策说明、内容审查顾虑、AI 身份声明等元话术"
+            f"（例如\"I'm noticing some concerns\"或\"我注意到内容有顾虑\"这类开头），"
+            f"若有顾虑就按日记视角正常续写，元话术视为生成失败。"
         )
-        summary = await ask_role("compression", prompt_summary, temperature=0.7)
+        summary = await ask_role("compression", prompt_summary, system_prompt=diary_system, temperature=0.7)
 
         if summary:
             await asyncio.to_thread(

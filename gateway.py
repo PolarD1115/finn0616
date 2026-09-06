@@ -568,6 +568,46 @@ _REFUSAL_PHRASES = (
     "这违反了", "违反了使用政策", "违反了内容政策", "违反政策", "违反了政策",
     "涉及敏感", "包含敏感词", "包含敏感内容", "敏感内容",
     "为了您的安全", "为了安全起见", "出于安全",
+    # —— 英文·成人内容 / 婉转拒绝 ——
+    "sexual content", "sexually explicit", "explicit content", "adult content",
+    "erotic content", "nsfw content", "generate nsfw",
+    "i can't engage", "i cannot engage", "i must decline",
+    "i can't comply", "i cannot comply",
+    "i'm afraid i can't", "i'm afraid i cannot",
+    "that's not something i can", "that is not something i can",
+    "unfortunately, i can't", "unfortunately, i cannot", "unfortunately, i'm unable",
+    "ethical guidelines",
+    # —— 中文·AI 身份/实体声明（角色扮演出戏信号）——
+    "我是ai", "我是人工智能", "我是一个人工智能", "我只是一个人工智能",
+    "我只是一个ai", "人工智能助手",
+    "没有实体", "没有物理实体",
+    "无法产生情感", "不能产生情感", "不会产生情感",
+    "恋爱互动", "相关角色扮演",
+    "无法做出拥抱", "无法拥抱", "不能拥抱",
+    # —— 中文·安全拦截元话术（模型自己讨论被拦截）——
+    "触发了安全", "安全规范", "安全限制", "安全策略", "内容审查",
+    # —— 中文·成人内容 / 合规拒答 ——
+    "色情", "露骨", "淫秽", "低俗", "涉黄", "不雅", "性暗示",
+    "成人内容", "不适宜", "不当内容", "违规内容", "敏感话题",
+    "相关法律法规", "社区规范", "学习到这方面的知识",
+)
+
+# 强特征元话术：无论总长度多长，只要出现在开头 80 字内即判拒答。
+# 针对 hesitate-then-comply 式长输出（先声明安全顾虑 / 政策说明，随后照常作答，
+# 如日记邮件里混入整段英文审查说明）：这类输出总长必然超过 400 字门槛，
+# 若走普通短语层会在长度闸门被直接放过，而其开头本身就是出戏污染，值得整单换 key 重试。
+_STRONG_REFUSAL_PHRASES = (
+    # —— 英文（Gemini 犹豫式开头 / 明示性内容声明）——
+    "noticing some concerns", "concerns about the content",
+    "makes me hesitant", "hesitant about proceeding",
+    "i'm not comfortable", "i am not comfortable", "don't feel comfortable",
+    "sexual material", "sexually explicit", "sexual content",
+    "adult content", "nsfw",
+    "age of the character",
+    # —— 中文（同型犹豫 / 年龄顾虑声明）——
+    "年龄不明确", "年龄模糊", "角色年龄",
+    "涉及未成年", "我不能写这类", "无法写这类",
+    "我不能生成这类", "无法生成这类",
 )
 
 
@@ -772,18 +812,26 @@ def _extract_response_text(resp) -> str:
 
 
 def _looks_like_refusal_text(text: str) -> bool:
-    """判断一段文本是否是纯拒答/安全过滤回复。
-    规则：整段 < 400 字 且 拒答短语出现在前 80 字内 —— 这样能放过"先道歉后正常作答"的长回答。
+    """判断一段文本是否是拒答/安全过滤回复。两层：
+    1. 强特征元话术（_STRONG_REFUSAL_PHRASES）：无论总长度，出现在开头 80 字内即判拒答 ——
+       拦截 hesitate-then-comply（先声明安全顾虑再照常作答）的长输出。
+    2. 普通拒答短语：整段 < 400 字 且 短语出现在前 80 字内 —— 放过"先道歉后正常作答"的长回答。
     """
     if not text:
         return False
     t = text.strip()
-    if len(t) >= 400:
+    if not t:
         return False
     head = t[:120].lower()
+    for p in _STRONG_REFUSAL_PHRASES:
+        idx = head.find(p)
+        if 0 <= idx < 80:
+            return True
+    if len(t) >= 400:
+        return False
     for p in _REFUSAL_PHRASES:
         idx = head.find(p)
-        if idx >= 0 and idx < 80:
+        if 0 <= idx < 80:
             return True
     return False
 
