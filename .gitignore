@@ -74,3 +74,37 @@ files.txt
 !test_home_api_c6.py
 # C9：受保护拆信与已拆信阅读专项测试纳入版本控制（其余 test_*.py 保持忽略）
 !test_letter_open_c9.py
+
+# 敏感凭据
+credentials.json
+token.json
+
+# 数字命名文件
+/1650
+/580
+/600
+
+# 临时与测试脚本 (下划线开头)
+_*
+
+# Anthropic 相关探针与测试文件
+anthropic_*
+
+# GitHub 相关 dump 数据
+gh_*
+
+# Issue 相关 JSON
+issue_*.json
+
+# LiteLLM 调试文件
+litellm_*
+
+# 本地抓取/生成的 JSON 数据与树结构
+hermes_*.json
+openai_openapi*
+
+# 单独的临时与测试脚本
+godmode_race.py
+quickstart.py
+test_letter_open_c9.py
+genservice.proto
