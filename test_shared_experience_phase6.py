@@ -259,13 +259,16 @@ class TestDBatchTrigger(unittest.IsolatedAsyncioTestCase):
         # 无共同经历写入
         dep.pinecone_memory.add.assert_not_called()
 
-    async def test_D4_failure_does_not_block_archive(self):
+    async def test_D4_failure_does_not_archive(self):
+        # 🔒 第1阶段契约更新（目标A）：LLM 异常时不再归档原始聊天。
+        #    旧断言「失败也归档防止堆积」会造成总结失败后原始流水脱离上下文（跨会话失忆），
+        #    新行为：失败只记日志，原始记录保留原标签待下次重试。
         dep = self._mock_dep_with_chats(30)
         dep.ask_role_sync = MagicMock(side_effect=Exception("LLM 全部端点失败"))
         with patch.dict(os.environ, {"SUMMARY_THRESHOLD": "30"}), patch("napcat._get_deps", return_value=dep), patch("napcat._naplog"):
             await __import__("napcat").check_and_summarize_all()  # 不应抛
-        # 归档仍执行（update 链被调用）
-        self.assertTrue(dep.supabase.table.return_value.update.called)
+        # 失败时归档不得执行（update 链不被调用）
+        dep.supabase.table.return_value.update.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════
