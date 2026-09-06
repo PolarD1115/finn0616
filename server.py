@@ -2846,6 +2846,373 @@ async def archive_note(note_key: str = "", action_key: str = ""):
     return await asyncio.to_thread(_call)
 
 
+# ==========================================
+# AI 待办（ai_todos）：阶段 2 —— MCP 工具与服务端业务层
+# ==========================================
+# 独立表 ai_todos（migrations/20260904_002_ai_todos.sql），与旧 reminders
+# （server.py manage_reminder / heartbeat.py async_reminder_worker）互不影响。
+# scheduled_at 为 timestamptz：统一存 UTC isoformat 字符串；无时区输入按
+# 北京时间（Asia/Shanghai）解释，展示时转北京时间。到时调度 / Telegram 发送
+# / dynamic 到时生成属后续阶段，本工具只负责参数校验与表读写。
+import traceback  # noqa: E402  （仅本区块错误日志使用，带堆栈打印到控制台）
+
+_AI_TODO_TZ_BJ = datetime.timezone(datetime.timedelta(hours=8), name="Asia/Shanghai")
+_AI_TODO_TITLE_MAX = 200
+_AI_TODO_TEXT_MAX = 5000
+_AI_TODO_TZ_NAME_BJ = "Asia/Shanghai"
+
+
+def _ai_todo_now() -> datetime.datetime:
+    """当前 UTC aware 时间（过期校验与 updated_at 写入统一用它）。"""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _parse_ai_todo_time(time_str: str):
+    """解析时间字符串 -> (aware_datetime, tz_name, err)。
+
+    支持 ISO（含 Z / +08:00）与 "2026-09-05 21:00" 空格分隔写法；
+    无时区输入按北京时间解释，不使用服务器本地时区。
+    """
+    raw = (time_str or "").strip()
+    if not raw:
+        return None, None, "❌ 缺少时间参数 time_str。"
+    s = raw.replace("Z", "+00:00").replace("z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None, None, "❌ 时间格式无法解析，请使用如 2026-09-05T21:00:00+08:00 或 2026-09-05 21:00。"
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_AI_TODO_TZ_BJ), _AI_TODO_TZ_NAME_BJ, None
+    total = int(dt.utcoffset().total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    tz_name = _AI_TODO_TZ_NAME_BJ if total == 8 * 3600 else f"UTC{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+    return dt, tz_name, None
+
+
+def _normalize_ai_todo_repeat_rule(raw):
+    """规范化重复规则 -> (rule_dict_or_None, err)。
+
+    只接受（与迁移注释一致，合法性由应用层校验）：
+      空字符串 / None / JSON "null" -> None（不重复）
+      {"type":"daily"}
+      {"type":"weekly","weekdays":[1,3,5]}   1=周一 .. 7=周日
+      {"type":"weekdays"}
+    拒绝未知 type 与无关字段；weekly 的 weekdays 去重并排序。
+    """
+    if raw is None:
+        return None, None
+    if isinstance(raw, dict):
+        rule = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None, None
+        try:
+            rule = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return None, "❌ repeat_rule 不是合法 JSON，例如 {\"type\":\"daily\"}。"
+    else:
+        return None, "❌ repeat_rule 类型不支持。"
+    if rule is None:
+        return None, None
+    if not isinstance(rule, dict):
+        return None, "❌ repeat_rule 必须是对象，例如 {\"type\":\"daily\"}。"
+    rtype = rule.get("type")
+    if rtype == "daily":
+        if set(rule.keys()) != {"type"}:
+            return None, "❌ daily 规则只接受 {\"type\":\"daily\"}，不含其他字段。"
+        return {"type": "daily"}, None
+    if rtype == "weekdays":
+        if set(rule.keys()) != {"type"}:
+            return None, "❌ weekdays 规则只接受 {\"type\":\"weekdays\"}，不含其他字段。"
+        return {"type": "weekdays"}, None
+    if rtype == "weekly":
+        if set(rule.keys()) != {"type", "weekdays"}:
+            return None, "❌ weekly 规则只接受 {\"type\":\"weekly\",\"weekdays\":[1,3,5]}，不含其他字段。"
+        wd = rule.get("weekdays")
+        if not isinstance(wd, list) or not wd:
+            return None, "❌ weekly 的 weekdays 必须是非空数组，例如 [1,3,5]。"
+        clean = []
+        for x in wd:
+            if isinstance(x, bool) or not isinstance(x, int) or not (1 <= x <= 7):
+                return None, "❌ weekly 的 weekdays 只能是 1-7 的整数（1=周一）。"
+            clean.append(x)
+        return {"type": "weekly", "weekdays": sorted(set(clean))}, None
+    return None, "❌ 重复规则只支持：daily、weekly、weekdays 或不重复。"
+
+
+def _describe_ai_todo_repeat(rule) -> str:
+    """重复规则的模型可读描述。"""
+    if not rule:
+        return "不重复"
+    t = rule.get("type")
+    if t == "daily":
+        return "每天"
+    if t == "weekdays":
+        return "工作日"
+    if t == "weekly":
+        names = "一二三四五六日"
+        days = rule.get("weekdays") or []
+        return "每周" + "、".join(names[w - 1] for w in days if 1 <= w <= 7)
+    return str(rule)
+
+
+def _validate_ai_todo_enum(kind: str, delivery_mode: str):
+    if kind not in ("reminder", "message"):
+        return "❌ kind 必须是 reminder 或 message"
+    if delivery_mode not in ("static", "dynamic"):
+        return "❌ delivery_mode 必须是 static 或 dynamic"
+    return None
+
+
+def _format_ai_todo_row(row, idx: int, show_status: bool = False) -> str:
+    """单条待办 -> 模型可读的多行文本。"""
+    tag = "[提醒事项]" if row.get("kind") == "reminder" else "[想对你说]"
+    when_s = str(row.get("scheduled_at") or "")
+    try:
+        dt = datetime.datetime.fromisoformat(str(row.get("scheduled_at")).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        when_s = dt.astimezone(_AI_TODO_TZ_BJ).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        pass
+    mode = "固定内容" if row.get("delivery_mode") == "static" else "到时结合上下文生成"
+    lines = [
+        f"{idx}. {tag} {row.get('title') or '(无标题)'}",
+        f"   时间：{when_s}",
+        f"   方式：{mode}",
+    ]
+    rep = _describe_ai_todo_repeat(row.get("repeat_rule"))
+    if rep != "不重复":
+        lines.append(f"   重复：{rep}")
+    if show_status:
+        lines.append(f"   状态：{row.get('status', 'pending')}")
+    lines.append(f"   ID：{row.get('id', '')}")
+    return "\n".join(lines)
+
+
+async def _ai_todo_fetch_one(tid: str):
+    """按 id 读取单条待办 -> (row_or_None, err)；err 非空表示数据库故障。
+
+    ai_todos 对 anon/authenticated REVOKE 且无 RLS 策略（见迁移注释，阶段5真实
+    联调已复现 42501），读写必须走 service_role 客户端，不能用 anon 的 supabase。
+    """
+    def _get():
+        return supabase_service.table("ai_todos").select("*").eq("id", tid).limit(1).execute()
+
+    try:
+        res = await asyncio.to_thread(_get)
+    except Exception as e:
+        print(f"⚠️ [AI待办] 查询失败 todo_id={tid} action定位=fetch_one: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return None, "❌ 读取待办失败：数据库暂不可用或 ai_todos 表尚未创建。"
+    if not res or not res.data:
+        return None, ""
+    return res.data[0], ""
+
+
+@mcp.tool()
+@mcp_error_handler
+async def manage_ai_todo(
+    action: str,
+    todo_id: str = "",
+    kind: str = "",
+    delivery_mode: str = "",
+    title: str = "",
+    content: str = "",
+    generation_prompt: str = "",
+    fallback_content: str = "",
+    time_str: str = "",
+    repeat_rule: str = "",
+    status: str = "",
+):
+    """【AI 待办管理】管理 ai_todos：AI 未来要提醒用户的事（reminder，如吃药/上课）或某个时间想对用户说的话（message，如生日/月初）。到时由后台推送到 Telegram（调度属后续阶段）。
+    action: "add" | "list" | "update" | "complete" | "cancel"
+    - add：必填 kind、delivery_mode、title、time_str；static 模式必填 content（到时直接发送）；dynamic 模式必填 generation_prompt（到时结合上下文生成，失败时优先发 fallback_content，两者都空则只记录失败不编造）。time_str 必须是未来时间（如 2026-09-05 21:00 或 2026-09-05T21:00:00+08:00，无时区按北京时间），过去时间会被拒绝。
+    - repeat_rule 可选：不传=不重复；{"type":"daily"} 每天；{"type":"weekly","weekdays":[1,3,5]} 每周（1=周一）；{"type":"weekdays"} 工作日。
+    - list：默认只看 pending+sending；可用 status 筛选 pending/sending/completed/cancelled/all，按触发时间升序。
+    - update：按 todo_id 局部更新，只更新传入的非空字段，未传或空字符串表示不修改（kind/delivery_mode 同理，不会默默改回默认类型）；repeat_rule 传 "null" 可改为不重复。
+    - complete/cancel：只改状态、不删除记录。complete 仅表示这条待办不再继续调度，不代表用户现实中真的完成了这件事。
+    修改 kind/delivery_mode 后请注意配套内容：static 需要 content，dynamic 需要 generation_prompt。"""
+    if not supabase_service:
+        return "❌ 数据库未连接，无法管理 AI 待办。"
+    act = (action or "").strip().lower()
+
+    if act == "add":
+        err = _validate_ai_todo_enum(kind, delivery_mode)
+        if err:
+            return err
+        title_clean = (title or "").strip()
+        if not title_clean:
+            return "❌ title 不能为空。"
+        if len(title_clean) > _AI_TODO_TITLE_MAX:
+            return f"❌ title 超过 {_AI_TODO_TITLE_MAX} 字上限。"
+        for _f, _v in (("content", content), ("generation_prompt", generation_prompt), ("fallback_content", fallback_content)):
+            if _v and len(_v) > _AI_TODO_TEXT_MAX:
+                return f"❌ {_f} 超过 {_AI_TODO_TEXT_MAX} 字上限。"
+        if delivery_mode == "static" and not (content or "").strip():
+            return "❌ static 模式必须提供 content（到时直接发送的内容）。"
+        if delivery_mode == "dynamic" and not (generation_prompt or "").strip():
+            return "❌ dynamic 模式必须提供 generation_prompt（到时结合上下文生成的表达要求）。"
+        dt, tz_name, err = _parse_ai_todo_time(time_str)
+        if err:
+            return err
+        if dt <= _ai_todo_now():
+            return "❌ 时间已经过去，请提供未来的明确时间。"
+        rule, err = _normalize_ai_todo_repeat_rule(repeat_rule)
+        if err:
+            return err
+        payload = {
+            "kind": kind,
+            "delivery_mode": delivery_mode,
+            "title": title_clean,
+            "content": content or "",
+            "generation_prompt": generation_prompt or "",
+            "fallback_content": fallback_content or "",
+            "scheduled_at": dt.astimezone(datetime.timezone.utc).isoformat(),
+            "timezone": tz_name,
+            "repeat_rule": rule,
+            "status": "pending",
+        }
+
+        def _insert():
+            return supabase_service.table("ai_todos").insert(payload).execute()
+
+        try:
+            res = await asyncio.to_thread(_insert)
+        except Exception as e:
+            print(f"⚠️ [AI待办] add 写库失败 kind={kind} mode={delivery_mode}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return "❌ 保存待办失败：数据库暂不可用或 ai_todos 表尚未创建，请稍后重试。"
+        row = (res.data or [{}])[0] if res else {}
+        new_id = row.get("id") or "(数据库未返回 ID)"
+        mode_s = "固定内容" if delivery_mode == "static" else "到时结合上下文生成"
+        when_s = dt.astimezone(_AI_TODO_TZ_BJ).strftime("%Y-%m-%d %H:%M")
+        return (f"✅ AI 待办已创建：{title_clean}\n"
+                f"时间：{when_s}（北京时间）\n"
+                f"方式：{mode_s}\n"
+                f"重复：{_describe_ai_todo_repeat(rule)}\n"
+                f"ID：{new_id}")
+
+    if act == "list":
+        st = (status or "").strip().lower()
+        if st in ("pending", "sending", "completed", "cancelled"):
+            st_filter = ("eq", st)
+        elif st == "all":
+            st_filter = None
+        elif st == "":
+            st_filter = ("in", ["pending", "sending"])
+        else:
+            return "❌ status 只支持：pending、sending、completed、cancelled、all。"
+
+        def _fetch():
+            q = supabase_service.table("ai_todos").select("*")
+            if st_filter is None:
+                pass
+            elif st_filter[0] == "in":
+                q = q.in_("status", st_filter[1])
+            else:
+                q = q.eq("status", st_filter[1])
+            return q.order("scheduled_at", desc=False).limit(50).execute()
+
+        try:
+            res = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            print(f"⚠️ [AI待办] list 查询失败 status={st or '默认'}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return "❌ 读取待办失败：数据库暂不可用或 ai_todos 表尚未创建。"
+        rows = list(res.data) if res and res.data else []
+        rows.sort(key=lambda r: str(r.get("scheduled_at") or ""))
+        if not rows:
+            return "📭 当前没有符合条件的 AI 待办。"
+        show_status = st not in ("",)
+        head = "📋 当前 AI 待办：" if st in ("", "all") else f"📋 AI 待办（状态筛选：{st}）："
+        body = "\n\n".join(_format_ai_todo_row(r, i + 1, show_status) for i, r in enumerate(rows))
+        return f"{head}\n\n{body}"
+
+    if act == "update":
+        tid = (todo_id or "").strip()
+        if not tid:
+            return "❌ 需要提供 todo_id 才能更新。"
+        payload = {"updated_at": _ai_todo_now().isoformat()}
+        if (kind or "").strip():
+            if kind not in ("reminder", "message"):
+                return "❌ kind 必须是 reminder 或 message"
+            payload["kind"] = kind
+        if (delivery_mode or "").strip():
+            if delivery_mode not in ("static", "dynamic"):
+                return "❌ delivery_mode 必须是 static 或 dynamic"
+            payload["delivery_mode"] = delivery_mode
+        if (title or "").strip():
+            t = title.strip()
+            if len(t) > _AI_TODO_TITLE_MAX:
+                return f"❌ title 超过 {_AI_TODO_TITLE_MAX} 字上限。"
+            payload["title"] = t
+        for _f, _v in (("content", content), ("generation_prompt", generation_prompt), ("fallback_content", fallback_content)):
+            if (_v or "").strip():
+                if len(_v.strip()) > _AI_TODO_TEXT_MAX:
+                    return f"❌ {_f} 超过 {_AI_TODO_TEXT_MAX} 字上限。"
+                payload[_f] = _v.strip()
+        if (time_str or "").strip():
+            dt, tz_name, err = _parse_ai_todo_time(time_str)
+            if err:
+                return err
+            if dt <= _ai_todo_now():
+                return "❌ 时间已经过去，请提供未来的明确时间。"
+            payload["scheduled_at"] = dt.astimezone(datetime.timezone.utc).isoformat()
+            payload["timezone"] = tz_name
+        if (repeat_rule or "").strip():
+            rule, err = _normalize_ai_todo_repeat_rule(repeat_rule)
+            if err:
+                return err
+            payload["repeat_rule"] = rule
+        if len(payload) == 1:
+            return "❌ 没有提供任何要更新的字段（空字符串表示不修改该字段）。"
+        row, err = await _ai_todo_fetch_one(tid)
+        if err:
+            return err
+        if row is None:
+            return "❌ 未找到该待办（ID 有误或记录不存在）。"
+
+        def _upd():
+            return supabase_service.table("ai_todos").update(payload).eq("id", tid).execute()
+
+        try:
+            await asyncio.to_thread(_upd)
+        except Exception as e:
+            print(f"⚠️ [AI待办] update 写库失败 todo_id={tid}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return "❌ 更新待办失败：数据库暂不可用，请稍后重试。"
+        fields = ", ".join(k for k in payload if k != "updated_at")
+        return f"✅ 待办已更新（ID：{tid}），修改字段：{fields}。"
+
+    if act in ("complete", "cancel"):
+        tid = (todo_id or "").strip()
+        if not tid:
+            return f"❌ 需要提供 todo_id 才能标记{'完成' if act == 'complete' else '取消'}。"
+        row, err = await _ai_todo_fetch_one(tid)
+        if err:
+            return err
+        if row is None:
+            return "❌ 未找到该待办（ID 有误或记录不存在）。"
+        payload = {
+            "status": "completed" if act == "complete" else "cancelled",
+            "updated_at": _ai_todo_now().isoformat(),
+        }
+
+        def _upd():
+            return supabase_service.table("ai_todos").update(payload).eq("id", tid).execute()
+
+        try:
+            await asyncio.to_thread(_upd)
+        except Exception as e:
+            print(f"⚠️ [AI待办] {act} 写库失败 todo_id={tid}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return "❌ 状态更新失败：数据库暂不可用，请稍后重试。"
+        if act == "complete":
+            return (f"✅ 待办已标记完成（ID：{tid}）：这条待办不再继续调度。\n"
+                    f"（仅表示停止调度，不代表用户现实中已完成这件事。）")
+        return f"✅ 待办已取消（ID：{tid}）：记录保留，不再触发。"
+
+    return "❌ 未知操作。支持：add、list、update、complete、cancel"
+
+
 # Phase 6 安全收口：list_private_diary 不再注册为 MCP 工具。
 # 原因：私密日记标题/心情/时间属于 AI 私密元数据，FastMCP v1 无法区分调用者身份。
 # 统一索引通过内部 service 函数或 API_SECRET 保护的管理 API 提供。

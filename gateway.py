@@ -2048,6 +2048,11 @@ class HostFixMiddleware:
                 await self._handle_letter_read_api(scope, send, raw_key=letter_rest)
             return
 
+        # ---------- ✅ AI 待办 CRUD（阶段4：列表/创建/编辑/软完成/软取消；受 /api/* 统一鉴权；不提供删除接口） ----------
+        if scope["path"] == "/api/ai-todos" or scope["path"].startswith("/api/ai-todos/"):
+            await self._handle_ai_todos_api(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -5505,10 +5510,474 @@ class HostFixMiddleware:
                                 (b"access-control-allow-origin", b"*")]})
         await send({"type": "http.response.body", "body": body})
 
+    # ------------------------------------------
+    # ✅ AI 待办 CRUD（阶段4：ai_todos 表；受 /api/* 统一鉴权）
+    #    创建/编辑复用 server.py 阶段2的 _ai_todo_* 校验函数，规则与 MCP 工具一致；
+    #    只提供软完成/软取消，不提供任何删除接口。
+    # ------------------------------------------
+
+    async def _handle_ai_todos_api(self, scope, receive, send):
+        """AI 待办管理 API 路由分发。
+
+        GET    /api/ai-todos                 分页列表（status / date_from / date_to / page / size）
+        POST   /api/ai-todos                 创建（校验与 MCP manage_ai_todo add 完全一致）
+        GET    /api/ai-todos/{id}            单条详情
+        PATCH  /api/ai-todos/{id}            局部编辑（只允许白名单字段）
+        POST   /api/ai-todos/{id}/complete   软更新 status=completed
+        POST   /api/ai-todos/{id}/cancel     软更新 status=cancelled
+        """
+        # 双保险鉴权：全局 /api/* 拦截已校验过，这里显式再查一次，保证本 handler 独立调用时同样安全
+        if not await _check_api_secret(scope, send):
+            return
+
+        path = scope["path"]
+        if path == "/api/ai-todos":
+            todo_id, sub = None, ""
+        elif path.startswith("/api/ai-todos/"):
+            rest = path[len("/api/ai-todos/"):]
+            parts = rest.split("/", 1)
+            todo_id = _normalize_ai_todo_id(parts[0])
+            if todo_id is None:
+                await _send_json_resp(send, 400, {"error": "待办 ID 格式不合法。"})
+                return
+            sub = parts[1] if len(parts) > 1 else ""
+            if sub and sub not in ("complete", "cancel"):
+                await _send_json_resp(send, 404, {"error": "接口不存在。"})
+                return
+        else:
+            await _send_json_resp(send, 404, {"error": "接口不存在。"})
+            return
+
+        # ai_todos 对 anon/authenticated REVOKE 且无 RLS 策略（迁移 deny-by-default，
+        # 阶段5真实联调已复现 anon 42501），读写走 service_role 客户端，
+        # 与 activity_logs 等敏感表同风格；不能用 _get_supabase() 的 anon 客户端。
+        import server as _srv_todo_client
+        sb = _srv_todo_client.supabase_service
+        if not sb:
+            await _send_json_resp(send, 503, {"error": "数据库未配置，AI 待办功能暂不可用。"})
+            return
+
+        method = scope["method"]
+        if todo_id is None:
+            if method == "GET":
+                await self._ai_todos_list(scope, send, sb)
+            elif method == "POST":
+                await self._ai_todos_create(scope, receive, send, sb)
+            else:
+                await _send_json_resp(send, 405, {"error": "仅支持 GET / POST。"})
+            return
+
+        if sub in ("complete", "cancel"):
+            if method != "POST":
+                await _send_json_resp(send, 405, {"error": "仅支持 POST。"})
+                return
+            await self._ai_todos_set_status(send, sb, todo_id, "completed" if sub == "complete" else "cancelled")
+            return
+
+        if method == "GET":
+            await self._ai_todos_detail(send, sb, todo_id)
+        elif method == "PATCH":
+            await self._ai_todos_update(scope, receive, send, sb, todo_id)
+        else:
+            await _send_json_resp(send, 405, {"error": "仅支持 GET / PATCH，不提供删除接口。"})
+        return
+
+    async def _ai_todos_list(self, scope, send, sb):
+        """GET /api/ai-todos：分页 + 状态/日期筛选，按 scheduled_at 升序。"""
+        from urllib.parse import parse_qs
+        import server as _srv_todo
+
+        qs = parse_qs(scope.get("query_string", b"").decode("utf-8"))
+
+        def _q1(name, default=""):
+            vals = qs.get(name)
+            return (vals[0].strip() if vals else default)
+
+        st = _q1("status").lower()
+        if st in ("", "pending"):
+            st = "pending"   # 默认只看待发送
+        elif st == "all":
+            pass
+        elif st not in ("sending", "completed", "cancelled"):
+            await _send_json_resp(send, 400, {"error": "status 只支持：pending、sending、completed、cancelled、all。"})
+            return
+
+        try:
+            page = int(_q1("page", "1"))
+            size = int(_q1("size", "50"))
+        except ValueError:
+            await _send_json_resp(send, 400, {"error": "page / size 必须是整数。"})
+            return
+        if page < 1 or size < 1 or size > 200:
+            await _send_json_resp(send, 400, {"error": "page 必须 ≥ 1，size 必须在 1-200 之间。"})
+            return
+
+        date_from_utc = None
+        date_to_utc = None
+        raw_from = _q1("date_from")
+        raw_to = _q1("date_to")
+        if raw_from:
+            date_from_utc = _ai_todo_api_date_to_utc(raw_from, False, _srv_todo._AI_TODO_TZ_BJ)
+            if not date_from_utc:
+                await _send_json_resp(send, 400, {"error": "date_from 格式应为 YYYY-MM-DD（按北京时间解释）。"})
+                return
+        if raw_to:
+            date_to_utc = _ai_todo_api_date_to_utc(raw_to, True, _srv_todo._AI_TODO_TZ_BJ)
+            if not date_to_utc:
+                await _send_json_resp(send, 400, {"error": "date_to 格式应为 YYYY-MM-DD（按北京时间解释）。"})
+                return
+
+        offset = (page - 1) * size
+
+        def _fetch():
+            q = sb.table("ai_todos").select("*", count="exact")
+            if st != "all":
+                q = q.eq("status", st)
+            if date_from_utc:
+                q = q.gte("scheduled_at", date_from_utc)
+            if date_to_utc:
+                q = q.lte("scheduled_at", date_to_utc)
+            return q.order("scheduled_at", desc=False).range(offset, offset + size - 1).execute()
+
+        try:
+            res = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] list 查询失败: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "读取待办失败：数据库暂不可用或 ai_todos 表尚未创建。"})
+            return
+        rows = list(res.data) if res and res.data else []
+        total = getattr(res, "count", None)
+        if total is None:
+            total = len(rows)
+        await _send_json_resp(send, 200, {"items": rows, "page": page, "size": size, "total": total})
+
+    async def _ai_todos_create(self, scope, receive, send, sb):
+        """POST /api/ai-todos：创建，校验逻辑与 MCP manage_ai_todo add 完全一致。"""
+        import server as _srv_todo
+
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        kind = _ai_todo_api_text(req.get("kind")).strip()
+        delivery_mode = _ai_todo_api_text(req.get("delivery_mode")).strip()
+        title = _ai_todo_api_text(req.get("title")).strip()
+        content = _ai_todo_api_text(req.get("content"))
+        generation_prompt = _ai_todo_api_text(req.get("generation_prompt"))
+        fallback_content = _ai_todo_api_text(req.get("fallback_content"))
+        time_str = _ai_todo_api_text(req.get("time_str")).strip()
+
+        err = _srv_todo._validate_ai_todo_enum(kind, delivery_mode)
+        if err:
+            await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+            return
+        if not title:
+            await _send_json_resp(send, 400, {"error": "title 不能为空。"})
+            return
+        if len(title) > _srv_todo._AI_TODO_TITLE_MAX:
+            await _send_json_resp(send, 400, {"error": f"title 超过 {_srv_todo._AI_TODO_TITLE_MAX} 字上限。"})
+            return
+        for _f, _v in (("content", content), ("generation_prompt", generation_prompt), ("fallback_content", fallback_content)):
+            if _v and len(_v) > _srv_todo._AI_TODO_TEXT_MAX:
+                await _send_json_resp(send, 400, {"error": f"{_f} 超过 {_srv_todo._AI_TODO_TEXT_MAX} 字上限。"})
+                return
+        if delivery_mode == "static" and not content.strip():
+            await _send_json_resp(send, 400, {"error": "static 模式必须提供 content（到时直接发送的内容）。"})
+            return
+        if delivery_mode == "dynamic" and not generation_prompt.strip():
+            await _send_json_resp(send, 400, {"error": "dynamic 模式必须提供 generation_prompt（到时结合上下文生成的表达要求）。"})
+            return
+        dt, tz_name, err = _srv_todo._parse_ai_todo_time(time_str)
+        if err:
+            await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+            return
+        if dt <= _srv_todo._ai_todo_now():
+            await _send_json_resp(send, 400, {"error": "时间已经过去，请提供未来的明确时间。"})
+            return
+        rule, err = _srv_todo._normalize_ai_todo_repeat_rule(req.get("repeat_rule"))
+        if err:
+            await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+            return
+
+        payload = {
+            "kind": kind,
+            "delivery_mode": delivery_mode,
+            "title": title,
+            "content": content,
+            "generation_prompt": generation_prompt,
+            "fallback_content": fallback_content,
+            "scheduled_at": dt.astimezone(datetime.timezone.utc).isoformat(),
+            "timezone": tz_name,
+            "repeat_rule": rule,
+            "status": "pending",
+        }
+
+        def _insert():
+            return sb.table("ai_todos").insert(payload).execute()
+
+        try:
+            res = await asyncio.to_thread(_insert)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] create 写库失败 kind={kind} mode={delivery_mode}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "保存待办失败：数据库暂不可用或 ai_todos 表尚未创建。"})
+            return
+        row = (res.data or [{}])[0] if res else {}
+        _log(f"✅ [AI待办API] 已创建待办 id={row.get('id', '')} kind={kind} mode={delivery_mode}")
+        await _send_json_resp(send, 200, {"ok": True, "todo": row})
+
+    async def _ai_todos_detail(self, send, sb, todo_id):
+        """GET /api/ai-todos/{id}：单条详情。"""
+        def _get():
+            return sb.table("ai_todos").select("*").eq("id", todo_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] detail 查询失败 id={todo_id}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "读取待办失败：数据库暂不可用。"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "待办不存在。"})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "todo": row})
+
+    async def _ai_todos_update(self, scope, receive, send, sb, todo_id):
+        """PATCH /api/ai-todos/{id}：局部编辑，只改白名单字段，未提供字段保持原值。
+
+        status / id / created_at / last_* 等受保护字段传入即拒绝；完成与取消必须走专用接口。
+        """
+        import server as _srv_todo
+
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        forbidden = {"id", "status", "created_at", "updated_at", "last_sent_at",
+                     "last_generated_content", "last_generated_at", "last_attempt_at",
+                     "scheduled_at", "timezone"}
+        for k in req:
+            if k in forbidden:
+                await _send_json_resp(send, 400, {"error": f"不允许修改字段 {k}，完成/取消请使用专用接口。"})
+                return
+
+        def _get():
+            return sb.table("ai_todos").select("*").eq("id", todo_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] update 前置查询失败 id={todo_id}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "读取待办失败：数据库暂不可用。"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "待办不存在。"})
+            return
+        if row.get("status") == "sending":
+            await _send_json_resp(send, 409, {"error": "该待办正在发送中，请稍后再试。"})
+            return
+
+        upd = {}
+        if "kind" in req:
+            v = _ai_todo_api_text(req["kind"]).strip()
+            err = _srv_todo._validate_ai_todo_enum(v, "static")
+            if err:
+                await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+                return
+            upd["kind"] = v
+        if "delivery_mode" in req:
+            v = _ai_todo_api_text(req["delivery_mode"]).strip()
+            err = _srv_todo._validate_ai_todo_enum("reminder", v)
+            if err:
+                await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+                return
+            upd["delivery_mode"] = v
+        if "title" in req:
+            v = _ai_todo_api_text(req["title"]).strip()
+            if not v:
+                await _send_json_resp(send, 400, {"error": "title 不能为空。"})
+                return
+            if len(v) > _srv_todo._AI_TODO_TITLE_MAX:
+                await _send_json_resp(send, 400, {"error": f"title 超过 {_srv_todo._AI_TODO_TITLE_MAX} 字上限。"})
+                return
+            upd["title"] = v
+        for _f in ("content", "generation_prompt", "fallback_content"):
+            if _f in req:
+                v = _ai_todo_api_text(req[_f])
+                if v and len(v) > _srv_todo._AI_TODO_TEXT_MAX:
+                    await _send_json_resp(send, 400, {"error": f"{_f} 超过 {_srv_todo._AI_TODO_TEXT_MAX} 字上限。"})
+                    return
+                upd[_f] = v
+        if "time_str" in req:
+            v = _ai_todo_api_text(req["time_str"]).strip()
+            if not v:
+                await _send_json_resp(send, 400, {"error": "time_str 不能为空。"})
+                return
+            dt, tz_name, err = _srv_todo._parse_ai_todo_time(v)
+            if err:
+                await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+                return
+            if dt <= _srv_todo._ai_todo_now():
+                await _send_json_resp(send, 400, {"error": "时间已经过去，请提供未来的明确时间。"})
+                return
+            upd["scheduled_at"] = dt.astimezone(datetime.timezone.utc).isoformat()
+            upd["timezone"] = tz_name
+        if "repeat_rule" in req:
+            v = req["repeat_rule"]
+            if v is None:
+                upd["repeat_rule"] = None
+            else:
+                rule, err = _srv_todo._normalize_ai_todo_repeat_rule(v)
+                if err:
+                    await _send_json_resp(send, 400, {"error": _ai_todo_api_err_msg(err)})
+                    return
+                upd["repeat_rule"] = rule
+
+        if not upd:
+            await _send_json_resp(send, 400, {"error": "没有提供任何要更新的字段。"})
+            return
+        upd["updated_at"] = _srv_todo._ai_todo_now().isoformat()
+
+        # 配套校验：改动类型/模式/内容之一时，合并后的结果态必须满足 add 的 static/dynamic 要求
+        if any(k in upd for k in ("kind", "delivery_mode", "content", "generation_prompt")):
+            final_mode = upd.get("delivery_mode") or row.get("delivery_mode")
+            final_content = upd.get("content", row.get("content", ""))
+            final_prompt = upd.get("generation_prompt", row.get("generation_prompt", ""))
+            if final_mode == "static" and not str(final_content or "").strip():
+                await _send_json_resp(send, 400, {"error": "static 模式必须提供 content（到时直接发送的内容）。"})
+                return
+            if final_mode == "dynamic" and not str(final_prompt or "").strip():
+                await _send_json_resp(send, 400, {"error": "dynamic 模式必须提供 generation_prompt（到时结合上下文生成的表达要求）。"})
+                return
+
+        def _update():
+            # 条件更新：避开 sending 行，避免与后台 worker 的原子领取竞态
+            return sb.table("ai_todos").update(upd).eq("id", todo_id).neq("status", "sending").select("*").execute()
+
+        try:
+            res = await asyncio.to_thread(_update)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] update 写库失败 id={todo_id}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "更新待办失败：数据库暂不可用。"})
+            return
+        if not res or not res.data:
+            await _send_json_resp(send, 409, {"error": "该待办状态已变化（可能正在发送中），请刷新后重试。"})
+            return
+        changed = ",".join(sorted(k for k in upd if k != "updated_at"))
+        _log(f"✅ [AI待办API] 已编辑待办 id={todo_id} 字段: {changed}")
+        await _send_json_resp(send, 200, {"ok": True, "todo": res.data[0]})
+
+    async def _ai_todos_set_status(self, send, sb, todo_id, target):
+        """POST /api/ai-todos/{id}/complete|cancel：软更新 status，绝不删除记录。"""
+        import server as _srv_todo
+
+        def _get():
+            return sb.table("ai_todos").select("*").eq("id", todo_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] {target} 前置查询失败 id={todo_id}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "读取待办失败：数据库暂不可用。"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "待办不存在。"})
+            return
+        if row.get("status") == "sending":
+            await _send_json_resp(send, 409, {"error": "该待办正在发送中，请稍后再试。"})
+            return
+
+        payload = {"status": target, "updated_at": _srv_todo._ai_todo_now().isoformat()}
+
+        def _update():
+            # 条件更新：避开 sending 行，避免覆盖后台 worker 正在处理的记录
+            return sb.table("ai_todos").update(payload).eq("id", todo_id).neq("status", "sending").select("*").execute()
+
+        try:
+            res = await asyncio.to_thread(_update)
+        except Exception as e:
+            _log(f"⚠️ [AI待办API] {target} 写库失败 id={todo_id}: {type(e).__name__}")
+            await _send_json_resp(send, 500, {"error": "更新待办失败：数据库暂不可用。"})
+            return
+        if not res or not res.data:
+            await _send_json_resp(send, 409, {"error": "该待办状态已变化（可能正在发送中），请刷新后重试。"})
+            return
+        _log(f"✅ [AI待办API] 待办 {todo_id} -> {target}")
+        await _send_json_resp(send, 200, {"ok": True, "todo": res.data[0]})
+
 
 # ==========================================
 # 辅助函数
 # ==========================================
+
+# ---------- ✅ AI 待办 API 辅助（阶段4） ----------
+
+_AI_TODO_ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{0,63}$")
+
+
+def _normalize_ai_todo_id(raw_key: str):
+    """阶段4：校验 ai_todos 路径参数 id（uuid 形态）。合法返回 id 字符串，非法返回 None。
+
+    校验先行：非法 id 在任何数据库调用之前就被拒绝，只进入查询构造器参数绑定，不拼 SQL。
+    """
+    from urllib.parse import unquote as _unquote
+    try:
+        tid = _unquote(raw_key or "")
+    except Exception:
+        return None
+    tid = (tid or "").strip()
+    if not tid or len(tid) > 64 or "/" in tid or "\\" in tid or "%" in tid:
+        return None
+    if not _AI_TODO_ID_RE.match(tid):
+        return None
+    return tid
+
+
+def _ai_todo_api_date_to_utc(date_str: str, end_of_day: bool, tz_bj):
+    """date_from/date_to（YYYY-MM-DD，按北京时间解释）-> UTC ISO 字符串；非法返回 None。"""
+    try:
+        d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    if end_of_day:
+        dt = datetime.datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=tz_bj)
+    else:
+        dt = datetime.datetime(d.year, d.month, d.day, tzinfo=tz_bj)
+    return dt.astimezone(datetime.timezone.utc).isoformat()
+
+
+def _ai_todo_api_err_msg(err: str) -> str:
+    """把阶段2校验函数返回的 '❌ ...' 消息转成 API 的简洁中文。"""
+    return (err or "").replace("❌", "").strip()
+
+
+def _ai_todo_api_text(v) -> str:
+    """JSON body 字段宽容转字符串（None -> ""，与 MCP 工具字符串参数语义一致）。"""
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)
+
+
+async def _read_ai_todo_json_body(receive):
+    """读取并解析 JSON body -> (dict_or_None, err)；body 为空按空对象处理。"""
+    body = b""
+    while True:
+        msg = await receive()
+        body += msg.get("body", b"")
+        if not msg.get("more_body", False):
+            break
+    try:
+        req = json.loads(body.decode("utf-8")) if body.strip() else {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return None, "请求体不是合法 JSON。"
+    if not isinstance(req, dict):
+        return None, "请求体必须是 JSON 对象。"
+    return req, ""
+
 
 def _normalize_letter_key(raw_key: str):
     """C9：校验并规范化 letter_key 路径参数。合法返回 key 字符串，非法返回 None。
@@ -5561,7 +6030,7 @@ async def _send_json_resp(send, status: int, data: dict):
         "headers": [
             (b"content-type", b"application/json; charset=utf-8"),
             (b"access-control-allow-origin", b"*"),
-            (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+            (b"access-control-allow-methods", b"GET, POST, PATCH, DELETE, OPTIONS"),
             (b"access-control-allow-headers", b"Content-Type, Authorization, X-Api-Key"),
         ]
     })
@@ -5574,7 +6043,7 @@ async def _send_cors_preflight(send):
         "status": 204,
         "headers": [
             (b"access-control-allow-origin", b"*"),
-            (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+            (b"access-control-allow-methods", b"GET, POST, PATCH, DELETE, OPTIONS"),
             (b"access-control-allow-headers", b"Content-Type, Authorization, X-Api-Key"),
             (b"access-control-max-age", b"86400"),
         ]

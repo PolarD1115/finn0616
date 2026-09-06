@@ -1150,6 +1150,425 @@ async def async_reminder_worker():
 
 
 # ==========================================
+# 4.5 AI 待办调度器 (ai_todos · 阶段3)
+# ==========================================
+# 与上面的旧提醒巡视器 (async_reminder_worker / reminders 表) 完全独立：
+# 只读写 ai_todos 表，不触碰 reminders，不改旧 worker 的任何行为。
+
+# sending 是"原子领取"的幂等锁：进程崩溃后任务可能卡在该状态。超过该时长
+# 仍未推进的 sending 视为遗留锁并回收为 pending。（阶段约束不新增环境变量，
+# 故用代码常量。领取时必写 last_attempt_at，因此超时即可判定为遗留。）
+_AI_TODO_SENDING_TIMEOUT = datetime.timedelta(minutes=15)
+# 瞬时失败（网络/模型抖动）后的重试退避：把 scheduled_at 顺延，避免下一轮
+# (60s) 立即重试造成每分钟轰炸。任务保持 pending，不丢、不伪装成完成。
+_AI_TODO_RETRY_BACKOFF = datetime.timedelta(minutes=5)
+# 数据本身无效（static 缺 content、dynamic 缺 prompt、TG 未配置等）的退避：
+# 这类错误短期内重试也不会成功，拉长间隔防刷日志。
+_AI_TODO_INVALID_BACKOFF = datetime.timedelta(hours=1)
+# Telegram Bot API 单条消息上限 4096 字符，留余量截断（阶段2 已限制内容
+# 字段 ≤5000 字，超限时发送会失败，这里兜底截断避免无限失败循环）。
+_AI_TODO_TG_MAX_CHARS = 4000
+# 单轮最多处理的到期任务数，防止积压时单轮阻塞过久。
+_AI_TODO_BATCH_LIMIT = 20
+
+
+def _ai_todo_mask_secret(text: str) -> str:
+    """日志脱敏：bot token / JWT / Supabase 主机名等不出现在控制台输出里。
+
+    requests 的网络异常消息通常包含完整请求 URL（含 /bot<TOKEN>/ 路径），
+    异常堆栈里可能带 SUPABASE_URL，直接打进日志都会泄漏，因此所有异常
+    消息与堆栈落日志前必须过这里。
+    """
+    text = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", text or "")
+    text = re.sub(r"eyJ[A-Za-z0-9._-]+", "eyJ***", text)
+    text = re.sub(r"https://[A-Za-z0-9.-]+\.supabase\.[A-Za-z.]+",
+                  "https://***.supabase.***", text)
+    return text
+
+
+class _AiTodoTelegramNotConfigured(RuntimeError):
+    """TG_BOT_TOKEN / TG_CHAT_ID 未配置，无法投递。"""
+
+
+def _ai_todo_send_telegram(text: str):
+    """向 TG_CHAT_ID 发送一条纯文本消息。成功静默返回，失败抛异常。
+
+    与 async_telegram_polling 内部闭包 _send_message 使用同一套 Bot API
+    调用方式（requests + raise_for_status + 检查 ok 字段），不引入第二套
+    客户端。不复用 server._push_wechat 的原因：它吞掉一切异常且不检查
+    响应，worker 无法感知发送成败，会把失败任务错误标记为 completed。
+    纯文本发送（不带 parse_mode），避免待办正文里的未配对 markdown 符号
+    被 Telegram 拒绝。
+    """
+    import requests
+
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise _AiTodoTelegramNotConfigured("TG_BOT_TOKEN/TG_CHAT_ID 未配置")
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description") or "Telegram sendMessage returned failure")
+
+
+def _ai_todo_compute_next_scheduled(cur, rule):
+    """计算重复待办的下一次计划时间，返回 aware UTC datetime。
+
+    cur: 当前这一次的计划时间（aware datetime 或 ISO 字符串）
+    rule: {"type":"daily"} / {"type":"weekly","weekdays":[1..7]} / {"type":"weekdays"}
+    weekdays 约定 1=周一 … 7=周日（与阶段2 保存格式一致）。
+
+    时区语义统一为 Asia/Shanghai（固定 UTC+8，中国无夏令时；本机 Windows
+    缺 tzdata，zoneinfo 不可用，故沿用阶段2 的固定偏移时区对象）。
+    daily 对墙钟"加一天"，在固定偏移下与 UTC 加 86400 秒等价。
+    计算不出结果时抛 ValueError，由调用方记录错误码，不得改 completed 掩盖。
+    """
+    from server import _AI_TODO_TZ_BJ
+
+    if isinstance(cur, str):
+        cur = datetime.datetime.fromisoformat(cur.replace("Z", "+00:00"))
+    if cur.tzinfo is None:
+        cur = cur.replace(tzinfo=datetime.timezone.utc)
+
+    rtype = (rule or {}).get("type")
+    if rtype == "daily":
+        return cur + datetime.timedelta(days=1)
+    if rtype == "weekdays":
+        allowed = {1, 2, 3, 4, 5}
+    elif rtype == "weekly":
+        allowed = {int(d) for d in (rule.get("weekdays") or [])}
+    else:
+        raise ValueError(f"未知重复类型: {rtype!r}")
+
+    if not allowed:
+        raise ValueError("weekly 的 weekdays 为空")
+    # 从当前计划时间的下一天起找下一个允许的星期（保留原时分秒），最多看 8 天
+    day = cur.astimezone(_AI_TODO_TZ_BJ) + datetime.timedelta(days=1)
+    for _ in range(8):
+        if day.isoweekday() in allowed:
+            return day.astimezone(datetime.timezone.utc)
+        day += datetime.timedelta(days=1)
+    raise ValueError("weekly 未找到下一个允许的星期")
+
+
+def _ai_todo_wrap_body(kind: str, body: str) -> str:
+    """按类型包装推送正文。reminder 带固定前缀；message 是 AI 想主动说的话，
+    不强行添加"待办提醒"类标题。"""
+    if kind == "reminder":
+        return f"⏰ 小提醒\n\n{body}"
+    return body
+
+
+def _ai_todo_strip_fences(text: str) -> str:
+    """去掉模型输出可能带上的 markdown 代码围栏，其余正文原样保留。"""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+    if t.endswith("```"):
+        t = re.sub(r"\n?```$", "", t)
+    return t.strip()
+
+
+def _ai_todo_dynamic_prompt(todo: dict, now_bj: datetime.datetime) -> str:
+    """组装动态生成提示。
+
+    generation_prompt 是用户预先保存的表达要求（非系统提示）；输出约束写死
+    在这里，要求模型只输出最终正文，不暴露后台任务机制与上下文来源。
+    """
+    title = (todo.get("title") or "").strip() or "（无标题）"
+    intent = (todo.get("generation_prompt") or "").strip()
+    return (
+        f"现在是 {now_bj.strftime('%Y-%m-%d %H:%M')}（北京时间）。\n"
+        f"你之前给自己定了一件事：\n标题：{title}\n想法：{intent}\n\n"
+        "请生成此刻要发给对方的内容。只输出最终正文本身，注意：\n"
+        "- 纯文本输出，不要 JSON，不要 markdown 代码块，不要标题符号\n"
+        "- 不要解释你的任务，不要出现待办、定时、调度、系统提示、数据库、"
+        "工具、上下文来源等机制词\n"
+        "- 像平时说话一样自然，直接给出内容"
+    )
+
+
+async def _ai_todo_build_context(todo: dict) -> str:
+    """为动态生成读取有限渠道上下文；失败降级为空串，不让 worker 退出。"""
+    try:
+        from server import _build_channel_context
+
+        query = (
+            f"{(todo.get('title') or '').strip()} "
+            f"{(todo.get('generation_prompt') or '').strip()}"
+        ).strip()[:150]
+        return await _build_channel_context(
+            query=query,
+            channel_tag="TG_MSG",
+            source="background_ai_todo",
+        )
+    except Exception as e:
+        # _build_channel_context 内部已逐数据源降级，这里只兜底 import/调用
+        # 层面的意外；上下文缺失时仍可继续生成，不视为投递失败。
+        print(f"⚠️ [AI待办] 上下文构建失败（降级为无上下文生成）: "
+              f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+        return ""
+
+
+async def _ai_todo_process_row(todo: dict):
+    """处理单条到期待办：完整性校验 → 原子领取 → 生成/取内容 → 发送 → 推进。
+
+    失败统一走 _fail：恢复 pending + 顺延 scheduled_at（退避）+ 记录安全
+    错误码。任何路径都不会把失败任务标记为 completed，也不会删除任务。
+    """
+    from server import supabase_service, ask_role, _ai_todo_now, _AI_TODO_TZ_BJ
+
+    tid = str(todo.get("id") or "")
+    kind = todo.get("kind")
+    mode = todo.get("delivery_mode")
+    label = f"{tid[:8]}…" if tid else "<no-id>"
+
+    def _sb_update(payload: dict, expect_sending: bool):
+        # 条件更新兜住与用户操作的竞态：领取前要求行仍是 pending；领取后
+        # 要求行仍是 sending——若用户此刻已 complete/cancel，条件不命中，
+        # 后台不会覆盖用户的决定。
+        table = (supabase_service.table("ai_todos").update(payload).eq("id", tid))
+        table = table.eq("status", "sending" if expect_sending else "pending")
+        return table.select("id").execute()
+
+    async def _fail(code: str, backoff: datetime.timedelta,
+                    generated: str = "", expect_sending: bool = False):
+        now = _ai_todo_now()
+        payload = {
+            "status": "pending",
+            "scheduled_at": (now + backoff).isoformat(),
+            "last_error_code": code,
+            "updated_at": now.isoformat(),
+        }
+        if generated:
+            payload["last_generated_content"] = generated
+            payload["last_generated_at"] = now.isoformat()
+        try:
+            await asyncio.to_thread(lambda: _sb_update(payload, expect_sending))
+        except Exception as e:
+            print(f"❌ [AI待办] 任务 {label} 写回失败状态出错: "
+                  f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+        print(f"⚠️ [AI待办] 任务 {label} 本次未投递（{code}），"
+              f"已退避 {int(backoff.total_seconds() // 60)} 分钟后重试")
+
+    # ── 1) 调度入口完整性校验：阶段2 的 update 不做模式-内容配套校验，
+    #       可能留下 static 而 content 为空（或 dynamic 而 prompt 为空）的
+    #       无效记录。这里兜底：不调模型、不调 Telegram、退避后重试。
+    if kind not in ("reminder", "message") or mode not in ("static", "dynamic"):
+        await _fail("invalid_todo_fields", _AI_TODO_INVALID_BACKOFF)
+        return
+    content = (todo.get("content") or "").strip()
+    gen_intent = (todo.get("generation_prompt") or "").strip()
+    fallback = (todo.get("fallback_content") or "").strip()
+    if mode == "static" and not content:
+        await _fail("invalid_static_content", _AI_TODO_INVALID_BACKOFF)
+        return
+    if mode == "dynamic" and not gen_intent:
+        await _fail("invalid_dynamic_prompt", _AI_TODO_INVALID_BACKOFF)
+        return
+
+    # ── 2) 原子领取：条件更新（仅 pending 可被置为 sending），返回命中行；
+    #       未命中说明已被其他实例领取，直接跳过，杜绝重复发送。
+    now = _ai_todo_now()
+    now_iso = now.isoformat()
+    try:
+        claim = await asyncio.to_thread(
+            lambda: supabase_service.table("ai_todos")
+            .update({"status": "sending", "last_attempt_at": now_iso,
+                     "updated_at": now_iso})
+            .eq("id", tid).eq("status", "pending").select("*").execute())
+    except Exception as e:
+        print(f"❌ [AI待办] 任务 {label} 领取失败: "
+              f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+        return
+    if not claim.data:
+        print(f"🤝 [AI待办] 任务 {label} 已被其他实例领取，跳过")
+        return
+
+    # ── 3) 准备最终文本 ──
+    generated = ""       # 模型真实生成结果（仅 dynamic 生成成功时非空）
+    used_fallback = False
+    try:
+        if mode == "static":
+            body = content
+        else:
+            now_bj = _ai_todo_now().astimezone(_AI_TODO_TZ_BJ)
+            ctx = await _ai_todo_build_context(todo)
+            try:
+                raw = await ask_role(
+                    "background", _ai_todo_dynamic_prompt(todo, now_bj),
+                    system_prompt=ctx, temperature=0.85)
+            except Exception as e:
+                # ask_role 常规失败返回空串，这里兜住更底层的意外
+                print(f"⚠️ [AI待办] 任务 {label} 模型调用异常: "
+                      f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+                raw = ""
+            body = _ai_todo_strip_fences(raw or "")
+            if body:
+                generated = body
+            else:
+                # 生成失败：按 fallback_content → content 顺序取备用内容；
+                # 两者皆空则本次不发送、不自行编造内容。
+                if fallback:
+                    body = fallback
+                    used_fallback = True
+                elif content:
+                    body = content
+                    used_fallback = True
+                else:
+                    await _fail("dynamic_generation_failed", _AI_TODO_RETRY_BACKOFF,
+                                expect_sending=True)
+                    return
+        if not body:  # 防御：理论上走不到（static 空内容已在入口拦截）
+            await _fail("invalid_static_content", _AI_TODO_INVALID_BACKOFF,
+                        generated=generated, expect_sending=True)
+            return
+
+        # ── 4) 发送 Telegram ──
+        text = _ai_todo_wrap_body(kind, body)[:_AI_TODO_TG_MAX_CHARS]
+        try:
+            await asyncio.to_thread(_ai_todo_send_telegram, text)
+        except _AiTodoTelegramNotConfigured:
+            await _fail("telegram_not_configured", _AI_TODO_INVALID_BACKOFF,
+                        generated=generated, expect_sending=True)
+            return
+        except Exception as e:
+            print(f"❌ [AI待办] 任务 {label} Telegram 发送失败: "
+                  f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+            await _fail("telegram_send_failed", _AI_TODO_RETRY_BACKOFF,
+                        generated=generated, expect_sending=True)
+            return
+    except Exception:
+        # 流程兜底：未预期异常不终止 worker，也不让任务无声卡死在 sending
+        # （15 分钟后回收机制仍会兜底，这里主动写回让状态立即可见）。
+        import traceback
+        print(f"❌ [AI待办] 任务 {label} 处理异常:\n"
+              f"{_ai_todo_mask_secret(traceback.format_exc())}")
+        await _fail("process_error", _AI_TODO_RETRY_BACKOFF,
+                    generated=generated, expect_sending=True)
+        return
+
+    # ── 5) 发送成功：推进状态（重复→算下一次保持 pending；一次性→completed）──
+    sent_at = _ai_todo_now()
+    sent_iso = sent_at.isoformat()
+    rule = todo.get("repeat_rule") or None
+    payload = {"last_sent_at": sent_iso, "updated_at": sent_iso}
+    if used_fallback:
+        # 备用内容不算模型生成结果：last_generated_content 保持不动，
+        # 只记录失败原因（本次投递实际使用了 fallback/content）
+        payload["last_error_code"] = "dynamic_generation_failed"
+    else:
+        payload["last_error_code"] = ""
+    if rule:
+        try:
+            nxt = _ai_todo_compute_next_scheduled(todo.get("scheduled_at"), rule)
+            payload["status"] = "pending"
+            payload["scheduled_at"] = nxt.isoformat()
+        except Exception as e:
+            # 推进失败不能伪装成完成：保持 pending、退避后重发、记录错误码
+            print(f"❌ [AI待办] 任务 {label} 下一次时间计算失败: {type(e).__name__}: {e}")
+            payload["status"] = "pending"
+            payload["scheduled_at"] = (sent_at + _AI_TODO_RETRY_BACKOFF).isoformat()
+            payload["last_error_code"] = "repeat_advance_failed"
+    else:
+        payload["status"] = "completed"
+    if generated and not used_fallback:
+        payload["last_generated_content"] = generated
+        payload["last_generated_at"] = sent_iso
+    try:
+        await asyncio.to_thread(lambda: _sb_update(payload, expect_sending=True))
+    except Exception as e:
+        print(f"❌ [AI待办] 任务 {label} 状态推进写入失败: "
+              f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:160]}")
+        return
+    nxt_txt = payload.get("scheduled_at", "")
+    tail = f"，下一次 {nxt_txt}" if rule and payload["status"] == "pending" else ""
+    print(f"📤 [AI待办] 任务 {label} 已投递（{kind}/{mode}）{tail}")
+
+
+async def _ai_todo_tick():
+    """单轮巡检：回收卡死的 sending → 处理到期 pending（按计划时间升序）。"""
+    from server import supabase_service, _ai_todo_now
+
+    now = _ai_todo_now()
+    now_iso = now.isoformat()
+
+    # telegram_enabled 与 TG 收消息共用同一开关（gateway._tg_enabled，带缓存）；
+    # 关闭时本轮不领取任何任务，任务保持 pending，不标记已发送。
+    try:
+        import gateway as _gw
+        if not _gw._tg_enabled():
+            return
+    except Exception as e:
+        # 开关读取失败按开启处理：这只是收消息门控的扩展检查，
+        # 不应阻断待办投递
+        print(f"⚠️ [AI待办] telegram_enabled 开关读取失败（按开启处理）: "
+              f"{type(e).__name__}: {_ai_todo_mask_secret(str(e))[:120]}")
+
+    # 1) 回收遗留 sending：领取时必写 last_attempt_at，超过阈值仍卡在
+    #    sending 即判定为进程崩溃遗留，条件更新恢复为 pending
+    cutoff_iso = (now - _AI_TODO_SENDING_TIMEOUT).isoformat()
+    stale = await asyncio.to_thread(
+        lambda: supabase_service.table("ai_todos").select("id")
+        .eq("status", "sending").lt("last_attempt_at", cutoff_iso).execute())
+    for row in (stale.data or []):
+        rid = str(row.get("id") or "")
+        if not rid:
+            continue
+        rec = await asyncio.to_thread(
+            lambda rid=rid: supabase_service.table("ai_todos")
+            .update({"status": "pending",
+                     "last_error_code": "sending_timeout_recovered",
+                     "updated_at": now_iso})
+            .eq("id", rid).eq("status", "sending").select("id").execute())
+        if rec.data:
+            print(f"♻️ [AI待办] 回收超时任务 {rid[:8]}… "
+                  f"（sending 超过 {int(_AI_TODO_SENDING_TIMEOUT.total_seconds() // 60)} 分钟）")
+
+    # 2) 到期 pending：scheduled_at <= 当前 UTC，按计划时间升序、限量处理
+    due = await asyncio.to_thread(
+        lambda: supabase_service.table("ai_todos").select("*")
+        .eq("status", "pending").lte("scheduled_at", now_iso)
+        .order("scheduled_at", desc=False).limit(_AI_TODO_BATCH_LIMIT).execute())
+    for todo in (due.data or []):
+        try:
+            await _ai_todo_process_row(todo)
+        except Exception:
+            # 单条兜底：任何漏网异常不终止本轮、不终止 worker；任务若已被
+            # 领取会留在 sending，由下一轮的超时回收机制恢复
+            import traceback
+            print(f"❌ [AI待办] 任务 {str(todo.get('id') or '')[:8]}… 单条处理异常:\n"
+                  f"{_ai_todo_mask_secret(traceback.format_exc())}")
+
+
+async def async_ai_todo_worker():
+    """AI 待办调度循环：每 60 秒巡检一次 ai_todos 表并投递到期任务。
+
+    自身绝不抛异常——run_background_process 里任一任务异常会导致整个
+    后台进程重启，worker 必须把所有异常消化在循环内。
+    """
+    from server import supabase_service
+
+    print("📋 [AI待办] 调度神经已上线（ai_todos 后台投递）...")
+    while True:
+        try:
+            if supabase_service:
+                await _ai_todo_tick()
+        except Exception:
+            # tick 级兜底：任何异常不退出 worker（退出会导致整个后台进程重启）
+            import traceback
+            print(f"❌ [AI待办] 调度巡检异常:\n"
+                  f"{_ai_todo_mask_secret(traceback.format_exc())}")
+        await asyncio.sleep(60)
+
+
+# ==========================================
 # 5. 日程小秘书
 # ==========================================
 
@@ -2151,6 +2570,8 @@ async def run_background_process():
         asyncio.create_task(async_diary_worker(),       name="diary"),
         asyncio.create_task(async_message_summarizer(), name="msg_summarizer"),
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
+        # AI 待办调度（阶段3）：投递 ai_todos 到期任务，独立于旧 reminders 巡视器
+        asyncio.create_task(async_ai_todo_worker(),     name="ai_todo"),
         asyncio.create_task(async_schedule_secretary(), name="schedule"),
         # 宠物状态 tick：不属于本阶段合并的顶层自主活动，保持独立运行
         asyncio.create_task(async_pet_house_tick(),     name="pet_house_tick"),

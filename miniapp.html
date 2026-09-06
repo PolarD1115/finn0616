@@ -340,6 +340,7 @@ th,td{padding:10px 9px;}
       <a data-p="storage"><i data-lucide="save"></i>上下文与存储</a>
       <a data-p="ticks"><i data-lucide="paw-print"></i>状态面板</a>
       <a data-p="prompts"><i data-lucide="scroll-text"></i>注入提示词</a>
+      <a data-p="aitodos"><i data-lucide="list-checks"></i>AI 待办</a>
     </nav>
     <div class="foot">v5.0 · Mini App</div>
   </aside>
@@ -662,6 +663,17 @@ th,td{padding:10px 9px;}
           <div id="promptList"></div>
         </div>
       </section>
+
+      <!-- ===== AI 待办（阶段4） ===== -->
+      <section class="page" id="p-aitodos">
+        <div class="card">
+          <h3><i data-lucide="list-checks" style="width:16px;height:16px"></i>AI TODO LIST <span class="sub" id="aitodoTotal"></span>
+            <button class="ghost" style="float:right" onclick="loadAiTodos(true)"><i data-lucide="refresh-cw"></i>刷新</button>
+            <button class="ghost" style="float:right;margin-right:6px" onclick="openAiTodoModal()"><i data-lucide="plus"></i>新建</button></h3>
+          <div class="tabs" id="aitodoFilter" style="margin-bottom:10px;"></div>
+          <div id="aitodoList"></div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -676,7 +688,7 @@ th,td{padding:10px 9px;}
  * ============================================================ */
 const IS_FILE_PROTOCOL = location.protocol === "file:";
 const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
-const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词"};
+const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词",aitodos:"AI 待办"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
@@ -741,7 +753,7 @@ function showPage(name){
   document.querySelector(".topbar").classList.remove("config-open");
   const sbWrap=document.getElementById("sbConfigWrap");
   if(sbWrap)sbWrap.classList.toggle("mobile-visible",name==="ticks");
-  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts};
+  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts,aitodos:loadAiTodos};
   if(loaders[name])loaders[name]();
   // 自动刷新
   if(name==="ticks"){
@@ -1782,6 +1794,181 @@ function toggleStatusAuto(){
   if(document.getElementById("statusAuto").checked){
     _pollers.status = setInterval(()=>loadStatus(), 10000);
   }
+}
+
+/* ============ AI 待办（阶段4） ============ */
+const AITODO_STATUS_LABEL={pending:"待发送",sending:"发送中",completed:"已完成",cancelled:"已取消"};
+const AITODO_STATUS_TAG={pending:"blue",sending:"warn",completed:"ok",cancelled:"mute"};
+const AITODO_FILTERS=[["all","全部"],["pending","待发送"],["reminder","提醒事项"],["message","想对你说"],["completed","已发送"],["cancelled","已取消"]];
+let _aitodoFilter="all";
+let _aitodoRows=[];
+function aiTodoSafeId(t){return String(t&&t.id||"").replace(/[^0-9a-fA-F-]/g,"").slice(0,64);}
+function aiTodoRepeatText(rule){
+  if(!rule||!rule.type)return "不重复";
+  if(rule.type==="daily")return "每天";
+  if(rule.type==="weekdays")return "工作日";
+  if(rule.type==="weekly")return "每周"+(rule.weekdays||[]).map(w=>"一二三四五六日"[w-1]).join("、");
+  return "不重复";
+}
+async function loadAiTodos(force){
+  try{
+    setNet("mute","加载中…");
+    const d=await api("/api/ai-todos?status=all&size=200");
+    if(!d)return;
+    _aitodoRows=d.items||[];
+    if(force)_aitodoFilter="all";
+    renderAiTodos();
+    setNet("ok","在线");
+  }catch(e){
+    document.getElementById("aitodoList").innerHTML='<div class="empty"><i data-lucide="inbox"></i><br>'+esc(e.message)+'</div>';
+    refreshIcons();
+  }
+}
+function renderAiTodos(){
+  document.getElementById("aitodoFilter").innerHTML=AITODO_FILTERS.map(([k,label])=>
+    '<div class="tab '+(_aitodoFilter===k?"active":"")+'" onclick="setAiTodoFilter(\''+k+'\')">'+label+'</div>').join("");
+  let list=_aitodoRows;
+  if(_aitodoFilter==="pending")list=list.filter(t=>t.status==="pending"||t.status==="sending");
+  else if(_aitodoFilter==="reminder")list=list.filter(t=>t.kind==="reminder");
+  else if(_aitodoFilter==="message")list=list.filter(t=>t.kind==="message");
+  else if(_aitodoFilter==="completed")list=list.filter(t=>t.status==="completed");
+  else if(_aitodoFilter==="cancelled")list=list.filter(t=>t.status==="cancelled");
+  document.getElementById("aitodoTotal").textContent="共 "+list.length+" 条";
+  const el=document.getElementById("aitodoList");
+  if(!list.length){el.innerHTML='<div class="empty"><i data-lucide="inbox"></i><br>暂无 AI 待办</div>';}
+  else{el.innerHTML=list.map(aiTodoCard).join("");}
+  refreshIcons();
+}
+function setAiTodoFilter(k){_aitodoFilter=k;renderAiTodos();}
+function aiTodoCard(t){
+  const isReminder=t.kind==="reminder";
+  const kindLabel=isReminder?"重要提醒":"想对你说";
+  const kindTag=isReminder?"blue":"warn";
+  const stTag=AITODO_STATUS_TAG[t.status]||"mute";
+  const isDynamic=t.delivery_mode==="dynamic";
+  const canAct=t.status==="pending"||t.status==="sending";
+  const timeShort=fmtCN8(t.scheduled_at).slice(5,16).replace("-","/");
+  const bodyLine=isDynamic
+    ?((t.generation_prompt||"")
+      ?'<div class="body" style="margin-top:4px"><span class="tag mute">表达要求</span><br>'+esc((t.generation_prompt||"").length>160?(t.generation_prompt||"").slice(0,160)+"…":(t.generation_prompt||""))+'</div>'
+      :'<div class="body" style="margin-top:4px"><span class="tag mute">到时结合上下文生成</span></div>')
+    :'<div class="body" style="margin-top:4px">'+esc(t.content||"")+'</div>';
+  let acts='<button class="ghost" onclick="openAiTodoModal(\''+aiTodoSafeId(t)+'\')"><i data-lucide="pencil"></i>编辑</button>';
+  if(canAct){
+    acts+='<button class="blue" onclick="completeAiTodo(\''+aiTodoSafeId(t)+'\')"><i data-lucide="check"></i>完成</button>';
+    acts+='<button class="danger" onclick="cancelAiTodo(\''+aiTodoSafeId(t)+'\')"><i data-lucide="x"></i>取消</button>';
+  }
+  const foot=aiTodoRepeatText(t.repeat_rule)+(t.status!=="pending"?" · "+esc(AITODO_STATUS_LABEL[t.status]||t.status):"");
+  const errLine=t.last_error_code?'<div class="body" style="margin-top:4px"><span class="tag no">上次异常</span> '+esc(t.last_error_code)+'</div>':"";
+  return '<div class="item">'+
+    '<div class="meta"><span><span class="tag '+kindTag+'">'+kindLabel+'</span></span><span>'+esc(timeShort)+'</span></div>'+
+    '<div class="body"><b>'+esc(t.title||"(无标题)")+'</b></div>'+
+    bodyLine+errLine+
+    '<div class="meta" style="margin-top:6px"><span>'+esc(foot)+'</span><span></span></div>'+
+    '<div class="acts">'+acts+'</div></div>';
+}
+function openAiTodoModal(id){
+  const t=id?_aitodoRows.find(x=>x.id===id):null;
+  const kind=t?(t.kind||"reminder"):"reminder";
+  const mode=t?(t.delivery_mode||"static"):"static";
+  const rule=(t&&t.repeat_rule)||null;
+  const repType=rule?(rule.type||"none"):"none";
+  const weekdays=rule&&rule.type==="weekly"?(rule.weekdays||[1]):[1];
+  let timeVal="";
+  if(t&&t.scheduled_at){
+    const bj=fmtCN8(t.scheduled_at);
+    timeVal=bj.slice(0,10)+"T"+bj.slice(11,16);
+  }
+  const wdHtml=["周一","周二","周三","周四","周五","周六","周日"].map((n,i)=>
+    '<label style="margin-right:10px"><input type="checkbox" class="aitodo-wd" value="'+(i+1)+'" '+(weekdays.includes(i+1)?"checked":"")+'/> '+n+'</label>').join("");
+  const html='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">'+
+    '<h3>'+(t?"编辑 AI 待办":"新建 AI 待办")+'<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3>'+
+    '<div class="row2">'+
+    '<div><label>类型</label><select id="aitodoKind">'+
+      '<option value="reminder" '+(kind==="reminder"?"selected":"")+'>提醒事项</option>'+
+      '<option value="message" '+(kind==="message"?"selected":"")+'>想对你说</option></select></div>'+
+    '<div><label>发送方式</label><select id="aitodoMode" onchange="aiTodoModeChanged()">'+
+      '<option value="static" '+(mode==="static"?"selected":"")+'>固定内容</option>'+
+      '<option value="dynamic" '+(mode==="dynamic"?"selected":"")+'>到时结合上下文生成</option></select></div>'+
+    '</div>'+
+    '<label>标题（必填）</label><input id="aitodoTitle" maxlength="200" value="'+esc(t?(t.title||""):"")+'" placeholder="如：提醒宝宝吃药"/>'+
+    '<label>时间（北京时间，必须是未来时间）</label><input id="aitodoTime" type="datetime-local" value="'+esc(timeVal)+'"/>'+
+    '<label>重复</label><select id="aitodoRepeat" onchange="aiTodoRepeatChanged()">'+
+      '<option value="none" '+(repType==="none"?"selected":"")+'>不重复</option>'+
+      '<option value="daily" '+(repType==="daily"?"selected":"")+'>每天</option>'+
+      '<option value="weekly" '+(repType==="weekly"?"selected":"")+'>每周（选择星期）</option>'+
+      '<option value="weekdays" '+(repType==="weekdays"?"selected":"")+'>工作日</option></select>'+
+    '<div id="aitodoWeekRow" style="display:none;margin:6px 0">'+wdHtml+'</div>'+
+    '<div id="aitodoContentWrap"><label>固定发送内容（固定内容模式必填）</label>'+
+      '<textarea id="aitodoContent" rows="3" maxlength="5000" placeholder="到时直接原样发送">'+esc(t?(t.content||""):"")+'</textarea></div>'+
+    '<div id="aitodoPromptWrap" style="display:none"><label>表达要求（到时结合上下文模式必填）</label>'+
+      '<textarea id="aitodoPrompt" rows="3" maxlength="5000" placeholder="到时结合上下文，按这个要求生成要发送的话">'+esc(t?(t.generation_prompt||""):"")+'</textarea>'+
+      '<label>备用内容（可选；生成失败时发送）</label>'+
+      '<textarea id="aitodoFallback" rows="2" maxlength="5000">'+esc(t?(t.fallback_content||""):"")+'</textarea></div>'+
+    '<div class="btn-row"><button onclick="saveAiTodo('+(t?"'"+aiTodoSafeId(t)+"'":"null")+')"><i data-lucide="save"></i>保存</button>'+
+    '<button class="ghost" onclick="closeModal()">取消</button></div>'+
+    '</div></div>';
+  document.getElementById("modalRoot").innerHTML=html;
+  aiTodoModeChanged();aiTodoRepeatChanged();refreshIcons();
+}
+function aiTodoModeChanged(){
+  const mode=document.getElementById("aitodoMode").value;
+  document.getElementById("aitodoContentWrap").style.display=mode==="static"?"":"none";
+  document.getElementById("aitodoPromptWrap").style.display=mode==="dynamic"?"":"none";
+}
+function aiTodoRepeatChanged(){
+  const v=document.getElementById("aitodoRepeat").value;
+  document.getElementById("aitodoWeekRow").style.display=v==="weekly"?"":"none";
+}
+async function saveAiTodo(id){
+  const kind=document.getElementById("aitodoKind").value;
+  const mode=document.getElementById("aitodoMode").value;
+  const title=document.getElementById("aitodoTitle").value.trim();
+  const timeVal=document.getElementById("aitodoTime").value;
+  const rep=document.getElementById("aitodoRepeat").value;
+  if(!title){toast("请填写标题","err");return;}
+  if(!timeVal){toast("请选择时间","err");return;}
+  let repeat_rule=null;
+  if(rep==="daily")repeat_rule={type:"daily"};
+  else if(rep==="weekdays")repeat_rule={type:"weekdays"};
+  else if(rep==="weekly"){
+    const wds=Array.from(document.querySelectorAll(".aitodo-wd:checked")).map(c=>parseInt(c.value,10));
+    if(!wds.length){toast("每周重复至少选择一天","err");return;}
+    repeat_rule={type:"weekly",weekdays:wds};
+  }
+  const body={kind:kind,delivery_mode:mode,title:title,time_str:timeVal,repeat_rule:repeat_rule};
+  if(mode==="static")body.content=document.getElementById("aitodoContent").value;
+  else{body.generation_prompt=document.getElementById("aitodoPrompt").value;body.fallback_content=document.getElementById("aitodoFallback").value;}
+  try{
+    if(id){
+      const d=await api("/api/ai-todos/"+id,{method:"PATCH",body:body});
+      if(!d)return;
+      toast("已保存修改","ok");
+    }else{
+      const d=await api("/api/ai-todos",{method:"POST",body:body});
+      if(!d)return;
+      toast("AI 待办已创建","ok");
+    }
+    closeModal();
+    loadAiTodos();
+  }catch(e){toast(e.message,"err");}
+}
+async function completeAiTodo(id){
+  try{
+    const d=await api("/api/ai-todos/"+id+"/complete",{method:"POST",body:{}});
+    if(!d)return;
+    toast("已完成，不再继续调度","ok");
+    loadAiTodos();
+  }catch(e){toast(e.message,"err");}
+}
+async function cancelAiTodo(id){
+  if(!confirm("确认取消这条待办？\n取消后不再发送，记录保留（不删除）。"))return;
+  try{
+    const d=await api("/api/ai-todos/"+id+"/cancel",{method:"POST",body:{}});
+    if(!d)return;
+    toast("已取消","ok");
+    loadAiTodos();
+  }catch(e){toast(e.message,"err");}
 }
 
 /* ============ 通用配置 PATCH ============ */
