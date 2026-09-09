@@ -892,6 +892,84 @@ def _classify_llm_error(e) -> tuple:
     return (f"http_{sc}", True)
 
 
+# ==========================================
+# 🧹 压缩产物兜底清洗：剥离混入正文开头的英文思考链
+# ==========================================
+# 压缩类调用（阶段总结/日记/周月年回忆录/消息总结，role="compression"）偶发把
+# 英文思考链写在正文开头（"I'm working through how to summarize..."），
+# 污染记忆库与邮件。兜底剥离策略：仅当开头命中思考链句式时才动刀 ——
+# 优先切到第一个"句首 6 字符内含 CJK 的句子"（压缩正文以中文为主；
+# 要求 6 字符窗口是为了不被 CoT 中段夹带的中文人名骗到），
+# 找不到再退回第一个 CJK 字符所在句子的句首；
+# 全文无 CJK 或切后剩余过短则原样返回 —— 宁可漏洗不可误杀。
+_COT_OPENERS = (
+    "i need to", "i'm working", "i am working", "i'm thinking", "i am thinking",
+    "i'm going to", "i'm starting", "i'll ", "i will ", "i should", "i can see",
+    "i notice", "let me ", "okay,", "okay ", "alright,", "alright ",
+    "first,", "looking at", "the user", "this conversation", "the content",
+    "to summarize", "since the", "since this", "since most", "given the",
+    "given this",
+)
+_SENT_ENDER_RE = re.compile(r"[.!?。！？；;:：]+[\s]*|\n+")
+
+
+def _has_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
+def strip_cot_preamble(text: str) -> str:
+    """兜底剥离压缩产物开头混入的英文思考链/元话术，只保留正文。
+
+    仅当开头是思考链句式时才动刀；<shared_experiences> 结构化块（若存在）
+    整体原样保留；全英文输出无法可靠区分思考与正文，原样返回。
+    """
+    if not text:
+        return text
+    t = text.strip()
+    if not t:
+        return t
+    first_line = t.split("\n", 1)[0].lower()
+    if not any(first_line.startswith(op) for op in _COT_OPENERS):
+        return t
+    if not _has_cjk(t):
+        return t
+
+    # <shared_experiences> 结构化块整体保留，只清洗它之前的正文部分
+    se_idx = t.find("<shared_experiences>")
+    head_part, tail_part = (t[:se_idx], t[se_idx:]) if se_idx != -1 else (t, "")
+    if not head_part.strip():
+        return t
+
+    # 思考链通常比正文长数倍，比例守卫会误杀；只要求切后剩下一句完整的话
+    min_keep = 20
+
+    # 首选：第一个句首 6 字符内含 CJK 的句子（候选起点 = 句末标点/换行之后）
+    for m in _SENT_ENDER_RE.finditer(head_part):
+        s = m.end()
+        j = s
+        while j < len(head_part) and (head_part[j].isspace() or head_part[j] in "#*>-"):
+            j += 1
+        if j < len(head_part) and _has_cjk(head_part[j:j + 6]):
+            stripped = head_part[s:].strip()
+            if len(stripped) >= min_keep:
+                return stripped + tail_part
+            return t
+
+    # 退路：第一个 CJK 字符所在句子的句首（正文以英文名开头等场景）
+    for i, ch in enumerate(head_part):
+        if "\u4e00" <= ch <= "\u9fff":
+            cut = 0
+            for j in range(i - 1, -1, -1):
+                if head_part[j] in ".!?。！？；;\n:：":
+                    cut = j + 1
+                    break
+            stripped = head_part[cut:].strip()
+            if len(stripped) >= min_keep:
+                return stripped + tail_part
+            break
+    return t
+
+
 def _role_client(role: str):
     """构造一个 OpenAI 客户端用于给定角色（供 server._get_llm_client 复用）。
     返回 (client, model_name)；client 可能为 None（角色未配置）。
@@ -1232,6 +1310,26 @@ def _gw_home_context_safe() -> str:
         return ""
 
 
+# 🔒 第42阶段：active 记忆上下文注入（门控默认关）。召回余量 top_k：注入层只
+#    取 top 3（第41阶段 DEFAULT_MAX_INJECTED），多召回的 7 条留给跨来源去重消耗。
+_ACTIVE_MEMORY_RECALL_TOP_K = 10
+
+
+def _active_memory_injection_enabled() -> bool:
+    """active 记忆上下文注入门控（环境变量 ACTIVE_MEMORY_INJECTION_ENABLED）。
+
+    默认 false = 关闭：_inject_context 内注入逻辑完全不执行（连召回都不发生），
+    聊天行为与第 41 阶段（零接入）完全一致。仅接受 1/true/yes/on（大小写不
+    敏感）为开启，未设置或任何其他值一律按关闭处理（安全侧默认）。开启后注入
+    仍受第 41 阶段三重防线约束（参考身份块 + top 3 限量 + 人工 approve 的
+    active 池）；上线前必须先经 /api/memory-context-preview 以真实数据人工
+    核对注入质量。
+    """
+    return os.environ.get(
+        "ACTIVE_MEMORY_INJECTION_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _extract_user_side_from_history(content, user_name):
     """🔒 第1阶段（目标B/C）：从 memories 历史条目中只提取「用户侧」内容。
 
@@ -1502,10 +1600,32 @@ def _reverse_geocode(lat, lon):
         return None
 
 
+def _fetch_latest_app_usage_row(sb):
+    """回退查询：最近一条带应用数据（app_usage 非空）的 device_data 行。
+
+    设备端应用数据上报可能断流（使用情况权限被回收、进程被杀、版本变更等），
+    之后的快照行会长期缺 app_usage/foreground_app，而库里最后一次同步的数据仍在。
+    此时借用该行应用数据注入，避免「库里有数据、prompt 里却永远看不到」。
+    """
+    try:
+        res = (sb.table("device_data")
+               .select("id,timestamp,foreground_app,app_usage")
+               .not_.is_("app_usage", "null")
+               .order("id", desc=True)
+               .limit(1)
+               .execute())
+        rows = res.data or []
+    except Exception as e:
+        _log(f"⚠️ [设备快照] 应用数据回退查询失败（跳过）: {e}")
+        return None
+    return rows[0] if rows else None
+
+
 def _fetch_device_snapshot(sb):
     """
     拉取 device_data 最新一条，渲染成可注入 prompt 的文本块。
     只注入最新一条，并标注数据更新时间（设备时间 + 距今多久前）。
+    快照主体行缺应用数据时回退最近一次同步的应用数据（标注截至时间）。
     失败/无数据时返回空串，由调用方优雅降级。
     """
     top_apps = int(os.environ.get("DEVICE_CONTEXT_TOP_APPS", "5") or "5")
@@ -1540,11 +1660,44 @@ def _fetch_device_snapshot(sb):
     notifications = _parse_json_field(row.get("notifications"))
     health = _parse_json_field(row.get("health_data")) or {}
 
+    # 应用数据回退：快照主体行缺前台应用与应用使用时，取库里最近一次同步的
+    # 应用数据借用（设备端上报可能断流数小时甚至数天），并标注同步截至时间。
+    foreground_app = str(row.get("foreground_app") or "").strip() or None
+    app_synced_ts = row.get("timestamp")
+    if not (isinstance(app_usage, list) and app_usage) and not foreground_app:
+        _app_row = _fetch_latest_app_usage_row(sb)
+        if _app_row:
+            _au = _parse_json_field(_app_row.get("app_usage"))
+            _fg = str(_app_row.get("foreground_app") or "").strip() or None
+            if (isinstance(_au, list) and _au) or _fg:
+                app_usage = _au
+                foreground_app = _fg
+                app_synced_ts = _app_row.get("timestamp")
+
     ts_raw = str(row.get("timestamp") or "")[:16]
     parsed = _parse_device_ts(row.get("timestamp"))
     now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     age = _fmt_age_cn(parsed, now_bj) if parsed else ""
     updated = f"{ts_raw}（{age}）" if ts_raw and age else (ts_raw or "--")
+
+    # 借来的应用数据标注同步时间；超过时限（默认 72 小时，可调）视为过期不注入，
+    # 免得拿几天前的「前台应用/使用时长」误导对话。
+    app_stale_tag = ""
+    app_data_fresh = True
+    if app_synced_ts and str(app_synced_ts)[:19] != str(row.get("timestamp") or "")[:19]:
+        _app_parsed = _parse_device_ts(app_synced_ts)
+        try:
+            _app_max_age_h = float(os.environ.get("DEVICE_CONTEXT_APP_MAX_AGE_HOURS", "72") or "72")
+        except ValueError:
+            _app_max_age_h = 72.0
+        if _app_parsed:
+            _app_age_h = (now_bj - _app_parsed).total_seconds() / 3600
+            if _app_age_h > _app_max_age_h:
+                app_data_fresh = False
+            else:
+                app_stale_tag = f"（截至 {str(app_synced_ts)[:16]}，{_fmt_age_cn(_app_parsed, now_bj)}）"
+        else:
+            app_stale_tag = f"（截至 {str(app_synced_ts)[:16]}）"
 
     lines = [f"【设备状态快照】更新时间：{updated}"]
 
@@ -1559,9 +1712,9 @@ def _fetch_device_snapshot(sb):
         if regeo:
             lines.append(f"📍 位置：{regeo}")
 
-    # 前台应用
-    if row.get("foreground_app"):
-        lines.append(f"📱 前台应用：{_app_name_of(app_usage, row.get('foreground_app'))}")
+    # 前台应用（可能来自回退的应用数据行，此时带「截至」标注）
+    if app_data_fresh and foreground_app:
+        lines.append(f"📱 前台应用：{_app_name_of(app_usage, foreground_app)}{app_stale_tag}")
 
     # 健康数据
     health_parts = []
@@ -1602,14 +1755,14 @@ def _fetch_device_snapshot(sb):
             sleep_line += f" {st}–{wk}"
         lines.append(sleep_line)
 
-    # 应用使用 Top
-    if isinstance(app_usage, list) and app_usage:
+    # 应用使用 Top（可能来自回退的应用数据行，此时带「截至」标注）
+    if app_data_fresh and isinstance(app_usage, list) and app_usage:
         apps = sorted(app_usage, key=lambda a: (a or {}).get("totalTimeInForeground", 0) or 0, reverse=True)[:top_apps]
         apps_txt = "、".join([
             f"{a.get('appName') or a.get('packageName') or '未知'}({_fmt_duration_cn(a.get('totalTimeInForeground'))})"
             for a in apps
         ])
-        lines.append(f"📊 应用使用 Top{len(apps)}：{apps_txt}")
+        lines.append(f"📊 应用使用 Top{len(apps)}{app_stale_tag}：{apps_txt}")
 
     # 通知（去重后最近 N 条）
     notifs = _dedupe_notifs(notifications, max_notifs)
@@ -2066,6 +2219,11 @@ class HostFixMiddleware:
         # ---------- 🔀 lexical+vector 混合召回只读预览（第37阶段：一次 embedding + 一次 RPC 取同批 active 候选 → deterministic_lexical_v1 词面二次排序 → 内部 ID 合并去重 → RRF 融合；手动、零写入、不接正式上下文；受 /api/* 统一鉴权） ----------
         if scope["path"] == "/api/memory-hybrid-recall-preview":
             await self._handle_memory_hybrid_recall(scope, receive, send)
+            return
+
+        # ---------- 🧠 active 记忆上下文注入只读预览（第42阶段：与真实注入完全同链路（召回→去重→截断→组块）供人工核对；零写入、不更新召回统计、不触 Pinecone 写、不调 LLM、绝不发给上游模型；受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/memory-context-preview":
+            await self._handle_memory_context_preview(scope, receive, send)
             return
 
         # ---------- 🏠 Home 聚合只读视图（C6：后端读取+安全投影，GET 零写副作用；受 /api/* 统一鉴权） ----------
@@ -2870,6 +3028,63 @@ class HostFixMiddleware:
             msgs.insert(last_user_idx, volatile_msg)
         else:
             msgs.append(volatile_msg)
+
+        # 🔒 第42阶段：active 记忆上下文注入（门控默认关，_active_memory_injection_enabled）。
+        #    开启时把第41阶段模块返回的「事实参考」块作为【独立 system 消息】插到
+        #    volatile 消息之后、最后一条 user 之前（不拼进 volatile_block 字符串，
+        #    不破坏既有缓存前缀语义；绝不伪装 user/assistant）。失败安全：模块内部
+        #    已全捕获降级为"无注入"，此处兜底除插入动作外的任何意外异常，只记日志
+        #    跳过，绝不打断聊天主链路。
+        if (_active_memory_injection_enabled()
+                and current_query and current_query.strip()):
+            try:
+                import memory_context_injection as _mci42
+                import memory_hybrid_recall as _mhr42
+                import server as _srv42
+
+                async def _am_recall_fn(query_text, server_user_id):
+                    # 第41阶段 recall_fn 契约：(query_text, server_user_id) ->
+                    # 第37阶段 result dict。生产绑定与第37阶段预览同款：
+                    # service_role 只读 RPC + server._get_embedding，恰各调用一次；
+                    # top_k=10 给跨来源去重留余量（注入层再截 top 3）。
+                    def _rpc_caller(params):
+                        return _srv42.supabase_service.rpc(
+                            _mhr42.RPC_NAME, params).execute()
+
+                    _hr_result, _hr_log = await _mhr42.run_hybrid_recall(
+                        query_text, server_user_id,
+                        _srv42._get_embedding, _rpc_caller,
+                        _ACTIVE_MEMORY_RECALL_TOP_K)
+                    _log(f"🧠 [ActiveMemory] {_hr_log}")
+                    return _hr_result
+
+                # 跨来源去重基底：当轮已算好的画像行/总结行/Pinecone 行/历史用户侧文本
+                _am_existing = [user_prof, core_summaries, pinecone_context]
+                _am_existing.extend(
+                    hm.get("content") for hm in history_msgs
+                    if isinstance(hm, dict)
+                    and isinstance(hm.get("content"), str)
+                    and hm.get("content", "").strip())
+
+                _am_message, _am_log = await _mci42.build_active_memory_injection(
+                    current_query, _srv42._resolve_pinecone_user_id(),
+                    _am_recall_fn, _am_existing)
+                _log(_am_log)
+                # 防御：只插入模块承诺的 system 消息（绝不插入任何其他角色）
+                if (isinstance(_am_message, dict)
+                        and _am_message.get("role") == "system"):
+                    _am_idx = None
+                    for i in range(len(msgs) - 1, -1, -1):
+                        if msgs[i].get("role") == "user":
+                            _am_idx = i
+                            break
+                    if _am_idx is not None:
+                        msgs.insert(_am_idx, _am_message)
+                    else:
+                        msgs.append(_am_message)
+            except Exception as e:
+                _log(f"⚠️ [ActiveMemory] 注入失败（已跳过，不打断聊天）: "
+                     f"exception_type={type(e).__name__}")
 
         _summ_tag = "跳过" if _skip_core_summaries else f"{len(core_summaries)}字"
         _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{_summ_tag} + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
@@ -4173,6 +4388,291 @@ class HostFixMiddleware:
         _log(log_line)
         status = _mhr.HTTP_STATUS_BY_CODE.get(result.get("code"), 500)
         await _send_json_resp(send, status, result)
+
+    # ------------------------------------------
+    # 🧠 active 记忆上下文注入只读预览（第42阶段）
+    #    让昕在开启聊天门控（ACTIVE_MEMORY_INJECTION_ENABLED，默认关）之前，
+    #    用真实数据人工核对注入效果。走与真实注入完全相同的链路（第41阶段模块：
+    #    召回→去重→截断→组块），但：
+    #    - 只读：零写入（不写任何表、不更新 recall_count/last_recalled_at）、
+    #      不触 Pinecone 写、不调 LLM、绝不把注入内容发给任何真实上游模型；
+    #    - 去重基底：只读复刻真实聊天当轮会带的四类既有文本（画像行/总结行/
+    #      Pinecone 行/历史用户侧文本），各来源独立 best-effort，失败跳过并在
+    #      dedup_basis 里如实报告；
+    #    - 脱敏：响应不含 user_id / 内部 item ID / hash；正文只给 ≤40 字符
+    #      截断预览 + 完整长度标注，绝不返回完整正文；
+    #    - 请求体严格白名单（confirm/query）；confirm 必须逐字匹配；
+    #      user_id 一律服务端解析（_resolve_pinecone_user_id），客户端无提交入口；
+    #    - 不受聊天门控影响（门控默认关时本接口照常可用——它就是开门前的核对
+    #      手段）；响应附带 chat_gate_enabled 如实反映当前门控状态；
+    #    - 无相似度阈值（沿用第41阶段防线：参考身份块 + top 3 + 人工把关）。
+    # ------------------------------------------
+    async def _handle_memory_context_preview(self, scope, receive, send):
+        confirm_token = "MEMORY_CONTEXT_PREVIEW_ONLY"
+
+        def _safe_body(code):
+            """错误/诊断路径统一安全骨架（不含任何敏感值）。"""
+            return {"ok": False, "code": code,
+                    "method": "active_memory_context_injection_v1",
+                    "injection": {"would_inject": False, "message_role": None,
+                                  "block_title": None, "instruction": None,
+                                  "block_chars": 0, "items": []},
+                    "stats": {"recall_candidates": 0,
+                              "dedup_existing_removed": 0,
+                              "dedup_batch_removed": 0,
+                              "invalid_dropped": 0, "expired_dropped": 0,
+                              "invalid_time_dropped": 0, "injected": 0,
+                              "limit": 0,
+                              "recall_top_k": _ACTIVE_MEMORY_RECALL_TOP_K},
+                    "dedup_basis": {},
+                    "writes_executed": False,
+                    "sent_to_model": False,
+                    "chat_gate_enabled": _active_memory_injection_enabled()}
+
+        method = scope.get("method", "")
+        if method != "POST":
+            # OPTIONS 已由全局 CORS 分支处理；其余方法一律 405（零调用）
+            await _send_json_resp(send, 405, _safe_body("METHOD_NOT_ALLOWED"))
+            return
+
+        # 读取小型 JSON 请求体（沿用项目 while-receive 聚合模式）
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            await _send_json_resp(send, 400,
+                                  _safe_body("INVALID_CONTEXT_PREVIEW_REQUEST"))
+            return
+        if not isinstance(payload, dict):
+            await _send_json_resp(send, 400,
+                                  _safe_body("INVALID_CONTEXT_PREVIEW_REQUEST"))
+            return
+
+        # 严格字段白名单：只允许 confirm/query。客户端提交 user_id/status/
+        # memory_type/top_k/item_id/vector/write_back 等任何额外字段 → 400，
+        # 绝不调用 provider、绝不调用 RPC、绝不读库
+        allowed_fields = {"confirm", "query"}
+        if set(payload.keys()) - allowed_fields:
+            await _send_json_resp(send, 400,
+                                  _safe_body("INVALID_CONTEXT_PREVIEW_REQUEST"))
+            return
+        # 显式确认（逐字匹配）
+        if payload.get("confirm") != confirm_token:
+            await _send_json_resp(send, 400, _safe_body("INVALID_CONFIRMATION"))
+            return
+
+        # 惰性导入（沿用项目 handler 内按需 import 惯例）：
+        # 第41阶段注入模块（链路本体）+ 第37阶段召回模块（常量与执行体）+
+        # server（service_role 客户端、_get_embedding、user_id 服务端解析）
+        try:
+            import memory_context_injection as _mci
+            import memory_hybrid_recall as _mhr
+            import server as _srv
+        except Exception as e:
+            _log(f"⚠️ 注入预览失败：stage=handler_import "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        # query 校验：字符串、trim 后非空、≤ 第37阶段同值上限（500 字符）
+        query = payload.get("query")
+        if not isinstance(query, str):
+            await _send_json_resp(send, 400,
+                                  _safe_body("INVALID_CONTEXT_PREVIEW_REQUEST"))
+            return
+        query_text = query.strip()
+        if not query_text or len(query_text) > _mhr.QUERY_MAX_LENGTH:
+            await _send_json_resp(send, 400,
+                                  _safe_body("INVALID_CONTEXT_PREVIEW_REQUEST"))
+            return
+
+        user_id = _srv._resolve_pinecone_user_id()
+        chat_tag = os.environ.get("CHAT_TAG", "Web_Chat").strip() or "Web_Chat"
+        user_name = os.environ.get("USER_NAME", "用户").strip() or "用户"
+
+        # ── 只读去重基底（复刻 _inject_context 当轮已注入的四类既有文本）──
+        dedup_basis = {"profile_lines": 0, "summary_lines": 0,
+                       "pinecone_lines": 0, "history_texts": 0,
+                       "pinecone_available": False}
+        existing_texts = []
+
+        try:  # 画像行（与 _inject_context 同查询/同过滤/同截断）
+            pr = await asyncio.to_thread(lambda: _srv.supabase_service.table(
+                "user_facts").select("key, value").neq(
+                "key", "sys_config").neq("key", "llm_settings").neq(
+                "key", "llm_models").order("key").execute())
+            prof_lines = []
+            for r in ((pr.data or []) if pr else [])[:30]:
+                if not isinstance(r, dict):
+                    continue
+                val = str(r.get("value", "")).strip()
+                if val and _is_profile_key(str(r.get("key", ""))):
+                    prof_lines.append(f"• {val[:150]}")
+            if prof_lines:
+                existing_texts.append("\n".join(prof_lines))
+                dedup_basis["profile_lines"] = len(prof_lines)
+        except Exception as e:
+            _log(f"⚠️ [ContextPreview] 画像基底获取失败（跳过）: "
+                 f"exception_type={type(e).__name__}")
+
+        try:  # 阶段总结行
+            sr = await asyncio.to_thread(lambda: _srv.supabase_service.table(
+                "memories").select("content").eq(
+                "tags", "Core_Cognition").order(
+                "created_at", desc=True).limit(3).execute())
+            sum_lines = [f"- {str(r.get('content', '')).strip()}"
+                         for r in ((sr.data or []) if sr else [])
+                         if isinstance(r, dict) and str(r.get("content", "")).strip()]
+            if sum_lines:
+                existing_texts.append("\n".join(sum_lines))
+                dedup_basis["summary_lines"] = len(sum_lines)
+        except Exception as e:
+            _log(f"⚠️ [ContextPreview] 总结基底获取失败（跳过）: "
+                 f"exception_type={type(e).__name__}")
+
+        try:  # Pinecone 深层记忆行（只读检索；未配置/失败都跳过）
+            mc = _get_pinecone_memory()
+            if mc:
+                dedup_basis["pinecone_available"] = True
+
+                def _psearch():
+                    return mc.search(query=query_text, user_id=user_id,
+                                     limit=5, source="web_user")
+
+                mr = await asyncio.to_thread(_psearch)
+                if mr:
+                    rl = mr.get("results", mr) if isinstance(mr, dict) else mr
+                    if isinstance(rl, list) and rl:
+                        from shared_experience import partition_recall
+                        _regular, _shared = partition_recall(rl)
+                        pc_lines = [
+                            f"- {m.get('memory', str(m))}" if isinstance(m, dict)
+                            else f"- {str(m)}" for m in _regular]
+                        if pc_lines:
+                            existing_texts.append("\n".join(pc_lines))
+                            dedup_basis["pinecone_lines"] = len(pc_lines)
+        except Exception as e:
+            _log(f"⚠️ [ContextPreview] Pinecone 基底获取失败（跳过）: "
+                 f"exception_type={type(e).__name__}")
+
+        try:  # 历史用户侧文本（与 _inject_context 同 tag 集/同提取函数/同截断）
+            _TAGS = [chat_tag, "TG_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
+            hr = await asyncio.to_thread(lambda: _srv.supabase_service.table(
+                "memories").select("content, tags").in_(
+                "tags", _TAGS).order("created_at", desc=True).limit(20).execute())
+            hist_texts = []
+            for row in list(reversed((hr.data or []) if hr else []))[-10:]:
+                c = str(row.get("content", "")).strip() if isinstance(row, dict) else ""
+                if not c:
+                    continue
+                user_side = _extract_user_side_from_history(c, user_name)
+                if user_side:
+                    hist_texts.append(user_side[:500])
+            if hist_texts:
+                existing_texts.extend(hist_texts)
+                dedup_basis["history_texts"] = len(hist_texts)
+        except Exception as e:
+            _log(f"⚠️ [ContextPreview] 历史基底获取失败（跳过）: "
+                 f"exception_type={type(e).__name__}")
+
+        # ── 真实注入链路（与 _inject_context 生产接线同款绑定）──
+        async def _recall_fn(query_text_arg, server_user_id):
+            def _rpc_caller(params):
+                # 只读 RPC：active-only 余弦召回，每请求至多一次
+                return _srv.supabase_service.rpc(_mhr.RPC_NAME, params).execute()
+
+            _hr_result, _ = await _mhr.run_hybrid_recall(
+                query_text_arg, server_user_id,
+                _srv._get_embedding, _rpc_caller,
+                _ACTIVE_MEMORY_RECALL_TOP_K)
+            return _hr_result
+
+        try:
+            message, log_line = await _mci.build_active_memory_injection(
+                query_text, user_id, _recall_fn, existing_texts)
+        except Exception as e:
+            # 模块内部已全捕获；此处仅防御意外，异常只记类型不记原文
+            _log(f"⚠️ 注入预览失败：stage=handler "
+                 f"error=INTERNAL_ERROR exception_type={type(e).__name__}")
+            await _send_json_resp(send, 500, _safe_body("INTERNAL_ERROR"))
+            return
+
+        _log(f"🔍 [ContextPreview] {log_line}")
+
+        # 失败路径：日志行为 stage/error 形态（错误码已由模块脱敏为常量形态）
+        m_fail = re.search(r"stage=(\S+) error=([A-Za-z0-9_]+)", log_line)
+        if m_fail:
+            body = _safe_body(m_fail.group(2))
+            body["dedup_basis"] = dedup_basis
+            status = _mhr.HTTP_STATUS_BY_CODE.get(m_fail.group(2), 500)
+            await _send_json_resp(send, status, body)
+            return
+
+        # 成功/无注入路径：从模块日志行解析计数（key=value 是模块稳定契约；
+        # 解析失败按 0 处理，不影响注入块本体展示）
+        counters = dict(re.findall(r"([a-z_]+)=(\d+)", log_line))
+
+        def _cint(key):
+            try:
+                return int(counters.get(key, "0"))
+            except Exception:
+                return 0
+
+        items = []
+        block_chars = 0
+        message_role = None
+        if isinstance(message, dict):
+            message_role = message.get("role")
+            content = message.get("content")
+            if isinstance(content, str):
+                block_chars = len(content)
+                for ln in content.split("\n")[2:]:  # 前两行为标题与指令文案
+                    if ln.startswith("• "):
+                        c = ln[2:]
+                        # 脱敏：只给截断预览 + 完整长度标注，绝不返回完整正文
+                        items.append({
+                            "preview": (c[:40] + "…") if len(c) > 40 else c,
+                            "content_chars": len(c)})
+
+        resp = {
+            "ok": True,
+            "code": "MEMORY_CONTEXT_PREVIEW_READY",
+            "method": _mci.METHOD_NAME,
+            "query_chars": len(query_text),
+            "injection": {
+                "would_inject": bool(items),
+                "message_role": message_role,
+                "block_title": _mci.INJECTION_BLOCK_TITLE,
+                "instruction": (_mci.INJECTION_INSTRUCTION
+                                + _mci.INJECTION_IGNORE_NOTE),
+                "block_chars": block_chars,
+                "items": items,
+            },
+            "stats": {
+                "recall_candidates": _cint("recall_items"),
+                "dedup_existing_removed": _cint("dedup_existing_removed"),
+                "dedup_batch_removed": _cint("dedup_batch_removed"),
+                "invalid_dropped": _cint("invalid_dropped"),
+                "expired_dropped": _cint("expired_dropped"),
+                "invalid_time_dropped": _cint("invalid_time_dropped"),
+                "injected": _cint("injected"),
+                "limit": _cint("limit"),
+                "recall_top_k": _ACTIVE_MEMORY_RECALL_TOP_K,
+            },
+            "dedup_basis": dedup_basis,
+            "writes_executed": False,
+            "sent_to_model": False,
+            "chat_gate_enabled": _active_memory_injection_enabled(),
+        }
+        await _send_json_resp(send, 200, resp)
 
     # ------------------------------------------
     # 🎛️ 多模型管理接口 /api/models

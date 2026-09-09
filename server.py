@@ -570,7 +570,12 @@ async def ask_role(role: str, prompt: str, system_prompt: str = "", temperature:
                 raw_text = resp.choices[0].message.content.strip()
             except Exception:
                 raw_text = _gw._extract_response_text(resp)
-            return re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean = re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            # 压缩类产物兜底清洗：剥离混入正文开头的英文思考链
+            # （阶段总结/日记/周月年回忆录/消息总结都走 compression 角色）
+            if role == "compression":
+                clean = _gw.strip_cot_preamble(clean)
+            return clean
         except Exception as e:
             reason, mark = _gw._classify_llm_error(e)
             if epk and mark:

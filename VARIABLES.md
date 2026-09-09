@@ -23,6 +23,7 @@
 - [12. 后台心跳调度](#12-后台心跳调度)
 - [13. 其他可选](#13-其他可选)
 - [14. 欲望驱动系统 (情感 / 欲望引擎)](#14-欲望驱动系统-情感--欲望引擎)
+- [16. active 记忆上下文注入（长期记忆进聊天）](#16-active-记忆上下文注入长期记忆进聊天)
 - [最小可运行配置示例](#最小可运行配置示例)
 
 > 💡 **运行时门控**：以下功能开关均通过桌面控制台 `/console` 或 Mini App `/miniapp` 管理，存储在 Supabase `user_facts.sys_config` JSON 字段中，无需重启即可生效：
@@ -466,6 +467,21 @@ Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什
 - `wallet_check` / `wallet_earn` / `wallet_spend` / `wallet_exchange` / `wallet_overtime_withdraw` / `wallet_log` 六个 MCP 工具在 `server.py` 注册，调用 `home_system.py` 中对应的 DB IO 函数。
 - `wallet_exchange` 硬编码兑换率：`tea=50` / `gift=100`（单位与 `currency` 一致，默认 CNY）。
 - `source_key` 幂等：重复提交相同 `source_key` 时，`rpc_wallet_earn` 会返回 `DUPLICATE_SOURCE` 错误，防止重复入账。
+
+---
+
+## 16. active 记忆上下文注入（长期记忆进聊天）🆕
+
+> 🆕 第 42 阶段新增。把经人工 approve 的 active 长期记忆（`memory_items`）通过混合召回接入网页聊天的上下文。**门控默认关**：关闭时注入逻辑完全不执行（连召回都不发生），聊天行为与接入前完全一致。开启前必须先经 `POST /api/memory-context-preview`（受 `API_SECRET` 保护 + confirm 令牌）以真实数据人工核对注入质量。
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `ACTIVE_MEMORY_INJECTION_ENABLED` | ❌ | `false` | **注入总闸**（环境变量，需重启生效）。`true`/`1`/`yes`/`on`（大小写不敏感）开启；未设置或任何其他值一律关闭（安全侧默认）。开启后：`_inject_context` 在 volatile 块之后以**独立 system 消息**注入「【长期记忆 · 事实参考】」块——内部走第 40 阶段混合召回（向量+词面 RRF，top_k=10），跨来源去重（与当轮画像/总结/Pinecone/历史用户侧文本比对）后最多注入 **top 3** 条。防线：注入块是"参考"身份非"事实断言"、限量 3 条、每条记忆本身经人工 approve 才进 active。**不设相似度阈值**——弱相关查询仍可能召回，请先跑 preview 核对。 |
+
+**preview 接口**（只读人工核对，不受门控影响，门控关时也可用）：
+- `POST /api/memory-context-preview`，请求体 `{"confirm": "MEMORY_CONTEXT_PREVIEW_ONLY", "query": "<≤500 字符>"}`，需带 `API_SECRET` 鉴权头。
+- 返回：命中候选数 / 各类去重计数 / 注入条数、注入块结构示意（system 角色、指令文案、每条记忆 ≤40 字符截断预览 + 完整长度）、`writes_executed: false`、`sent_to_model: false`、`chat_gate_enabled`（当前门控状态）。
+- 响应不含 user_id、内部 item ID、hash；绝不把注入内容发给上游模型。
 
 ---
 

@@ -5831,3 +5831,280 @@ Home 页面能看到信件标题和摘要，但没有拆信入口；未拆信正
 - `_probe_env.txt`（含 anon 公开 key）与 `_phase5_*.py`、`_probe_anon.py`、`_scan5.py`
   为本阶段临时联调脚本，留在工作区（已按 .gitignore 规则排除或不含敏感值），
   可由昕自行删除。
+
+---
+
+## 2026-09-09 · AI 伴侣记忆系统重做 · 第 41 阶段：active 记忆上下文注入 Mock 设计（零生产接入）
+
+第 40 阶段已验收混合召回多候选排序（HYBRID_MULTI_GATE_PASS），但 active 记忆尚未
+接入真实聊天上下文。本阶段为接入做**纯设计 + Mock 测试**：产出注入逻辑模块与专项
+测试，为第 42 阶段手动 preview 真实接线铺路。**零生产接入**：不修改
+`gateway._inject_context`，新模块不被任何聊天路径调用（仅被测试调用），不部署。
+
+### 硬性边界遵守情况
+
+- **仅新增 2 个文件**：`memory_context_injection.py`（注入逻辑）、
+  `test_memory_context_injection_phase41.py`（Mock 测试）。
+- `gateway.py` / `server.py` / 其余既有文件零改动（git status 中二者的 M 为本阶段
+  之前其他会话的既有未提交改动，与本阶段无关）。
+- 零真实外部调用：测试全程 unittest + 合成数据，不触真实 provider / Supabase /
+  Pinecone / LLM；测试不 import gateway / server。
+- 不新增环境变量（`VARIABLES.md` 零改动）；不 commit、不 push、不部署。
+
+### 设计说明（memory_context_injection.py）
+
+- **唯一入口** `build_active_memory_injection(query, server_user_id, recall_fn,
+  existing_context_texts, max_items, now)`，返回 `(message | None, log_line)`。
+- **召回源解耦**：混合召回能力（第 37 阶段向量+词面 RRF）只经注入的 async
+  callable 进入，契约 `recall_fn(query_text, server_user_id) -> 第 37 阶段 result
+  dict`；本模块不 import `memory_hybrid_recall`、不复制其算法代码（测试以真实
+  `run_hybrid_recall` 绑假 embedding/假 RPC 注入，证明复用身份）。
+- **只注入 active**：状态排除（pending_review/rejected/superseded）与首次过期
+  过滤由召回层保证（RPC SQL active-only + `_row_state` 二次过滤）；注入层对
+  `expires_at` 独立复验（已过丢弃、不可解析保守丢弃、None=永不过期），解析复用
+  第 35 阶段 `_parse_utc` 同一实现。user_id 只有服务端参数一个来源，原样传给
+  recall_fn（生产即 RPC 的 p_user_id），无任何客户端提交入口。
+- **限量 top 3**：`max_items` 默认 `DEFAULT_MAX_INJECTED=3`，去重在截断之前完成；
+  非法 max_items（bool/非 int/<1）回退默认值，不中断。
+- **跨来源去重**（简单可解释，无相似度阈值合并）：调用方把 `_inject_context`
+  现有来源文本（user_facts 画像、Core_Cognition 总结、Pinecone、历史流水）以
+  `existing_context_texts` 传入；归一化（lowercase+去空白+仅留字母数字/CJK）后
+  精确相等或双向子串包含（被包含侧 ≥ `DEDUP_MIN_SUBSTR_LEN=5`，防超短串误杀）
+  即判同一事实只留一处；批内同正文只留排名靠前一条；dedup 输入契约违规整体拒绝
+  （宁可不注入也不跳过去重，且零召回调用）。
+- **注入块结构**（恰一条独立 system 消息，绝不伪装 user/assistant）：
+
+  ```
+  【长期记忆 · 事实参考】
+  以下是关于用户的事实参考，仅供回答时参考，禁止模仿其措辞、语气，禁止当作对话范例复述。若某条与当前话题无关，直接忽略即可。
+  • 记忆正文1
+  • 记忆正文2
+  • 记忆正文3
+  ```
+
+  每条正文 strip 后按 `MAX_ITEM_CONTENT_CHARS=300` 截断（与画像 150/历史 500
+  既有截断风格一致）。
+- **失败路径**（全部返回"无注入"，绝不抛异常打断聊天主链路、绝不注入残缺内容）：
+  query/user_id 非法 → `request_check`（零召回调用）；recall_fn 不可调用 →
+  `dependency_check`；dedup 输入违规 → `dedup_input`（零召回调用）；召回抛异常 →
+  `recall_call`（只记 exception_type）；返回非 dict / ok 非 True / items 非列表 →
+  `recall_result`（错误码仅放行 `[A-Z0-9_]{1,64}` 常量形态，防结构违规结果把任意
+  文本带进日志）；items 空/全无效 → 计数日志 injected=0；另有外层兜底
+  `except Exception`（放行 CancelledError 保持取消语义）。
+- **脱敏**：日志与返回值不含 user_id / 内部 item ID / hash / 查询原文 / 正文 /
+  异常原文；正文只出现在最终注入的 system 消息内容里；模块不 print，日志行去向由
+  调用方决定。
+
+### 已知风险（如实声明）
+
+- **无相似度阈值**（未校准，被明确禁止），弱相关/无关查询仍可能召回并注入 top 3
+  条记忆。当前防线：注入块是"参考"身份而非"事实断言"（明示可忽略）、限量 3 条、
+  每条记忆本身经人工 approve 才进入 active。根本把关在第 42 阶段人工 preview：
+  接线前先以真实数据人工核对注入质量，确认可接受后才允许进入真实聊天链路。
+
+### 测试结果（全部通过，零真实调用）
+
+- `python -m py_compile memory_context_injection.py
+  test_memory_context_injection_phase41.py` → 通过。
+- `python -m unittest test_memory_context_injection_phase41` → **72/72 通过**，
+  覆盖：只注入 active 逐类排除（经真实第 37 阶段召回链 + 注入层独立时间复验）、
+  top 3 限量与非法回退、跨来源四来源去重（精确/双向子串/项目符号行/大小写标点/
+  超短串防误杀/批内去重/契约违规拒绝）、注入形态逐行断言（system 角色+指令原文+
+  块结构+无 user/assistant 伪装）、失败安全全场景（召回异常/结构违规/输入非法，
+  全部无注入且不抛错）、日志与返回值脱敏扫描（全部路径）、零真实外部调用
+  （embedding/RPC 恰调用次数逐场景断言、p_user_id/match_count/1024 维参数核对、
+  AST 级 import 白名单、无 print/无环境变量访问）、零生产接入（全部既有顶层 .py
+  源码不含本模块名，gateway.py/server.py/tool_loop.py/heartbeat.py 必在扫描集内）。
+- 回归：`test_memory_recall_phase21` + `test_memory_vector_recall_phase35` +
+  `test_memory_hybrid_recall_phase37` → **224/224 通过**，既有模块零干扰。
+
+### Git 状态
+
+- 新增 untracked：`memory_context_injection.py`。
+- 新增 `test_memory_context_injection_phase41.py` 被仓库既有 `.gitignore` 第 48 行
+  `test_*.py` 规则忽略（与阶段 19-37 测试文件同处境；旧测试文件是历史强制加入的，
+  提交时需 `git add -f`）。`.gitignore` 本阶段零改动。
+- `gateway.py` / `server.py` 的 M 为其他会话既有未提交改动；本阶段未产生任何对
+  既有文件的修改。本阶段未创建 commit。
+
+### 第 42 阶段（手动 preview 接线）建议
+
+1. 接线位置：`_inject_context` 的 volatile 区块（Pinecone 注入之后），以独立
+   system 消息插入（复用本模块返回的 message，不拼进 volatile_block 字符串，避免
+   破坏缓存前缀语义）。
+2. 生产绑定：`recall_fn` 内部调用第 37 阶段 `run_hybrid_recall(query, user_id,
+   server._get_embedding, service_role RPC callable, top_k=10)`（top_k 取 10 给
+   去重留余量，注入层再截 3）；`existing_context_texts` 传当轮已计算的
+   user_prof 行、core_summaries 行、pinecone 行、history 用户侧文本。
+3. 必须保留人工 preview 关卡：先以真实 active 记忆数据跑 preview，人工核对注入
+   质量（尤其无关查询场景），确认后才接入真实聊天链路；preview 接口沿用既有
+   confirm 令牌模式。
+4. 建议新增门控环境变量（如 `MEMORY_INJECTION_ENABLED`，默认 false）+ 白名单
+   日志，接入后先小流量观察 injected/dedup 计数分布再放开。
+
+---
+
+## 第 42 阶段：active 记忆上下文注入 · 真实接线 + 只读 preview 接口（门控默认关，不接真实聊天验证）
+
+### 本阶段做了什么
+
+把第 41 阶段的注入逻辑接线到 `_inject_context`，并新增受保护的只读 preview
+接口 `POST /api/memory-context-preview`，供人工以真实数据核对注入效果。
+**门控默认关**：`ACTIVE_MEMORY_INJECTION_ENABLED` 未设置时注入逻辑完全不执行
+（连召回都不发生），聊天行为与第 41 阶段（零接入）完全一致。本阶段未做真实
+聊天验证（任务书明确不接真实聊天路径）。
+
+### 修改文件清单
+
+| 文件 | 变更 |
+|------|------|
+| `gateway.py` | ① 门控：新增常量 `_ACTIVE_MEMORY_RECALL_TOP_K = 10` 与函数 `_active_memory_injection_enabled()`（环境变量 `ACTIVE_MEMORY_INJECTION_ENABLED`，默认 false，仅 `1/true/yes/on` 视为开启，安全侧默认）。② 接线：`_inject_context` volatile 消息插入之后、最终注入日志之前新增注入区块。③ 路由：`__call__` dispatch 注册 `/api/memory-context-preview`（紧跟第 37 阶段 hybrid recall 路由之后，恰好一处）。④ 新 handler：`_handle_memory_context_preview`（含注释）。 |
+| `VARIABLES.md` | 新增 §16「active 记忆上下文注入」+ 目录项：变量契约、preview 接口用法。 |
+| `test_memory_context_injection_phase42.py` | 新增，41 个用例（详见测试结果）。 |
+| `test_memory_context_injection_phase41.py` | **唯一一处既有测试修改**：`test_h_no_existing_file_references_new_module` 的排除集加入 `gateway.py`（第 42 阶段授权的唯一接线点）与 `test_memory_context_injection_phase42.py`（第 42 阶段测试文件自身引用模块名）。该守卫原语义是"第 41 阶段零生产接入"，第 42 阶段合法接线后必然失效，故按新阶段语义最小更新：模块名仍禁止出现在 server.py / tool_loop.py / heartbeat.py 等其余全部顶层 .py。 |
+| `memory_context_injection.py` | **核心逻辑零改动**（硬性边界确认）。 |
+| `test_memory_recall_phase21.py` | **零改动**。第 21 阶段守卫 `test_k_context_injection_untouched`（禁 `memory_recall` 子串）执行中曾被触发——原因是接线初版局部函数命名 `_active_memory_recall_fn` 含该子串（`memory_hybrid_recall` 本身不含），将函数改名 `_am_recall_fn` 后守卫按原文还原通过。最终该守卫零弱化。 |
+
+### 接线位置说明（gateway._inject_context）
+
+- **位置**：③「易变尾块」volatile 消息插入（`msgs.insert(last_user_idx, volatile_msg)`）
+  之后、`_summ_tag` 统计日志之前。以**独立 system 消息**插入，插在重扫后的
+  最后一条 user 之前——最终消息序为 `… volatile_msg → 注入消息 → 最后一条 user`，
+  即"volatile 区块之后"，且**不拼进 volatile_block 字符串**（不破坏既有缓存前缀
+  语义与 `/api/prompts` 快照语义）。
+- **recall_fn 绑定**：嵌套协程 `_am_recall_fn(query_text, server_user_id)` 内部调
+  `run_hybrid_recall(query, user_id, server._get_embedding, service_role RPC, top_k=10)`
+  （RPC 经 `server.supabase_service.rpc(_mhr.RPC_NAME, params).execute()`，与第 37
+  阶段预览同款绑定；top_k=10 留去重余量，注入层再截 3），返回 result dict 并把
+  召回层安全日志行前缀 `[ActiveMemory]` 落日志。
+- **existing_context_texts**：当轮已算好的四类文本——`user_prof`（画像行）、
+  `core_summaries`（总结行）、`pinecone_context`（Pinecone 行）、`history_msgs`
+  各条用户侧 content。
+- **user_id**：一律 `server._resolve_pinecone_user_id()` 服务端解析，客户端无提交入口。
+- **防御**：只插入模块承诺的 `role == "system"` 消息（任何其他角色一律丢弃）；
+  模块内部已全捕获降级"无注入"，接线处再兜底 `except Exception`（只记
+  `exception_type`），任何异常不打断聊天主链路。
+
+### 门控变量
+
+- 名称：`ACTIVE_MEMORY_INJECTION_ENABLED`；默认 **false**。
+- 取值：`true/True/TRUE/1/yes/on/" true "` 开启；未设置 / `false/0/no/off/""`
+  /其他任意值一律关闭（已逐值测试）。运行时读取（无缓存），改后需重启进程生效。
+
+### preview 接口契约（POST /api/memory-context-preview）
+
+- **鉴权**：`/api/*` 全局 `API_SECRET`（Bearer）；OPTIONS 预检免鉴权；非 POST 405。
+- **请求体**：严格白名单 `{confirm, query}`——confirm 必须逐字等于
+  `"MEMORY_CONTEXT_PREVIEW_ONLY"`；query 字符串、trim 非空、≤500 字符（沿用
+  `memory_hybrid_recall.QUERY_MAX_LENGTH`）；任何额外字段（user_id/top_k/status/
+  write_back 等）→ 400 且**零读库、零 RPC、零 provider 调用**。
+- **链路**：与真实注入完全相同（第 41 阶段模块：召回→去重→截断→组块）。去重
+  基底只读复刻真实聊天当轮四类既有文本（画像/总结/Pinecone/历史用户侧，与
+  `_inject_context` 同查询同过滤同截断），各来源独立 best-effort 失败跳过，
+  并在 `dedup_basis` 如实报告各来源行数。
+- **只读保证**：零写入（不写任何表、不更新 recall_count）、不触 Pinecone 写、
+  不调 LLM、**绝不把注入内容发给任何真实上游模型**（测试静态断言 handler 源码
+  无 insert/update/delete/upsert/requests/ask_llm）。
+- **响应**（成功）：`ok / code("MEMORY_CONTEXT_PREVIEW_READY") / method /
+  query_chars` + `injection{would_inject, message_role, block_title,
+  instruction, block_chars, items[{preview(≤40 字符截断+…), content_chars}]}` +
+  `stats{recall_candidates, dedup_existing_removed, dedup_batch_removed,
+  invalid_dropped, expired_dropped, invalid_time_dropped, injected, limit,
+  recall_top_k=10}` + `dedup_basis{...}` + `writes_executed:false` +
+  `sent_to_model:false` + `chat_gate_enabled`（当前门控状态，preview 本身不受
+  门控影响——它就是开门前的核对手段）。失败路径返回安全错误码
+  （`INVALID_*` / `VECTOR_RPC_FAILED` / `INTERNAL_ERROR` 等，HTTP 状态沿用
+  第 37 阶段映射）。
+- **脱敏**：响应与日志不含 user_id、内部 item ID、hash；正文只给 ≤40 字符
+  截断预览 + 完整长度标注；召回层错误码经第 41 阶段白名单形态过滤。
+
+### 测试结果（全部通过，零真实调用）
+
+- `python -m py_compile gateway.py test_memory_context_injection_phase42.py` → 通过。
+- `python -m unittest test_memory_context_injection_phase42` → **41/41 通过**：
+  门控语义逐值 + 关闭零执行（build 恰 0 调用、零 embedding、零 RPC、消息序列
+  与基线一致）；开启恰 1 次调用、注入消息位于 volatile 之后最后一条 user 之前、
+  system 角色、无 user/assistant 伪装、不拼进 volatile_block、去重基底含
+  画像/总结/历史用户侧、user_id 服务端值、max_items=3；真实链路（真实第 41
+  阶段模块 + 假 embedding/RPC）：provider 恰 1 次、RPC 恰 1 次、p_user_id/
+  match_count/1024 维核对、注入块由 RPC 行真实拼出、与画像重复被跨来源去重；
+  失败安全（build 抛异常 / embedding 抛异常 → 聊天照常、异常原文不进日志）；
+  preview 路由/鉴权（缺密钥 401、错密钥 401、空密钥 503、OPTIONS 204、有效
+  密钥端到端 200）/ confirm 缺失错误 / 额外字段 / query 非法与超长全拒绝且零
+  调用 / 恰 500 字符通过；成功结构逐字段、去重如实计数、只读断言（forbidden
+  空、RPC 恰 1 次、表操作全为读）、门控关时 preview 可用且 chat_gate_enabled
+  如实、失败路径安全码、响应与日志脱敏扫描、静态边界（handler 源码无写/无
+  LLM/无 HTTP、confirm 令牌、接线源码引用门控与模块、top_k=10）。
+- 回归：`test_memory_context_injection_phase41`（72，含更新后的接线点守卫）+
+  `test_memory_hybrid_recall_phase37` + `test_memory_vector_recall_phase35` +
+  `test_memory_recall_phase21` + `test_sanitize_phase41` → 六套合计
+  **356/356 通过**，既有模块零干扰。
+
+### Git 状态（未 commit、未 push、未部署）
+
+- `gateway.py`：unstaged 修改（本阶段接线 + 路由 + preview handler；此前会话
+  已有 staged 改动保持原样，状态 `MM`）。`git diff --stat`（本阶段 unstaged）：
+  `gateway.py | 367 +`（含注释）、`VARIABLES.md | 16 +`。
+- `VARIABLES.md`：unstaged 修改（§16 + 目录项）。
+- `PROJECT_NOTES.md` / `server.py` / `memory_context_injection.py`：本阶段
+  **未再改动**（PROJECT_NOTES/server 的 M 为此前会话既有改动；
+  memory_context_injection.py 为第 41 阶段新增的 staged 文件，本阶段零改动）。
+- 新增 `test_memory_context_injection_phase42.py` 被仓库 `.gitignore` 的
+  `test_*.py` 规则忽略（与阶段 19-41 测试同处境，提交时需 `git add -f`）。
+- 临时扫描文件（_p42_scan*）已全部删除。
+
+### 已确认 / 未验证 / 风险
+
+**已确认（Mock 测试覆盖）**：门控默认关时 `_inject_context` 行为与接线前逐字节
+一致（消息序列、零注入调用、零 provider、零 RPC）；开启时注入消息形态与位置
+符合要求；召回绑定参数正确（p_user_id/match_count/维度/top_k）；preview 与真实
+注入同链路、只读、脱敏、拒绝路径零副作用；注入失败不打断聊天。
+
+**未验证（需要真实环境，本阶段按任务书不做）**：
+1. 真实聊天链路效果——门控开启后的实际注入质量（这正是 preview 人工核对要做的）；
+2. preview 接口对真实 Supabase/Pinecone 的表现（真实 active 3 条数据的实际
+   召回/去重计数）；
+3. 上游模型对注入块的实际反应（token 成本、是否模仿措辞）。
+
+**风险（如实声明，沿袭第 41 阶段）**：
+1. **无相似度阈值**：弱相关/无关查询仍会召回并注入 top 3 条。防线仍是参考身份
+   块 + 限量 + 人工 approve 的 active 池；**根本把关在 preview 人工核对**。
+2. preview 的去重基底是"当轮四类来源"的 best-effort 只读复刻：与真实聊天轮
+   （TTL 缓存、客户端自带历史等差异）可能存在个别行差异，dedup 计数以真实
+   聊天为准；preview 已在 `dedup_basis` 如实列出各来源行数供比对。
+3. preview 的计数从第 41 阶段模块日志行解析（key=value 是模块稳定契约），
+   解析失败按 0 处理（不影响注入块本体展示）。
+4. 门控开启后每轮聊天新增 1 次 embedding 调用 + 1 次只读 RPC（召回成本），
+   失败时静默降级为无注入（安全侧）。
+
+### 给昕的手动 preview 操作步骤
+
+1. 启动网关（确保环境变量 `API_SECRET` 已配置；`ACTIVE_MEMORY_INJECTION_ENABLED`
+   保持不设或 false——preview 不受门控影响）。
+2. 准备查询（≤500 字符），例如 `这周想吃什么` / `我上次说的猫怎么样了`。
+3. 发请求（PowerShell，**中文必须按 UTF-8 byte[] 发送**，直接 `-Body "中文"`
+   会按本地码页编码导致乱码）：
+
+   ```powershell
+   $secret = "你的API_SECRET"
+   $query  = "这周想吃什么"   # 换成你想核对的查询
+   $body   = [System.Text.Encoding]::UTF8.GetBytes(
+       ('{"confirm": "MEMORY_CONTEXT_PREVIEW_ONLY", "query": "' + $query + '"}'))
+   Invoke-RestMethod -Method Post `
+     -Uri "http://127.0.0.1:10000/api/memory-context-preview" `
+     -Headers @{ Authorization = "Bearer $secret" } `
+     -ContentType "application/json; charset=utf-8" `
+     -Body $body | ConvertTo-Json -Depth 8
+   ```
+
+   （端口按实际 `PORT` 调整；curl 用户用 `--data-binary` 且确保请求体文件为
+   UTF-8，勿用 `-d "中文字面量"`。）
+4. 核对响应：`stats.injected` / `dedup_*` 计数、`injection.items[].preview`
+   （每条记忆 ≤40 字预览 + `content_chars` 全长）、`dedup_basis`（画像/总结/
+   Pinecone/历史各来源行数）、`writes_executed=false`、`sent_to_model=false`。
+   **重点核对无关查询场景**（如问天气、问时间）——无阈值防线下它们仍可能命中。
+5. 多换几个查询重复第 3-4 步。确认注入质量可接受后，再在环境变量中设
+   `ACTIVE_MEMORY_INJECTION_ENABLED=true` 并重启网关，用一次真实聊天在日志里
+   看 `🧠 长期记忆注入：… injected=N` 行复核，随后可常开。
+6. 任何异常情况：把 `ACTIVE_MEMORY_INJECTION_ENABLED` 移除或设回 false 重启，
+   即完全回到接入前行为（注入逻辑零执行）。
