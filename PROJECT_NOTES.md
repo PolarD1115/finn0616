@@ -835,6 +835,22 @@
 - `run_auto_extraction`：并发防护（同 user 已有 processing 非空批次即跳过本轮）→ 取批（pending 按 `created_at` 升序最旧 20 条，单调消化积压）→ **原子条件 UPDATE 认领**（pending→processing，只处理实际认领到的子集）→ `memory_extractor.extract_memory_candidates` → 分写（confidence≥0.75 直接 `active`，否则 `pending_review`；写入前 user_id+content_hash 跨批精确去重，重复候选跳过且事件照常标 processed）→ 事件收尾（成功 processed+attempt_count+1；提取失败 failed+attempt_count+1+脱敏 last_error；**写入/去重失败释放回 pending** 幂等重试，事件不丢）；永不抛异常；日志只打计数。
 - worker `async_memory_extraction_worker` **默认关**（`MEMORY_EXTRACTION_WORKER_ENABLED=false`），已注册进 `run_background_process`（name="memory_extraction"）；env 解析失败回退默认值，不拖垮后台进程。
 
+**B2 · search_memory 优先查分层记忆**（`server.py`）：
+- `search_memory` 新增第一段：`memory_items` 混合召回（`run_hybrid_recall`，service_role 只读 RPC，top_k=5）→「🧠 【长期记忆】:」分块（最多 5 条）；旧 Pinecone 语义 / 旧 memories 关键词两段**原样保留为回退**；Secret_Diary 过滤不回归；user_id 服务端解析；stdout 无正文/user_id/查询原文。
+
+**B3 · TG/QQ 渠道接 active 自动注入**（`server.py` `_build_channel_context`）：
+- 复用 Web 第 42 阶段门控（`ACTIVE_MEMORY_INJECTION_ENABLED`，默认关）与第 41 阶段构建体 `build_active_memory_injection`（召回/去重算法零复制）；recall_fn 与 Web 同构（service_role 只读 RPC + `_get_embedding`，top_k=10）；去重基底=当轮画像/总结/Pinecone/历史用户侧文本；
+- 该函数返回**字符串**（system prompt）而非 messages：模块返回的 system 文本块校验 `role=="system"` 后**以独立段落追加到 volatile 末尾**（绝不伪装 user/assistant）；失败整段兜底跳过；函数签名零改动，napcat/heartbeat 调用方零变更。
+
+**测试**：新增 86 例全通过（A 渠道 23 / A4 18 / A5 23 / B2 8 / B3 14，全 mock 不触真实服务）；回归经 `git stash` 复验零新增回归。**守卫测试更新 3 处**（阶段授权使旧守卫过期，均为最小更新并注明授权阶段）：phase21 `test_k` 的 server.py 断言改为真实不变量（禁直接 `table("memory_items")`、禁旧 `memory_recall` 模块——B3 授权经 `memory_hybrid_recall` 只读访问）；phase41 `test_h` 模块名白名单加 `server.py`；secret_diary C4 隔离扫描因 B2 注释出现私密表名字面命中，改写注释措辞（测试代码未动）。
+
+**新环境变量**（`VARIABLES.md` §12.4）：`MEMORY_EXTRACTION_WORKER_ENABLED`（默认 `false`）/ `MEMORY_EXTRACTION_INTERVAL`（默认 `3600`）/ `MEMORY_EXTRACTION_BATCH_SIZE`（默认 `20`）/ `MEMORY_AUTO_ACTIVE_THRESHOLD`（默认 `0.75`）。
+
+**Supabase 操作声明**：A5 在 worker 开启后会真实 INSERT `memory_items` 并条件 UPDATE `memory_events`（本阶段默认关、未在真实库执行）；B2/B3 为只读 SELECT/RPC；未修改 schema / RLS / 策略。
+**Pinecone 操作声明**：未涉及（B2 的旧 Pinecone 段仅作回退保留）。
+
+**📌 关联**：本条与 v5.6（C1+C2）同属「memory_events 双写 → 分层提取 → memory_items → 注入/搜索/总结 → 安全清理」完整链路；链路各环的失败语义（service 缺失降级、事件永不物理删除、pending/processing 不动）在 v5.6 条目同样适用。
+
 ### v5.4 — 静态常驻提示词迁入网关 stable_system（修 rikkahub 自适应注入失效）
 **问题现象**：rikkahub 客户端因自带「常驻世界书」+「最新消息前提示词」等 user/assistant role 注入项，首轮请求 `_client_msg_count` 即达 4 条 >1 → v5.2 的自适应跳过逻辑在 rikkahub 渠道下**永久触发**，阶段总结和 DB 历史从未注入（日志连续出现 `📦 [Cache] 客户端已带 4 条历史消息，跳过...`）。
 

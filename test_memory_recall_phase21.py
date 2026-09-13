@@ -880,10 +880,14 @@ class TestRecallSourceIsolation(unittest.TestCase):
         if end < 0:
             end = srv.find("\nclass ", start + 10)
         chan = srv[start:end]
-        self.assertNotIn("memory_items", chan,
-                         "_build_channel_context 不得读取 memory_items")
-        self.assertNotIn("memory_recall", chan,
-                         "_build_channel_context 不得调用召回模块")
+        # 阶段 B3 授权：_build_channel_context 经 memory_hybrid_recall（只读 RPC）
+        # 接入 memory_items 分层召回；直接读表与调用旧 memory_recall 模块仍被禁止
+        #（真实不变量，取代本测试原有的字面子串检查——第42阶段起渠道注入已按
+        # 同一授权模式经召回模块访问 memory_items）。
+        self.assertNotIn('table("memory_items")', chan,
+                         "_build_channel_context 不得直接读 memory_items 表")
+        self.assertNotIn("import memory_recall", chan,
+                         "_build_channel_context 不得调用旧召回模块 memory_recall")
 
     def test_k_no_env_or_dependencies_changed(self):
         import ast

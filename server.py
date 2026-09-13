@@ -1100,6 +1100,51 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
+    # 🧠 阶段 B3：长期记忆（memory_items 分层）主动注入（与 Web 第 41/42 阶段对齐）。
+    #    - 复用 gateway 门控（ACTIVE_MEMORY_INJECTION_ENABLED，默认关）与第 41 阶段
+    #      构建体 build_active_memory_injection（召回/去重算法零复制）；
+    #    - 本函数返回 system prompt 字符串而非 messages 列表，故把模块返回的
+    #      system 文本块以独立段落追加到 volatile 末尾（绝不伪装 user/assistant）；
+    #    - 与 Web 相同：仅在 query 非空时触发；失败安全——整段独立 try/except，
+    #      任何失败只记日志跳过，注入块缺失不影响主上下文。
+    try:
+        import gateway as _gw_am
+        if _gw_am._active_memory_injection_enabled() and query and query.strip():
+            import memory_context_injection as _mci_b3
+            import memory_hybrid_recall as _mhr_b3
+
+            async def _am_recall_fn(query_text, server_user_id):
+                # 第41阶段 recall_fn 契约：(query_text, server_user_id) ->
+                # 第37阶段 result dict。生产绑定与 Web 第42阶段同款：
+                # service_role 只读 RPC + server._get_embedding，恰各调用一次；
+                # top_k=10 给跨来源去重留余量（注入层再截 top 3）。
+                def _rpc_caller(params):
+                    return supabase_service.rpc(_mhr_b3.RPC_NAME, params).execute()
+
+                _hr_result, _hr_log = await _mhr_b3.run_hybrid_recall(
+                    query_text, server_user_id, _get_embedding, _rpc_caller,
+                    _gw_am._ACTIVE_MEMORY_RECALL_TOP_K)
+                print(f"🧠 [ActiveMemory] {_hr_log}")
+                return _hr_result
+
+            # 跨来源去重基底：当轮已算好的画像/总结/Pinecone/历史用户侧文本
+            _am_existing = [user_prof, core_summaries, pinecone_context,
+                            history_text]
+            _am_existing = [t for t in _am_existing
+                            if isinstance(t, str) and t.strip()]
+            _am_message, _am_log = await _mci_b3.build_active_memory_injection(
+                query, _resolve_pinecone_user_id(), _am_recall_fn, _am_existing)
+            print(_am_log)
+            # 本函数返回字符串：只追加模块承诺的 system 文本块（绝不伪装其他角色）
+            if (isinstance(_am_message, dict)
+                    and _am_message.get("role") == "system"):
+                _am_content = _am_message.get("content")
+                if isinstance(_am_content, str) and _am_content.strip():
+                    volatile_parts.append(_am_content)
+    except Exception as e:
+        print(f"⚠️ [ActiveMemory] 渠道上下文注入失败（已跳过，不影响主上下文）: "
+              f"exception_type={type(e).__name__}")
+
     # Feed injection statistics into the shared gateway buffer without logging private context.
     try:
         import gateway as _gw
@@ -1380,6 +1425,37 @@ async def search_memory(query: str):
     # 私密标签黑名单——这些 tags 的记忆不通过通用搜索暴露
     _PRIVATE_TAGS = {"Secret_Diary"}
     ans_parts = []
+    # 0. 🧠 阶段 B2：优先查新分层记忆（memory_items 混合召回：core/current/
+    #    long_term/moment/memo，active-only，service_role 只读 RPC）。
+    #    查不到或失败时跳过该段，由下方旧链路（Pinecone 语义 / memories 关键词）兜底。
+    #    memory_items 不含秘密日记（私密正文存独立的私密日记表，不经本搜索暴露），
+    #    召回行结构由 run_hybrid_recall 信任边界校验，无需再做 tags 过滤。
+    if supabase_service:
+        try:
+            import memory_hybrid_recall as _mhr_b2
+            _b2_user_id = _resolve_pinecone_user_id()
+
+            def _b2_rpc_caller(params):
+                # 只读 RPC：active-only 余弦召回，每请求至多调用一次
+                return supabase_service.rpc(_mhr_b2.RPC_NAME, params).execute()
+
+            _b2_result, _b2_log = await _mhr_b2.run_hybrid_recall(
+                query, _b2_user_id, _get_embedding, _b2_rpc_caller, 5)
+            _b2_items = (_b2_result.get("items")
+                         if isinstance(_b2_result, dict) else None)
+            if (_b2_result.get("ok") is True and isinstance(_b2_items, list)
+                    and _b2_items):
+                ans_parts.append("🧠 【长期记忆】:")
+                _b2_count = 0
+                for _item in _b2_items:
+                    if _b2_count >= 5:
+                        break
+                    _content = str(_item.get("content", "")).strip()
+                    if _content:
+                        ans_parts.append(f"- {_content}")
+                        _b2_count += 1
+        except Exception:
+            pass
     # 1. 向量语义搜索
     try:
         vec_results = await asyncio.to_thread(pinecone_memory.search, query, source="mcp")
