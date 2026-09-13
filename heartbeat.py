@@ -264,6 +264,64 @@ def _clean_old_memories(supabase_client):
           "待建立明确的归档与保留策略后再恢复。")
 
 
+# ==========================================
+# 1.8 分层记忆读取（阶段 C1：四级总结叠加 memory_items 输入）
+# ==========================================
+
+def _layered_summary_enabled() -> bool:
+    """四级总结叠加分层记忆的门控（MEMORY_LAYERED_SUMMARY_ENABLED，默认开）。
+
+    关闭时周/月/年 prompt 与历史行为完全一致（完全不读 memory_items）。"""
+    return os.environ.get("MEMORY_LAYERED_SUMMARY_ENABLED", "true").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _fetch_layered_memories(sb_service, user_id, since_iso,
+                            memory_types=("long_term", "moment", "memo"),
+                            limit=30, min_importance=None):
+    """读取 since 之后的 active memory_items（指定类型），返回 content 列表。
+
+    阶段 C1：给四级总结叠加结构化分层记忆（事实/情感坐标/备忘）。
+    - 只读 SELECT（service_role 客户端 server.supabase_service），不新建客户端；
+    - 时间过滤列用 created_at（写入时刻，NOT NULL 带时区）：语义是「这一期产生了
+      哪些记忆」，与日/周/月/年叙事窗口一致；valid_at 是「事实生效时刻」、可空
+      且可能远早于当期（如长期偏好），不适合做当期窗口过滤；
+    - 排序 importance DESC, valid_at DESC；limit 防爆（默认 30）；
+    - current（会过期的临时状态）与 core（固定画像）由调用方通过 memory_types
+      参数排除，本函数不硬编码排除；
+    - 失败/无数据返回 []，绝不抛异常；绝不写库。"""
+    try:
+        if not sb_service or not user_id:
+            return []
+        types = [t for t in (memory_types or ())
+                 if isinstance(t, str) and t]
+        if not types:
+            return []
+        q = (sb_service.table("memory_items")
+             .select("content, memory_type, importance")
+             .eq("user_id", user_id)
+             .eq("status", "active")
+             .in_("memory_type", types)
+             .gte("created_at", since_iso))
+        if min_importance is not None:
+            q = q.gte("importance", int(min_importance))
+        res = (q.order("importance", desc=True)
+               .order("valid_at", desc=True)
+               .limit(max(1, int(limit)))
+               .execute())
+        rows = getattr(res, "data", None) or []
+        contents = []
+        for r in rows:
+            if isinstance(r, dict):
+                c = str(r.get("content", "")).strip()
+                if c:
+                    contents.append(c)
+        return contents
+    except Exception as e:  # noqa: BLE001 —— 只记类型；总结输入缺失不影响日记
+        print(f"⚠️ [分层记忆] 读取失败（该段跳过）: {type(e).__name__}")
+        return []
+
+
 async def _perform_deep_dreaming():
     """
     🌙【深夜日记模式】每日自动生成"昨日回溯"日记。
@@ -273,7 +331,8 @@ async def _perform_deep_dreaming():
     """
     from server import (
         _get_llm_client, _ask_llm_async, ask_role, _save_memory_to_db,
-        _send_email_helper, _get_now_bj, supabase, MemoryType
+        _send_email_helper, _get_now_bj, supabase, MemoryType,
+        supabase_service, _resolve_pinecone_user_id
     )
 
     AI_NAME = os.environ.get("AI_NAME", "AI")
@@ -308,6 +367,19 @@ async def _perform_deep_dreaming():
             context += f"[{ctx_time}] 【{m.get('title', '无题')}】 {content_preview} (Mood:{m.get('mood', '?')})\n"
         if len(context) > 80000:
             context = context[-80000:]
+
+        # 🧠 阶段 C1：日总结顺带附加昨日沉淀的 moment/memo 分层记忆（情感坐标/
+        #    备忘；importance>=6 前 10 条防爆）。读取失败/为空则不附加，日记
+        #    输入源仍是昨日 memories 流水（此处只是增强，不改主输入）。
+        if _layered_summary_enabled():
+            layered_daily = await asyncio.to_thread(
+                _fetch_layered_memories,
+                supabase_service, _resolve_pinecone_user_id(),
+                iso_start, ("moment", "memo"), 10, 6)
+            if layered_daily:
+                context += ("【昨日分层记忆 · 情感坐标/备忘】:\n"
+                            + "\n".join(f"- {c}" for c in layered_daily)
+                            + "\n（以上是当天沉淀的结构化记忆，可在日记中自然呼应。）\n")
 
         # 步骤1：生成每日日记（第一人称视角）
         # prompt 风格移植自群友的"橘瓣日记总结"部署包（memory_summaries 老日记的风格来源）：
@@ -366,9 +438,24 @@ async def _perform_deep_dreaming():
                 )
                 if week_res.data and len(week_res.data) >= 3:
                     week_context = "\n".join([f"- {w['content']}" for w in week_res.data])
+                    # 🧠 阶段 C1：叠加当期分层记忆（long_term/moment/memo，active；
+                    #    current 会过期不参与、core 是固定画像不参与）。
+                    week_prompt = f"【本周每日日记】:\n{week_context}\n\n"
+                    if _layered_summary_enabled():
+                        layered = await asyncio.to_thread(
+                            _fetch_layered_memories,
+                            supabase_service, _resolve_pinecone_user_id(),
+                            week_ago, ("long_term", "moment", "memo"), 30)
+                        if layered:
+                            week_prompt += (
+                                "【本周分层记忆】:\n"
+                                + "\n".join(f"- {c}" for c in layered)
+                                + "\n\n以下同时包含每日日记与结构化分层记忆"
+                                  "（事实/情感坐标/备忘），请综合两者提炼。\n\n")
+                    week_prompt += "请将这周的日记提炼成一篇深度的周度长期记忆总结。纯文本输出。"
                     week_summary = await ask_role(
                         "compression",
-                        f"【本周每日日记】:\n{week_context}\n\n请将这周的日记提炼成一篇深度的周度长期记忆总结。纯文本输出。",
+                        week_prompt,
                         temperature=0.7
                     )
                     if week_summary:
@@ -391,9 +478,23 @@ async def _perform_deep_dreaming():
                 )
                 if month_res.data:
                     month_context = "\n".join([f"- {m['content']}" for m in month_res.data])
+                    # 🧠 阶段 C1：叠加当期分层记忆（同周总结规格）。
+                    month_prompt = f"【本月周度记忆】:\n{month_context}\n\n"
+                    if _layered_summary_enabled():
+                        layered = await asyncio.to_thread(
+                            _fetch_layered_memories,
+                            supabase_service, _resolve_pinecone_user_id(),
+                            month_ago, ("long_term", "moment", "memo"), 30)
+                        if layered:
+                            month_prompt += (
+                                "【本月分层记忆】:\n"
+                                + "\n".join(f"- {c}" for c in layered)
+                                + "\n\n以下同时包含周度记忆与结构化分层记忆"
+                                  "（事实/情感坐标/备忘），请综合两者提炼。\n\n")
+                    month_prompt += f"请以【{AI_NAME}】的第一人称视角，提炼本月的核心大事件与情感走向，生成一篇月度回忆录。纯文本输出。"
                     month_summary = await ask_role(
                         "compression",
-                        f"【本月周度记忆】:\n{month_context}\n\n请以【{AI_NAME}】的第一人称视角，提炼本月的核心大事件与情感走向，生成一篇月度回忆录。纯文本输出。",
+                        month_prompt,
                         temperature=0.7
                     )
                     if month_summary:
@@ -418,9 +519,23 @@ async def _perform_deep_dreaming():
                 )
                 if year_res.data:
                     year_context = "\n".join([f"- {y['content']}" for y in year_res.data])
+                    # 🧠 阶段 C1：叠加当期分层记忆（同周总结规格）。
+                    year_prompt = f"【本年度月度记忆】:\n{year_context}\n\n"
+                    if _layered_summary_enabled():
+                        layered = await asyncio.to_thread(
+                            _fetch_layered_memories,
+                            supabase_service, _resolve_pinecone_user_id(),
+                            year_ago, ("long_term", "moment", "memo"), 30)
+                        if layered:
+                            year_prompt += (
+                                "【本年度分层记忆】:\n"
+                                + "\n".join(f"- {c}" for c in layered)
+                                + "\n\n以下同时包含月度记忆与结构化分层记忆"
+                                  "（事实/情感坐标/备忘），请综合两者提炼。\n\n")
+                    year_prompt += "请总结这一年的点点滴滴，写一篇年度回忆录。纯文本输出。"
                     year_summary = await ask_role(
                         "compression",
-                        f"【本年度月度记忆】:\n{year_context}\n\n请总结这一年的点点滴滴，写一篇年度回忆录。纯文本输出。",
+                        year_prompt,
                         temperature=0.7
                     )
                     if year_summary:

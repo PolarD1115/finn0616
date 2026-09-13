@@ -496,6 +496,19 @@ Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什
 
 ---
 
+## 17. 四级总结分层输入 & 原始事件安全清理（阶段 C1/C2）🆕
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `MEMORY_LAYERED_SUMMARY_ENABLED` | ❌ | `true` | 🆕 四级总结（日/周/月/年）是否叠加 `memory_items` 分层记忆输入（long_term/moment/memo，仅 active；current 会过期、core 是固定画像，均不参与）。日总结在昨日流水之外附加昨日 moment/memo（importance≥6 前 10 条）；周/月/年在原有 Core_Cognition 输入上追加「【本周/本月/本年度分层记忆】」段。关闭时总结 prompt 与历史行为完全一致。 |
+| `MEMORY_CLEANUP_OLDER_THAN_DAYS` | ❌ | `7` | 🆕 原始事件安全清理的默认阈值（天）：只清理 `memory_events` 中 `processing_status IN ('processed','failed')` 且早于阈值的事件；preview 的 `older_than_days` 参数（1~90）可覆盖该默认。 |
+
+**清理接口**（受 `API_SECRET` 鉴权；首次引入删除，仅手动触发，绝无后台自动循环删除）：
+- `POST /api/memory-events-cleanup-preview`：请求体 `{"confirm": "CLEANUP_PREVIEW_ONLY", "older_than_days": 7}` → 只读返回将删除条数（按 status/channel 分组）、最旧/最新 created_at、一次性 `cleanup_token`（15 分钟，token 带阈值快照）。零删除、零写入。
+- `POST /api/memory-events-cleanup-commit`：请求体 `{"confirm": "CLEANUP_EXECUTE", "cleanup_token": "..."}` → 先按同条件 COUNT 与 preview 核对一致性（漂移 >20% 中止并要求重新 preview），再执行 DELETE，返回实际删除条数。token 一次性消费防重放；pending/processing 不删；memory_items / memories 永不触碰。
+
+---
+
 ## 最小可运行配置示例
 
 只配置以下 3 项，网关即可正常启动并提供基础 MCP 工具：

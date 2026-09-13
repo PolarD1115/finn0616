@@ -818,6 +818,32 @@
 
 **📌 遗留提醒**：`PROJECT_NOTES.md` v3.9 条目写的「截断上限 → [:60]」在 `0af63a0` 之后已失效，**以本条为最新口径**。若还需把单条截断从 150 回滚到 200，须另行确认（会进一步增加注入字符数与 token 占用）。
 
+### v5.6 — 阶段 C1+C2：四级总结接分层记忆 + 原始事件安全清理（2026-09-13）
+**性质**：功能新增。C1 为读取侧增强（四级总结叠加 `memory_items` 输入），C2 为**首次引入删除链路**（原始事件清理，仅手动两步确认触发）。不改数据库 schema、不改 RLS、无新 migration。
+
+**C1 · 四级总结叠加分层记忆**（`heartbeat.py`）：
+- 新增 `_layered_summary_enabled`（门控 `MEMORY_LAYERED_SUMMARY_ENABLED`，默认开）与 `_fetch_layered_memories`（service_role 只读 SELECT：`user_id`（服务端解析）+ `status='active'` + `memory_type IN (long_term/moment/memo)` + `created_at >= since`，排序 `importance DESC, valid_at DESC`，limit 30；失败/无数据返回 `[]`，绝不抛异常）。时间过滤列选 **`created_at`**（写入时刻、NOT NULL 带时区，语义是「这一期产生了哪些记忆」）；`valid_at` 是事实生效时刻、可空且可能远早于当期（长期偏好），不适合当期窗口过滤。
+- 周/月/年总结：原有 Core_Cognition 输入逐字保留，其后追加 `【本周/本月/本年度分层记忆】` 段 + 指引「以下同时包含每日日记与结构化分层记忆（事实/情感坐标/备忘），请综合两者提炼。」。**current 不参与**（会过期的临时状态）、**core 不参与**（固定画像，不该被叙事改写）——由调用方 `memory_types` 参数排除。
+- 日总结：输入源不变（昨日 `memories` 流水），仅附加昨日 moment/memo（`importance>=6` 前 10 条，经新增 `min_importance` 参数在 SQL 层过滤）。
+- 阅后即焚**原样保留**：月/年仍只删旧 `memories` 的 Core_Cognition_Weekly/Monthly；`memory_items` 零 delete（测试锁定）。
+
+**C2 · 原始事件安全清理**（新模块 `memory_cleanup.py` + gateway 两端点，路由 `/api/memory-events-cleanup-preview` / `-commit`，受 `/api/*` 统一 `API_SECRET` 鉴权）：
+- 删除范围**白名单硬编码**：仅 `memory_events` 中 `processing_status IN ('processed','failed')` 且 `created_at < 阈值`（默认 7 天，preview 参数 1~90 可覆盖）。pending/processing 不删；`memory_items` / `memories` 永不触碰（memory_items 用 superseded/invalid_at 收束）。
+- preview：`{"confirm": "CLEANUP_PREVIEW_ONLY", "older_than_days"?}` → 只读 COUNT + 按 status/channel 分组 + 最旧/最新 created_at + 一次性 `cleanup_token`（`secrets.token_urlsafe(32)`，进程内 TTL 15 分钟，含阈值快照）；total=0 不签发 token。零删除、零写入。
+- commit：`{"confirm": "CLEANUP_EXECUTE", "cleanup_token"}` → token 校验（404 不存在/过期、409 已消费防重放、409 并发双击）→ **COUNT 一致性核对**（同条件重查，与 preview 差异 >±20% 视为漂移：中止、一条不删、token 消费并要求重新 preview）→ DELETE（`count="exact"` 返回实际删除数）。
+- 首次引入删除：只有显式两步确认才执行，**绝无后台自动循环删除**；日志只打计数与脱敏错误码，请求体严格字段白名单（`user_id`/`status`/`all` 等额外字段一律 400，删除范围不可被请求放大）。
+
+**测试**：新增 `test_layered_summary_phaseC1.py`（18 例）+ `test_memory_cleanup_phaseC2.py`（15 例）共 **33 例全通过**；回归记忆家族 878 例 + 相邻 244 例，11 个失败经 `git stash` 复验均为改动前已存在（`_inject_context` 文案断言、tool_loop 旧断言），**零新增回归**。`py_compile` 全部改动文件通过。
+
+**新环境变量**（已写入 `VARIABLES.md` §17）：
+- `MEMORY_LAYERED_SUMMARY_ENABLED`（默认 `true`）：四级总结叠加分层记忆总闸，关闭时零查询、prompt 逐字还原。
+- `MEMORY_CLEANUP_OLDER_THAN_DAYS`（默认 `7`）：清理默认阈值（天）。
+
+**Supabase 操作声明**：未修改 schema / RLS / 策略；全部新查询为 service_role 只读 SELECT；C2 删除链路本阶段未在真实库执行（接口就绪，等人工 preview→commit）。
+**Pinecone 操作声明**：未涉及。
+
+**📌 约束口径更新**：早期条目列的「不自动提取、不删数据」阶段约束，已由任务链明确推进——A5（全自动提取 worker，默认关，需 `MEMORY_EXTRACTION_WORKER_ENABLED=true`）与 C2（手动两步确认删除）为受控解除；**pending 事件与 memory_items 仍永不物理删除**。
+
 ### v5.7 — 阶段 A1–B3 汇总补记：多渠道原始事件双写 + 分层提取自动化 + 分层记忆接入搜索与渠道（2026-09-13，补记当日较早工作）
 **性质**：功能新增（四段：A1–A3 渠道双写 / A4 提取分层 / A5 全自动提取 / B2–B3 分层记忆接入）。不改数据库 schema、不改 RLS、无新 migration（memory_events / memory_items 沿用既有迁移）。
 
