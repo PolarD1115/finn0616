@@ -783,6 +783,15 @@
 
 **与 v3.7-v3.9 的关系**：v3.7 做了 prompt 注入位置重排（两段式 stable/volatile），v3.8 把 desire 状态迁出 user_facts，v3.9 修画像注入排序/截断。本次是同一条线的延续——前缀位置和内容来源已稳定，但"每轮都查 DB 导致前缀字节变化"这一根因此前未解决。
 
+### v5.7 — 阶段 A1–B3 汇总补记：多渠道原始事件双写 + 分层提取自动化 + 分层记忆接入搜索与渠道（2026-09-13，补记当日较早工作）
+**性质**：功能新增（四段：A1–A3 渠道双写 / A4 提取分层 / A5 全自动提取 / B2–B3 分层记忆接入）。不改数据库 schema、不改 RLS、无新 migration（memory_events / memory_items 沿用既有迁移）。
+
+**A1–A3 · 多渠道 memory_events 双写**（`napcat.py` / `heartbeat.py`）：
+- A1 QQ：`napcat._handle_merged` 记忆入库后双写（`channel="qq"`、`created_by="napcat"`），**仅主成功路径**——AI 未配置/空回复的固定兜底文案不是真实对话，不进账本（注释已说明理由）；
+- A2 TG：heartbeat TG `_handle_merged` 在 memories + Pinecone 写入之后双写（`channel="tg"`、`created_by="heartbeat"`），同样仅主成功路径；
+- A3 后台自主活动：主动问候（`async_autonomous_life`）与自由活动（`async_free_activity`）各写**一条** `role="event"`（`channel="background"`），不受 `chat_history_write_enabled` 门控（该开关管聊天记录，不是 AI 自主行为日志）；秘密日记不落账本（与 memories 隐私语义一致，双写块放在同一分支内）；
+- 字段与 Web 第 3 阶段基准（`gateway._save_conversation`）逐项对齐：`user_id` 走 `_resolve_pinecone_user_id()`、`session_id=None`（诚实写空）、`content_hash`=SHA-256、`source_event_id={request_id}:user/:assistant/:event`、`processing_status='pending'`、`attempt_count=0`、`metadata` 仅含 request_id、`occurred_at` 与 memories 写入同刻（该表 created_at 封装在 `_save_memory_to_db` 内，无法共享同一变量，为毫秒级偏差）；user+assistant 一次批量 insert；独立 try/except 失败只记日志。
+
 ### v5.4 — 静态常驻提示词迁入网关 stable_system（修 rikkahub 自适应注入失效）
 **问题现象**：rikkahub 客户端因自带「常驻世界书」+「最新消息前提示词」等 user/assistant role 注入项，首轮请求 `_client_msg_count` 即达 4 条 >1 → v5.2 的自适应跳过逻辑在 rikkahub 渠道下**永久触发**，阶段总结和 DB 历史从未注入（日志连续出现 `📦 [Cache] 客户端已带 4 条历史消息，跳过...`）。
 

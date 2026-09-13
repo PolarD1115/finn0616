@@ -200,6 +200,43 @@ async def async_autonomous_life():
                 _save_memory_to_db, "🤖 主动问候",
                 f"主动发送: {ai_msg}\n(判断理由: {decision.get('reason', '')})", "流水", "主动", "Heartbeat"
             )
+
+            # 🧾 第A阶段（memory_events 双写）：后台自主活动原始事件（只写不读）。
+            #    后台活动没有用户触发，不受 chat_history_write_enabled 门控（该开关管
+            #    聊天记录写入，不是 AI 自主行为日志）；独立 try 块，失败只记日志，
+            #    不影响自主生命循环。
+            try:
+                import uuid as _uuid
+                import hashlib as _hashlib
+                import server as _srv_ev
+                _ev_service = _srv_ev.supabase_service
+                if not _ev_service:
+                    print("🔇 [事件账本] service_role 客户端不可用，跳过 memory_events 写入")
+                else:
+                    _ev_request_id = str(_uuid.uuid4())
+                    _ev_content = f"主动问候: {ai_msg}"
+                    _ev_row = {
+                        "user_id": _srv_ev._resolve_pinecone_user_id(),
+                        "session_id": None,
+                        "channel": "background",
+                        "role": "event",
+                        "content": _ev_content,
+                        "content_hash": _hashlib.sha256(_ev_content.encode("utf-8")).hexdigest(),
+                        "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "source_event_id": f"{_ev_request_id}:event",
+                        "processing_status": "pending",
+                        "attempt_count": 0,
+                        "metadata": {"request_id": _ev_request_id},
+                        "created_by": "heartbeat",
+                    }
+
+                    def _insert_event():
+                        _ev_service.table("memory_events").insert([_ev_row]).execute()
+                    await asyncio.to_thread(_insert_event)
+                    print(f"🧾 [事件账本] 后台事件已写入 1 条（请求 {_ev_request_id[:8]}）")
+            except Exception as _ev_err:
+                print(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
+
             print(f"💓 [自主生命] 已发送主动问候: {ai_msg[:30]}...")
         except Exception as e:
             print(f"❌ 自主生命循环出错: {e}")
@@ -715,6 +752,43 @@ async def async_free_activity():
                         f"🎈 自由活动·{activity}", log_text, "记事", "惬意", _TAG
                     )
 
+                    # 🧾 第A阶段（memory_events 双写）：后台自主活动原始事件（只写不读）。
+                    #    放在 memories 写入同一分支内：秘密日记不落 memories，也不落事件
+                    #    账本（隐私语义一致）；后台活动不受 chat_history_write_enabled 门控
+                    #    （该开关管聊天记录写入，不是 AI 自主行为日志）；独立 try 块，
+                    #    失败只记日志，不影响自由活动循环。
+                    try:
+                        import uuid as _uuid
+                        import hashlib as _hashlib
+                        import server as _srv_ev
+                        _ev_service = _srv_ev.supabase_service
+                        if not _ev_service:
+                            print("🔇 [事件账本] service_role 客户端不可用，跳过 memory_events 写入")
+                        else:
+                            _ev_request_id = str(_uuid.uuid4())
+                            _ev_content = f"{activity}: {log_text}"
+                            _ev_row = {
+                                "user_id": _srv_ev._resolve_pinecone_user_id(),
+                                "session_id": None,
+                                "channel": "background",
+                                "role": "event",
+                                "content": _ev_content,
+                                "content_hash": _hashlib.sha256(_ev_content.encode("utf-8")).hexdigest(),
+                                "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "source_event_id": f"{_ev_request_id}:event",
+                                "processing_status": "pending",
+                                "attempt_count": 0,
+                                "metadata": {"request_id": _ev_request_id},
+                                "created_by": "heartbeat",
+                            }
+
+                            def _insert_event():
+                                _ev_service.table("memory_events").insert([_ev_row]).execute()
+                            await asyncio.to_thread(_insert_event)
+                            print(f"🧾 [事件账本] 后台事件已写入 1 条（请求 {_ev_request_id[:8]}）")
+                    except Exception as _ev_err:
+                        print(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
+
                 # 欲望驱动：做完活动后对相关驱动条做针对性回落 + 进入不应期。
                 # 规则（对齐 gating）：
                 #   - DESIRE_DRIVEN=False：只观测、不执行 satisfy（不覆盖行为也不改冷却）。
@@ -973,6 +1047,66 @@ async def async_telegram_polling():
                 _tg_log(f"Pinecone写入报错 chat={chat_label}: {e}")
         else:
             _tg_log(f"Pinecone未启用 chat={chat_label}")
+
+        # 🧾 第A阶段（memory_events 双写）：TG 原始事件账本（只写不读）。
+        #    仅在主成功路径双写——上方两处兜底 return（AI 未配置 / LLM 空回复）发出的
+        #    固定文案不是真实对话，不值得进原始事件账本。
+        #    - 复用上方 _write_on 门控（chat_history_write_enabled=false 时已提前 return，
+        #      走到这里必然开启，事件与 memories/Pinecone 流水同开同关）；
+        #    - 独立 try 块：任何失败只记日志，绝不影响 memories/Pinecone 写入；
+        #    - user + assistant 两条事件一次批量 insert（同一请求原子落库）。
+        try:
+            import uuid as _uuid
+            import hashlib as _hashlib
+            import server as _srv_ev
+            _ev_service = _srv_ev.supabase_service
+            if not _ev_service:
+                _tg_log("🔇 [事件账本] service_role 客户端不可用（SUPABASE_SERVICE_KEY 未配置），跳过 memory_events 写入")
+            else:
+                # 请求级 ID：uuid4 由服务端生成，仅用于本轮事件归属与日志关联，日志只取前 8 位
+                _ev_request_id = str(_uuid.uuid4())
+                # 统一用户隔离 ID：复用全项目唯一解析规则（USER_ID → MEM0_USER_ID → default）
+                _ev_uid = _srv_ev._resolve_pinecone_user_id()
+                # ⚠️ timestamptz 列必须写显式带时区 ISO；紧邻上方 memories 写入取得，
+                #    保证跨表时间线可对账
+                _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                _ev_rows = [
+                    {
+                        "user_id": _ev_uid,
+                        "session_id": None,  # TG 无可靠会话标识，诚实写空
+                        "channel": "tg",
+                        "role": "user",
+                        "content": text,
+                        "content_hash": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                        "occurred_at": _ev_now,
+                        "source_event_id": f"{_ev_request_id}:user",
+                        "processing_status": "pending",
+                        "attempt_count": 0,
+                        "metadata": {"request_id": _ev_request_id},
+                        "created_by": "heartbeat",
+                    },
+                    {
+                        "user_id": _ev_uid,
+                        "session_id": None,
+                        "channel": "tg",
+                        "role": "assistant",
+                        "content": reply,
+                        "content_hash": _hashlib.sha256(reply.encode("utf-8")).hexdigest(),
+                        "occurred_at": _ev_now,
+                        "source_event_id": f"{_ev_request_id}:assistant",
+                        "processing_status": "pending",
+                        "attempt_count": 0,
+                        "metadata": {"request_id": _ev_request_id},
+                        "created_by": "heartbeat",
+                    },
+                ]
+
+                def _insert_events():
+                    _ev_service.table("memory_events").insert(_ev_rows).execute()
+                await asyncio.to_thread(_insert_events)
+                _tg_log(f"🧾 [事件账本] TG 原始事件已写入 {len(_ev_rows)} 条（请求 {_ev_request_id[:8]}）")
+        except Exception as _ev_err:
+            _tg_log(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
 
     from aggregator import get_aggregator
     _tg_agg = get_aggregator("TG", _handle_merged)

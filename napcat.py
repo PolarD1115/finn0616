@@ -400,6 +400,65 @@ def _get_qq_aggregator(send):
                 "流水", "温柔", "QQ_MSG"
             )
 
+        # 🧾 第A阶段（memory_events 双写）：QQ 原始事件账本（只写不读）。
+        #    仅在主成功路径双写——上方两处兜底 return（AI 未配置 / LLM 空回复）发出的
+        #    固定文案不是真实对话，不值得进原始事件账本。
+        #    - 复用上方 _write_on 门控（chat_history_write_enabled=false 时已提前 return，
+        #      走到这里必然开启，事件与 memories 流水同开同关）；
+        #    - 独立 try 块：任何失败只记日志，绝不影响 memories 写入与总结触发；
+        #    - user + assistant 两条事件一次批量 insert（同一请求原子落库）。
+        try:
+            import uuid as _uuid
+            import hashlib as _hashlib
+            _ev_service = dep.supabase_service  # dep 即 server 模块，复用 service_role 客户端
+            if not _ev_service:
+                _naplog("🔇 [事件账本] service_role 客户端不可用（SUPABASE_SERVICE_KEY 未配置），跳过 memory_events 写入")
+            else:
+                # 请求级 ID：uuid4 由服务端生成，仅用于本轮事件归属与日志关联，日志只取前 8 位
+                _ev_request_id = str(_uuid.uuid4())
+                # 统一用户隔离 ID：复用全项目唯一解析规则（USER_ID → MEM0_USER_ID → default）
+                _ev_uid = dep._resolve_pinecone_user_id()
+                # ⚠️ timestamptz 列必须写显式带时区 ISO；紧邻上方 memories 写入取得，
+                #    保证跨表时间线可对账
+                _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                _ev_rows = [
+                    {
+                        "user_id": _ev_uid,
+                        "session_id": None,  # QQ 无可靠会话标识，诚实写空
+                        "channel": "qq",
+                        "role": "user",
+                        "content": text,
+                        "content_hash": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                        "occurred_at": _ev_now,
+                        "source_event_id": f"{_ev_request_id}:user",
+                        "processing_status": "pending",
+                        "attempt_count": 0,
+                        "metadata": {"request_id": _ev_request_id},
+                        "created_by": "napcat",
+                    },
+                    {
+                        "user_id": _ev_uid,
+                        "session_id": None,
+                        "channel": "qq",
+                        "role": "assistant",
+                        "content": reply,
+                        "content_hash": _hashlib.sha256(reply.encode("utf-8")).hexdigest(),
+                        "occurred_at": _ev_now,
+                        "source_event_id": f"{_ev_request_id}:assistant",
+                        "processing_status": "pending",
+                        "attempt_count": 0,
+                        "metadata": {"request_id": _ev_request_id},
+                        "created_by": "napcat",
+                    },
+                ]
+
+                def _insert_events():
+                    _ev_service.table("memory_events").insert(_ev_rows).execute()
+                await asyncio.to_thread(_insert_events)
+                _naplog(f"🧾 [事件账本] QQ 原始事件已写入 {len(_ev_rows)} 条（请求 {_ev_request_id[:8]}）")
+        except Exception as _ev_err:
+            _naplog(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
+
         # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
         asyncio.create_task(check_and_summarize_all())
 
