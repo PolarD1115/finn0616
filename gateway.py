@@ -2811,7 +2811,7 @@ class HostFixMiddleware:
                 if pr and pr.data:
                     rows = [r for r in pr.data if _is_profile_key(r.get("key", ""))]
                     profile_lines = []
-                    for r in rows[:30]:
+                    for r in rows[:60]:
                         val = str(r.get("value", "")).strip()
                         if val:
                             profile_lines.append(f"• {val[:150]}")
@@ -4510,7 +4510,7 @@ class HostFixMiddleware:
                 "key", "sys_config").neq("key", "llm_settings").neq(
                 "key", "llm_models").order("key").execute())
             prof_lines = []
-            for r in ((pr.data or []) if pr else [])[:30]:
+            for r in ((pr.data or []) if pr else [])[:60]:
                 if not isinstance(r, dict):
                     continue
                 val = str(r.get("value", "")).strip()

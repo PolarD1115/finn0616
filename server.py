@@ -982,7 +982,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         import gateway as _gw
         rows = [row for row in pr.data if _gw._is_profile_key(row.get("key", ""))]
         profile_lines = []
-        for row in rows[:30]:
+        for row in rows[:60]:
             val = str(row.get("value", "")).strip()
             if val:
                 profile_lines.append(f"• {val[:150]}")
