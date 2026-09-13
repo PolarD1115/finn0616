@@ -1721,6 +1721,56 @@ async def async_ai_todo_worker():
 
 
 # ==========================================
+# 4.5 记忆自动提取 worker（阶段 A5）
+# ==========================================
+
+async def async_memory_extraction_worker():
+    """记忆自动提取循环（阶段 A5）：分批把 memory_events 的 pending 原始事件
+    提取为分层记忆写入 memory_items——高置信直接 active，低置信进 pending_review。
+
+    🚫 默认关闭（MEMORY_EXTRACTION_WORKER_ENABLED=false）：全自动提取会真实消耗
+    compression 角色池的 LLM 调用，必须显式设 true 才启动；建议先人工 preview
+    校准提取质量后再常开。
+    自身绝不抛异常——run_background_process 里任一任务异常会导致整个后台进程
+    重启，worker 把所有异常消化在循环内（run_auto_extraction 自身也不向上抛）。
+    """
+    enabled = os.environ.get("MEMORY_EXTRACTION_WORKER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        print("🔇 [记忆提取] 全自动提取未启用 (MEMORY_EXTRACTION_WORKER_ENABLED=false)，worker 不启动。")
+        return
+    try:
+        interval = int(os.environ.get("MEMORY_EXTRACTION_INTERVAL", "3600"))
+        batch_size = int(os.environ.get("MEMORY_EXTRACTION_BATCH_SIZE", "20"))
+        threshold = float(os.environ.get("MEMORY_AUTO_ACTIVE_THRESHOLD", "0.75"))
+    except ValueError:
+        # 环境变量解析失败回退默认值（解析抛异常会导致整个后台进程重启）
+        interval, batch_size, threshold = 3600, 20, 0.75
+        print("⚠️ [记忆提取] 环境变量解析失败，已回退默认值")
+
+    print(f"🧠 [记忆提取] 自动提取 worker 已上线 interval={interval}s batch={batch_size} threshold={threshold}")
+    while True:
+        try:
+            import memory_auto_extract
+            import memory_extractor
+            import server
+            sb = server.supabase_service
+            if sb:
+                await memory_auto_extract.run_auto_extraction(
+                    sb,
+                    user_id=server._resolve_pinecone_user_id(),
+                    batch_limit=batch_size,
+                    auto_active_threshold=threshold,
+                    llm_call=memory_extractor.make_compression_llm_call(),
+                )
+            else:
+                print("🔇 [记忆提取] service_role 客户端不可用，跳过本轮")
+        except Exception as e:
+            # 轮级兜底：任何异常不退出 worker（只记异常类型，不打正文/密钥）
+            print(f"❌ [记忆提取] 本轮异常（不影响下一轮）: {type(e).__name__}")
+        await asyncio.sleep(interval)
+
+
+# ==========================================
 # 5. 日程小秘书
 # ==========================================
 
@@ -2724,6 +2774,9 @@ async def run_background_process():
         asyncio.create_task(async_reminder_worker(),    name="reminder"),
         # AI 待办调度（阶段3）：投递 ai_todos 到期任务，独立于旧 reminders 巡视器
         asyncio.create_task(async_ai_todo_worker(),     name="ai_todo"),
+        # 记忆自动提取（阶段 A5）：默认关闭（MEMORY_EXTRACTION_WORKER_ENABLED=false），
+        # 设 true 才启动；worker 内部自检后提前 return，任务列表保持统一编排
+        asyncio.create_task(async_memory_extraction_worker(), name="memory_extraction"),
         asyncio.create_task(async_schedule_secretary(), name="schedule"),
         # 宠物状态 tick：不属于本阶段合并的顶层自主活动，保持独立运行
         asyncio.create_task(async_pet_house_tick(),     name="pet_house_tick"),

@@ -32,7 +32,7 @@ MAX_CANDIDATES = 10              # 一批最多保留的候选数
 MAX_SOURCE_INDEXES = 5           # 单条候选最多引用的事件数
 MAX_INPUT_EVENT_CHARS = 500      # Prompt 渲染时单条事件截断
 MAX_INPUT_TOTAL_CHARS = 20000    # Prompt 事件区总长上限
-CURRENT_DEFAULT_EXPIRY_HOURS = 72  # current 无 expires_at 时的保守默认（有限期，非无限）
+CURRENT_DEFAULT_EXPIRY_HOURS = 168  # current 无 expires_at 时的默认有效期（7 天，阶段 A4）
 CORE_MIN_CONFIDENCE = 0.9
 CORE_MIN_IMPORTANCE = 8
 # 🔒 第 13 阶段：confidence 不再参与「无依据限定是否合法」的判断——它只是模型
@@ -434,14 +434,18 @@ def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc):
     if any(w in content for w in VAGUE_REFERENCE_WORDS):
         return None, "VAGUE_REFERENCE"
 
-    # 8. current 必须有限期：模型未给 → 补默认（从 max(valid_at, 最早来源事件时间) 起算，
-    #    满足 DB CHECK expires_at >= valid_at）；模型给的值早于 valid_at → clamp 到 valid_at
+    # 8. current 必须有限期（阶段 A4）：模型未给 → 按 valid_at + 默认有效期（7 天）补，
+    #    仍缺 valid_at 时用来源事件 occurred_at 起算（满足 DB CHECK expires_at >= valid_at）；
+    #    模型给的值早于 valid_at → clamp 到 valid_at
     if mt == "current":
         ref_times = [_parse_ts(e.get("occurred_at")) for e in ref_events]
         ref_times = [t for t in ref_times if t is not None]
-        base = min(ref_times) if ref_times else now_utc
-        if valid_at is not None and valid_at > base:
+        if valid_at is not None:
             base = valid_at
+        elif ref_times:
+            base = min(ref_times)
+        else:
+            base = now_utc
         if expires_at is None:
             expires_at = base + datetime.timedelta(hours=CURRENT_DEFAULT_EXPIRY_HOURS)
         elif valid_at is not None and expires_at < valid_at:

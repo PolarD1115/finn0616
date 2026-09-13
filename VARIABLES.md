@@ -406,6 +406,17 @@ Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什
 >
 > 💡 **灰度建议**：先 `HOME_AUTONOMY_ENABLED=true HOME_AUTONOMY_PHASE=1` 观察日志里 `🏠 [Home自主·工具循环]` 的执行结果，确认 LLM 能正确读取家庭状态、决策合理后，逐级升 phase（2→3→4），每级观察一段时间再升。
 
+### 12.4 记忆自动提取 worker（阶段 A5）🆕
+
+后台任务 `async_memory_extraction_worker`：按固定间隔把 `memory_events` 中**最旧的 pending** 原始事件分批交给提取器（compression 角色池，复用端点轮询/故障转移），产出五层记忆（core/long_term/current/moment/memo）写入 `memory_items`——置信度 ≥ 阈值直接 `active`，否则 `pending_review` 交人工审核。默认**关闭**。
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `MEMORY_EXTRACTION_WORKER_ENABLED` | ❌ | `false` | 🆕 全自动提取总闸。默认关闭；设 `true` 才启动 worker（避免未校准就自动消耗 LLM 调用）。建议先人工 preview 几批确认提取质量后再常开。 |
+| `MEMORY_EXTRACTION_INTERVAL` | ❌ | `3600` | 🆕 每轮提取间隔（秒）。 |
+| `MEMORY_EXTRACTION_BATCH_SIZE` | ❌ | `20` | 🆕 每轮取最旧 pending 事件的条数。 |
+| `MEMORY_AUTO_ACTIVE_THRESHOLD` | ❌ | `0.75` | 🆕 置信度达到该值的候选直接写入 `active`，否则写入 `pending_review` 交人工审核。 |
+
 ---
 
 ## 13. 其他可选
