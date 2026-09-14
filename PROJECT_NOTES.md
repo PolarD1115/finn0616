@@ -818,15 +818,14 @@
 
 **📌 遗留提醒**：`PROJECT_NOTES.md` v3.9 条目写的「截断上限 → [:60]」在 `0af63a0` 之后已失效，**以本条为最新口径**。若还需把单条截断从 150 回滚到 200，须另行确认（会进一步增加注入字符数与 token 占用）。
 
-### v5.8 — 阶段 D1+D3：换窗备忘 + 日记/活动日志打通分层记忆（2026-09-14）
-**性质**：功能新增（两块彼此独立、共用 `memory_items`）。不改数据库 schema / RLS；无新 migration；**不开启** `MEMORY_EXTRACTION_WORKER_ENABLED` / `ACTIVE_MEMORY_INJECTION_ENABLED`（保持默认 false）。不物理删除任何 `memory_items`（memo 用 superseded；过期用 expires_at）。
+### v5.8 — 阶段 D1+D2+D3：换窗备忘 + 画像反思周更 + 日记/活动日志打通分层记忆（2026-09-14）
+**性质**：功能新增（三块彼此独立、共用 `memory_items`）。不改数据库 schema / RLS；无新 migration；**不开启** `MEMORY_EXTRACTION_WORKER_ENABLED` / `ACTIVE_MEMORY_INJECTION_ENABLED`（保持默认 false）。不物理删除任何 `memory_items`（memo 用 superseded；过期用 expires_at）。
 
 **D3 · 行动日志 + 秘密日记 → 分层记忆**（新模块 `memory_diary_bridge.py`）：
 - `finalize_activity_log` 成功（succeeded/observed/partial）后异步调度提取；`free:secret_diary` /「写秘密日记」跳过（由日记桥单独处理，防双提取）。
 - `home.service.write_private_diary` 成功后异步提取；强制 `memory_type=moment`、`source=private_diary`、metadata.privacy。
 - 临时事件逻辑 `role=event`，经 `to_extractable_events` 适配为 `role=user` 再调用既有 `extract_memory_candidates`（不改 A4 白名单）。
 - `search_memory` B2 段过滤 `source=private_diary`（及 metadata 隐私标记），秘密日记原文不进通用搜索；hybrid recall **无类型白名单**，moment 可被渠道注入/召回。
-- C1 分层总结 `_fetch_layered_memories` 排除 `source=private_diary`，避免私密 moment 进入周/月/年总结后被写入普通 memories。
 - 门控 `DIARY_MEMORY_BRIDGE_ENABLED`（默认 true）。
 
 **D1 · 换窗备忘 memo**（新模块 `memory_memo.py`）：
@@ -834,13 +833,19 @@
 - 读取：`gateway._inject_context` volatile 与 `server._build_channel_context` 追加「【上次交接备忘】」最新 1 条 active 未过期 memo。
 - 门控 `MEMORY_MEMO_ENABLED`（默认 true）。Web `session_id` 恒 None **不**单独触发写入。
 
-**测试**：新增 `test_memory_diary_bridge_phaseD3.py` + `test_memory_memo_phaseD1.py`；`test_search_memory_phaseB2.py` 增补 fail-closed import 失败用例；回归 C1 等相邻用例。`py_compile` 改动文件通过。
+**D2 · 画像反思周更**（新模块 `memory_profile_reflect.py`）：
+- 挂在 `heartbeat._perform_deep_dreaming` 周日周总结之后；读取真画像（排除 sys_config/llm_*/desire 运行时）+ 近 7 天 active long_term/moment/current。
+- 校验顺序：段落完整保留（旧段须为新文子串）→ 长度 ≥ 原长 × 0.9 → 最多新增 5 句；失败拒绝写入。按 key upsert，不删 key；可新增 `profile_<topic>_<hash6>`。
+- 门控 `PROFILE_REFLECT_ENABLED`（默认 true）；日志只打 key/长度/计数。
+
+**测试**：新增 `test_memory_diary_bridge_phaseD3.py`（11）+ `test_memory_memo_phaseD1.py`（8）+ `test_memory_profile_reflect_phaseD2.py`（10）共 **29 例全通过**；C1 辅助函数在跑 `_perform_deep_dreaming` 时临时关 `PROFILE_REFLECT_ENABLED`，避免 D2 周日查询干扰「分层门控关 → 零 memory_items 查询」断言。回归 A/C1 等相邻用例通过。`py_compile` 全部改动文件通过。
 
 **新环境变量**（已写入 `VARIABLES.md` §18）：
 - `MEMORY_MEMO_ENABLED`（默认 `true`）/ `MEMORY_MEMO_SILENCE_HOURS`（默认 `6`）
+- `PROFILE_REFLECT_ENABLED`（默认 `true`）
 - `DIARY_MEMORY_BRIDGE_ENABLED`（默认 `true`）
 
-**Supabase 操作声明**：未修改 schema / RLS；D1/D3 写入为 service_role INSERT/UPDATE `memory_items`（门控默认开，部署后按需关闭）；本阶段未在真实库执行。
+**Supabase 操作声明**：未修改 schema / RLS；D 阶段写入为 service_role INSERT/UPDATE `memory_items` 与 upsert `user_facts`（门控默认开，部署后按需关闭）；本阶段未在真实库执行。
 **Pinecone 操作声明**：未涉及。
 
 ### v5.6 — 阶段 C1+C2：四级总结接分层记忆 + 原始事件安全清理（2026-09-13）

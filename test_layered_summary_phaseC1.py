@@ -5,7 +5,8 @@
 
 覆盖：
   A. _fetch_layered_memories：active/类型/时间范围/排序/limit 查询条件、
-     min_importance、失败返回 []、None 服务返回 []、只读（绝不 delete）
+     min_importance、失败返回 []、None 服务返回 []、只读（绝不 delete）、
+     排除 source=private_diary（D3 隐私）
   B. _layered_summary_enabled 门控语义（默认开）
   C. 周总结 prompt 叠加【本周分层记忆】+ 综合提炼指引；门控关时不叠加、零查询
   D. 月/年总结同理
@@ -49,6 +50,7 @@ class _FakeItemsQuery:
 
     def select(self, *a, **k): return self._rec("select", *a, **k)
     def eq(self, *a, **k): return self._rec("eq", *a, **k)
+    def neq(self, *a, **k): return self._rec("neq", *a, **k)
     def in_(self, *a, **k): return self._rec("in_", *a, **k)
     def gte(self, *a, **k): return self._rec("gte", *a, **k)
     def order(self, *a, **k): return self._rec("order", *a, **k)
@@ -76,7 +78,17 @@ class _FakeItemsService:
     def _dispatch(self, table, path):
         if self.fail:
             raise RuntimeError("mock memory_items failure")
-        return FakeResult([dict(r) for r in self.rows])
+        # 尊重 .neq("source", ...)，便于验证 D3 隐私排除
+        neq_source = next(
+            (a[1] for m, a, k in path
+             if m == "neq" and a and a[0] == "source" and len(a) >= 2),
+            None)
+        out = []
+        for r in self.rows:
+            if neq_source is not None and r.get("source") == neq_source:
+                continue
+            out.append(dict(r))
+        return FakeResult(out)
 
     def delete_ops(self):
         return [(t, p) for t, p in self.calls
@@ -190,6 +202,11 @@ def _run_deep_dreaming(fake_sb, fake_svc, *, now, gate="true",
     old = os.environ.pop(key, None)
     if gate is not None:
         os.environ[key] = gate
+    # 阶段 D2 画像反思挂在周日同一入口；本 C1 用例隔离分层总结门控，须关掉反思以免
+    # 额外 memory_items 查询干扰「门控关 → 零查询」断言。
+    _prf_key = "PROFILE_REFLECT_ENABLED"
+    _prf_old = os.environ.get(_prf_key)
+    os.environ[_prf_key] = "false"
     try:
         with patch.object(server, "ask_role", _ask), \
              patch.object(server, "_save_memory_to_db", _save), \
@@ -203,6 +220,10 @@ def _run_deep_dreaming(fake_sb, fake_svc, *, now, gate="true",
         os.environ.pop(key, None)
         if old is not None:
             os.environ[key] = old
+        if _prf_old is None:
+            os.environ.pop(_prf_key, None)
+        else:
+            os.environ[_prf_key] = _prf_old
     return prompts, saved, fake_sb, fake_svc
 
 
@@ -214,11 +235,13 @@ def _prompt_with(prompts, marker):
 
 
 def _conds_by_column(path):
-    """把查询路径压成 {列名: 值}（eq/in_/gte/gt/lt/limit 的首参数为列名或值）。"""
+    """把查询路径压成 {列名: 值}（eq/neq/in_/gte/gt/lt/limit 的首参数为列名或值）。"""
     conds = {}
     for m, a, k in path:
-        if a and len(a) >= 2 and m in ("eq", "in_", "gte", "gt", "lt"):
-            conds[a[0]] = a[1]
+        if a and len(a) >= 2 and m in ("eq", "neq", "in_", "gte", "gt", "lt"):
+            # neq 用特殊键，避免与 eq 同列互相覆盖
+            key = a[0] if m != "neq" else f"neq:{a[0]}"
+            conds[key] = a[1]
         elif a and m == "limit":
             conds["__limit__"] = a[0]
     return conds
@@ -244,6 +267,8 @@ class TestFetchLayeredMemories(unittest.TestCase):
         self.assertEqual(conds.get("status"), "active")
         self.assertEqual(conds.get("memory_type"), ["long_term", "moment", "memo"])
         self.assertEqual(conds.get("created_at"), "2026-09-01T00:00:00+08:00")
+        self.assertEqual(conds.get("neq:source"), "private_diary",
+                         "D3：查询必须排除 private_diary")
         order_cols = [a[0] for m, a, k in path if m == "order"]
         self.assertEqual(order_cols, ["importance", "valid_at"],
                          "importance DESC, valid_at DESC")
@@ -275,6 +300,28 @@ class TestFetchLayeredMemories(unittest.TestCase):
         self.assertEqual(
             heartbeat._fetch_layered_memories(svc, TEST_USER_ID,
                                               "2026-09-01T00:00:00+08:00", []), [])
+
+    def test_excludes_private_diary_source(self):
+        """D3 隐私：source=private_diary 的 moment 不进四级总结；普通 moment 正常返回。"""
+        rows = [
+            {"content": "SYNTHETIC_PRIVATE_DIARY_MOMENT", "memory_type": "moment",
+             "importance": 9, "source": "private_diary"},
+            {"content": "SYNTHETIC_PUBLIC_MOMENT", "memory_type": "moment",
+             "importance": 8, "source": "web"},
+            {"content": "SYNTHETIC_LONG_TERM_OK", "memory_type": "long_term",
+             "importance": 7, "source": "activity_log"},
+        ]
+        svc = _FakeItemsService(rows=rows)
+        contents = heartbeat._fetch_layered_memories(
+            svc, TEST_USER_ID, "2026-09-01T00:00:00+08:00",
+            ("long_term", "moment", "memo"), 30)
+        self.assertNotIn("SYNTHETIC_PRIVATE_DIARY_MOMENT", contents)
+        self.assertIn("SYNTHETIC_PUBLIC_MOMENT", contents)
+        self.assertIn("SYNTHETIC_LONG_TERM_OK", contents)
+        _, path = svc.calls[0]
+        conds = _conds_by_column(path)
+        self.assertEqual(conds.get("neq:source"), "private_diary",
+                         "查询必须带 .neq('source', 'private_diary')")
 
 
 # ==========================================

@@ -474,6 +474,19 @@ async def _perform_deep_dreaming():
             except Exception as e:
                 print(f"⚠️ 周度总结失败（不影响日记）: {e}")
 
+            # 🧠 阶段 D2：周日画像反思（只增不减 + 长度保护；门控默认开）
+            try:
+                import memory_profile_reflect as _mpr
+                if _mpr.profile_reflect_enabled():
+                    _reflect = await _mpr.run_profile_reflect()
+                    print(f"🪞 [画像反思] ok={_reflect.get('ok')} "
+                          f"proposed={_reflect.get('updates_proposed')} "
+                          f"written={_reflect.get('updates_written')} "
+                          f"rejected={_reflect.get('rejected')} "
+                          f"code={_reflect.get('error_code')}")
+            except Exception as e:
+                print(f"⚠️ 画像反思失败（不影响日记）: {type(e).__name__}")
+
         # 2. 月度总结 (每月最后一天触发)
         tomorrow = now_bj + datetime.timedelta(days=1)
         if tomorrow.day == 1:

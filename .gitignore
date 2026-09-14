@@ -74,8 +74,9 @@ files.txt
 !test_home_api_c6.py
 # C9：受保护拆信与已拆信阅读专项测试纳入版本控制（其余 test_*.py 保持忽略）
 !test_letter_open_c9.py
-# 阶段 D：记忆固化与隐私打通（D1 memo / D3 日记桥）专项测试
+# 阶段 D：记忆固化与隐私打通（D1 memo / D2 画像反思 / D3 日记桥）专项测试
 !test_memory_memo_phaseD1.py
+!test_memory_profile_reflect_phaseD2.py
 !test_memory_diary_bridge_phaseD3.py
 
 # 敏感凭据
