@@ -890,8 +890,19 @@ def write_private_diary(author_key: str, title: str, content: str, action_key: s
         return err_result("正文为空", "EMPTY_CONTENT")
     if len(content) > 10000:
         return err_result("正文超过 10000 字", "CONTENT_TOO_LONG")
-    return repo.rpc_write_private_diary(action_key.strip(), author_key.strip(),
-                                         title.strip(), content, mood)
+    res = repo.rpc_write_private_diary(action_key.strip(), author_key.strip(),
+                                       title.strip(), content, mood)
+    # 🧠 阶段 D3：秘密日记写入成功后异步提取为 moment（不进通用搜索；正文不入日志）
+    if isinstance(res, dict) and res.get("ok"):
+        try:
+            import memory_diary_bridge as _mdb
+            if _mdb.diary_bridge_enabled():
+                _mdb.schedule_bridge(_mdb.bridge_private_diary(
+                    title=title.strip(), content=content, mood=mood,
+                    action_key=action_key.strip()))
+        except Exception:
+            pass  # 桥接失败不影响日记写入成功语义
+    return res
 
 
 def list_private_diary() -> dict:

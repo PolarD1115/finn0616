@@ -1428,32 +1428,44 @@ async def search_memory(query: str):
     # 0. 🧠 阶段 B2：优先查新分层记忆（memory_items 混合召回：core/current/
     #    long_term/moment/memo，active-only，service_role 只读 RPC）。
     #    查不到或失败时跳过该段，由下方旧链路（Pinecone 语义 / memories 关键词）兜底。
-    #    memory_items 不含秘密日记（私密正文存独立的私密日记表，不经本搜索暴露），
-    #    召回行结构由 run_hybrid_recall 信任边界校验，无需再做 tags 过滤。
+    #    🧠 阶段 D3：秘密日记 moment（source=private_diary）不进通用搜索明文段。
+    #    隐私过滤器 fail-closed：memory_diary_bridge import 失败时整段 B2 跳过，
+    #    宁可少返回新记忆，也不冒私密内容泄露风险；旧两段不受影响。
     if supabase_service:
         try:
-            import memory_hybrid_recall as _mhr_b2
-            _b2_user_id = _resolve_pinecone_user_id()
+            try:
+                from memory_diary_bridge import (
+                    is_private_diary_memory_item as _is_priv)
+                _priv_filter_ok = True
+            except Exception:
+                _priv_filter_ok = False
+            if _priv_filter_ok:
+                import memory_hybrid_recall as _mhr_b2
+                _b2_user_id = _resolve_pinecone_user_id()
 
-            def _b2_rpc_caller(params):
-                # 只读 RPC：active-only 余弦召回，每请求至多调用一次
-                return supabase_service.rpc(_mhr_b2.RPC_NAME, params).execute()
+                def _b2_rpc_caller(params):
+                    # 只读 RPC：active-only 余弦召回，每请求至多调用一次
+                    return supabase_service.rpc(
+                        _mhr_b2.RPC_NAME, params).execute()
 
-            _b2_result, _b2_log = await _mhr_b2.run_hybrid_recall(
-                query, _b2_user_id, _get_embedding, _b2_rpc_caller, 5)
-            _b2_items = (_b2_result.get("items")
-                         if isinstance(_b2_result, dict) else None)
-            if (_b2_result.get("ok") is True and isinstance(_b2_items, list)
-                    and _b2_items):
-                ans_parts.append("🧠 【长期记忆】:")
-                _b2_count = 0
-                for _item in _b2_items:
-                    if _b2_count >= 5:
-                        break
-                    _content = str(_item.get("content", "")).strip()
-                    if _content:
-                        ans_parts.append(f"- {_content}")
-                        _b2_count += 1
+                _b2_result, _b2_log = await _mhr_b2.run_hybrid_recall(
+                    query, _b2_user_id, _get_embedding, _b2_rpc_caller, 5)
+                _b2_items = (_b2_result.get("items")
+                             if isinstance(_b2_result, dict) else None)
+                if (_b2_result.get("ok") is True
+                        and isinstance(_b2_items, list) and _b2_items):
+                    _b2_lines = []
+                    for _item in _b2_items:
+                        if len(_b2_lines) >= 5:
+                            break
+                        if _is_priv(_item):
+                            continue
+                        _content = str(_item.get("content", "")).strip()
+                        if _content:
+                            _b2_lines.append(f"- {_content}")
+                    if _b2_lines:
+                        ans_parts.append("🧠 【长期记忆】:")
+                        ans_parts.extend(_b2_lines)
         except Exception:
             pass
     # 1. 向量语义搜索

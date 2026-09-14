@@ -509,6 +509,18 @@ Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什
 
 ---
 
+## 18. 记忆固化与隐私打通（阶段 D3）🆕
+
+> 🆕 阶段 D3。日记·活动日志桥接分层记忆。共用 `memory_items`；**不开启** A5 / B3 自动注入门控（保持默认 false）。
+
+| 变量名 | 必填 | 默认值 | 说明 |
+|--------|:---:|--------|------|
+| `DIARY_MEMORY_BRIDGE_ENABLED` | ❌ | `true` | **D3 日记/活动桥总闸**。关：finalize / 写私密日记后不提取。开：`activity_logs` 成功 finalize 后异步提取为 moment/long_term；`home_private_diaries` 写入成功后异步提取为 moment（`source=private_diary`）。秘密日记原文**不进** `search_memory` 通用返回（B2 混合召回按 source 过滤）；可进渠道 active 注入 / 分层读取。 |
+
+**隐私边界（D3）**：秘密日记只进 `memory_items` 的 moment 层；不写 `memories.Secret_Diary`、不写 Pinecone、日志不打正文。`search_memory` 对 `source=private_diary`（及 metadata.privacy）跳过。
+
+---
+
 ## 最小可运行配置示例
 
 只配置以下 3 项，网关即可正常启动并提供基础 MCP 工具：

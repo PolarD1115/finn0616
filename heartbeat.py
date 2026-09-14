@@ -289,6 +289,9 @@ def _fetch_layered_memories(sb_service, user_id, since_iso,
     - 排序 importance DESC, valid_at DESC；limit 防爆（默认 30）；
     - current（会过期的临时状态）与 core（固定画像）由调用方通过 memory_types
       参数排除，本函数不硬编码排除；
+    - 隐私：排除 source='private_diary'（D3 秘密日记 moment）。选用 source 列
+      .neq 而非 metadata jsonb 过滤——D3 写入时 source 显式设为 private_diary，
+      PostgREST 对 .not_.contains(jsonb) 支持不稳定，source 列过滤更可靠；
     - 失败/无数据返回 []，绝不抛异常；绝不写库。"""
     try:
         if not sb_service or not user_id:
@@ -302,7 +305,10 @@ def _fetch_layered_memories(sb_service, user_id, since_iso,
              .eq("user_id", user_id)
              .eq("status", "active")
              .in_("memory_type", types)
-             .gte("created_at", since_iso))
+             .gte("created_at", since_iso)
+             # D3 隐私：私密日记 moment 不得进入周/月/年总结 prompt，
+             # 否则提炼结果会写入普通 memories 被通用搜索读到。
+             .neq("source", "private_diary"))
         if min_importance is not None:
             q = q.gte("importance", int(min_importance))
         res = (q.order("importance", desc=True)

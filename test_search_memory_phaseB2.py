@@ -202,6 +202,35 @@ class TestPrivateFilter(unittest.TestCase):
                          "私密标签记忆不得通过搜索暴露（既有防御不回归）")
         self.assertIn("SYNTHETIC_KEYWORD_普通记忆", out)
 
+    def test_priv_filter_import_fail_skips_b2_section(self):
+        """D3 隐私 fail-closed：memory_diary_bridge import 失败时整段 B2 跳过，旧段仍可用。"""
+        import builtins
+        real_import = builtins.__import__
+
+        def _block_diary_bridge(name, *args, **kwargs):
+            if name == "memory_diary_bridge" or (
+                    isinstance(name, str) and name.startswith("memory_diary_bridge.")):
+                raise ImportError("simulated diary bridge unavailable")
+            return real_import(name, *args, **kwargs)
+
+        svc = _FakeServiceRpc(rows=[
+            _rpc_row("11111111-1111-1111-1111-111111111111",
+                     "SYNTHETIC_B2_SHOULD_NOT_APPEAR"),
+        ])
+        anon = _FakeAnon(keyword_rows=[
+            _keyword_row(content="SYNTHETIC_KEYWORD_旧段仍可见"),
+        ])
+        with patch("builtins.__import__", side_effect=_block_diary_bridge):
+            out, _, _ = _run_search(svc, anon)
+
+        self.assertNotIn("【长期记忆】", out,
+                         "import 失败时 B2 新记忆段整段跳过")
+        self.assertNotIn("SYNTHETIC_B2_SHOULD_NOT_APPEAR", out)
+        self.assertIn("🔍 【关键词匹配记忆】:", out, "旧关键词段不受影响")
+        self.assertIn("SYNTHETIC_KEYWORD_旧段仍可见", out)
+        self.assertEqual(svc.execute_count, 0,
+                         "fail-closed 时不应发起 hybrid recall RPC")
+
 
 # ==========================================
 # E+F. user_id / RPC 参数 / 日志脱敏

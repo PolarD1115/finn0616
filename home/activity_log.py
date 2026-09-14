@@ -158,14 +158,14 @@ def finalize_activity_log(activity_key: str, activity_id: str = "", activity_nam
         return {"ok": False, "error_code": "SERVICE_KEY_MISSING"}
     key = activity_key.strip()
     thought = sanitize_thought_summary(thought_summary)
-    result = result_summary.strip()[:_RESULT_MAX_LEN] if isinstance(result_summary, str) else ""
+    result_text = result_summary.strip()[:_RESULT_MAX_LEN] if isinstance(result_summary, str) else ""
     tools = sanitize_tools_used(tools_used)
     payload = {
         "activity_id": (activity_id or "").strip()[:200] or None,
         "activity_name": (str(activity_name) if activity_name else "")[:100],
         "status": status,
         "thought_summary": thought,
-        "result_summary": result,
+        "result_summary": result_text,
         "tools_used": tools,
         "finished_at": finished_at if finished_at is not None else _utcnow_iso(),
         "updated_at": _utcnow_iso(),
@@ -174,6 +174,12 @@ def finalize_activity_log(activity_key: str, activity_id: str = "", activity_nam
         resp = (sb.table("activity_logs").update(payload)
                 .eq("activity_key", key).eq("status", "running").execute())
         if resp.data:
+            # 🧠 阶段 D3：成功 finalize 后异步桥接分层记忆（门控默认开；失败不影响主流程）
+            _schedule_activity_memory_bridge(
+                activity_key=key, activity_id=activity_id or "",
+                activity_name=activity_name or "", status=status,
+                thought_summary=thought, result_summary=result_text,
+                finished_at=payload.get("finished_at"))
             return {"ok": True, "finalized": True, "status": status}
         # 未更新到行：区分"不存在"与"已完成"（不插第二行、不掩盖 start 失败）
         cur = (sb.table("activity_logs").select("status")
@@ -187,6 +193,18 @@ def finalize_activity_log(activity_key: str, activity_id: str = "", activity_nam
         logger.warning("activity_log.finalize 失败（key 前缀=%s…, status=%s）: %s",
                        key[:6], status, e)
         return {"ok": False, "error_code": "DB_ERROR"}
+
+
+def _schedule_activity_memory_bridge(**kwargs) -> None:
+    """D3 旁路：活动日志 → memory_items（吞异常；秘密日记活动由日记桥处理）。"""
+    try:
+        import memory_diary_bridge as _mdb
+        if not _mdb.diary_bridge_enabled():
+            return
+        coro = _mdb.bridge_activity_log(**kwargs)
+        _mdb.schedule_bridge(coro)
+    except Exception as e:
+        logger.warning("activity_log → memory bridge 调度失败: %s", type(e).__name__)
 
 
 def fail_activity_log(activity_key: str, error_brief: str = "") -> dict:
