@@ -202,11 +202,14 @@ def _run_deep_dreaming(fake_sb, fake_svc, *, now, gate="true",
     old = os.environ.pop(key, None)
     if gate is not None:
         os.environ[key] = gate
-    # 阶段 D2 画像反思挂在周日同一入口；本 C1 用例隔离分层总结门控，须关掉反思以免
-    # 额外 memory_items 查询干扰「门控关 → 零查询」断言。
+    # 阶段 D2/D2b 画像/人格反思挂在周日同一入口；本 C1 用例隔离分层总结门控，
+    # 须关掉反思以免额外 memory_items 查询干扰「门控关 → 零查询」断言。
     _prf_key = "PROFILE_REFLECT_ENABLED"
     _prf_old = os.environ.get(_prf_key)
     os.environ[_prf_key] = "false"
+    _per_key = "PERSONA_REFLECT_ENABLED"
+    _per_old = os.environ.get(_per_key)
+    os.environ[_per_key] = "false"
     try:
         with patch.object(server, "ask_role", _ask), \
              patch.object(server, "_save_memory_to_db", _save), \
@@ -224,6 +227,10 @@ def _run_deep_dreaming(fake_sb, fake_svc, *, now, gate="true",
             os.environ.pop(_prf_key, None)
         else:
             os.environ[_prf_key] = _prf_old
+        if _per_old is None:
+            os.environ.pop(_per_key, None)
+        else:
+            os.environ[_per_key] = _per_old
     return prompts, saved, fake_sb, fake_svc
 
 

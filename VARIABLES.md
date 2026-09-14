@@ -509,15 +509,16 @@ Home Runtime 自主生活让 AI 在后台自主观察家庭状态并决定做什
 
 ---
 
-## 18. 记忆固化与隐私打通（阶段 D1/D2/D3）🆕
+## 18. 记忆固化与隐私打通（阶段 D1/D2/D2b/D3）🆕
 
-> 🆕 阶段 D。换窗备忘 / 画像周反思 / 日记·活动日志桥接分层记忆。三项彼此独立、共用 `memory_items`；**不开启** A5 / B3 自动注入门控（保持默认 false）。
+> 🆕 阶段 D。换窗备忘 / 画像周反思 / AI 人格周反思 / 日记·活动日志桥接分层记忆。彼此独立、共用 `memory_items`；**不开启** A5 / B3 自动注入门控（保持默认 false）。
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|:---:|--------|------|
 | `MEMORY_MEMO_ENABLED` | ❌ | `true` | **D1 换窗备忘总闸**。关：不写不读 memo，渠道 volatile 行为与接入前一致。开：沉默超时后本轮有效对话后台生成 1 条 `memory_type=memo`（`source=session_memo`，`expires_at` 默认 7 天）；Web/TG/QQ 上下文注入最新 1 条 active memo 为「【上次交接备忘】」段。 |
 | `MEMORY_MEMO_SILENCE_HOURS` | ❌ | `6` | D1 沉默阈值（小时）。`silence_hours > 该值` 才生成；Web 的 `session_id` 恒为 None，**不能**仅凭 None 触发（否则每轮都写）。调用方可显式传 `session_changed=True`。 |
 | `PROFILE_REFLECT_ENABLED` | ❌ | `true` | **D2 画像反思总闸**。关：周日深夜日记流程跳过反思。开：每周日在周总结之后跑一次，读取真画像 + 近 7 天 active（long_term/moment/current），compression 角色最多新增 5 句；**只增不减**（旧段落须完整保留）+ **长度保护**（新长 < 原长 × 0.9 → 拒绝写入）。日志只打计数，不写画像正文。 |
+| `PERSONA_REFLECT_ENABLED` | ❌ | `true` | **D2b AI 人格反思总闸**。关：周日不读记忆、不调 LLM、不写库。开：每周日在 D2 画像反思**之后**跑一次，读取 `user_facts.sys_ai_persona`（fallback `AI_PERSONA`）+ 近 7 天 AI 相关 active（moment/shared_experience，可选含「我」的 current；排除 `private_diary`），compression 角色最多新增 5 句；复用 D2 `validate_profile_growth`（只增不减 + 长度保护）；单 key upsert `sys_ai_persona`。**不改**环境变量 `AI_PERSONA`。日志只打计数，不写人设/记忆正文。 |
 | `DIARY_MEMORY_BRIDGE_ENABLED` | ❌ | `true` | **D3 日记/活动桥总闸**。关：finalize / 写私密日记后不提取。开：`activity_logs` 成功 finalize 后异步提取为 moment/long_term；`home_private_diaries` 写入成功后异步提取为 moment（`source=private_diary`）。秘密日记原文**不进** `search_memory` 通用返回（B2 混合召回按 source 过滤）；可进渠道 active 注入 / 分层读取。 |
 
 **隐私边界（D3）**：秘密日记只进 `memory_items` 的 moment 层；不写 `memories.Secret_Diary`、不写 Pinecone、日志不打正文。`search_memory` 对 `source=private_diary`（及 metadata.privacy）跳过。

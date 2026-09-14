@@ -487,6 +487,22 @@ async def _perform_deep_dreaming():
             except Exception as e:
                 print(f"⚠️ 画像反思失败（不影响日记）: {type(e).__name__}")
 
+            # 🪞 阶段 D2b：周日 AI 人格反思（D2 之后；只增不减；门控默认开）
+            try:
+                import memory_persona_reflect as _mper
+                if _mper.persona_reflect_enabled():
+                    from memory_extractor import make_compression_llm_call as _make_llm_call
+                    _persona = await _mper.run_persona_reflect(
+                        supabase_service, _make_llm_call(),
+                        _resolve_pinecone_user_id(), AI_NAME, USER_NAME)
+                    print(f"🪞 [人格反思] ok={_persona.get('ok')} "
+                          f"old_len={_persona.get('old_len')} "
+                          f"new_len={_persona.get('new_len')} "
+                          f"new_sent={_persona.get('new_sentences')} "
+                          f"code={_persona.get('error_code')}")
+            except Exception as e:
+                print(f"⚠️ 人格反思失败（不影响日记）: {type(e).__name__}")
+
         # 2. 月度总结 (每月最后一天触发)
         tomorrow = now_bj + datetime.timedelta(days=1)
         if tomorrow.day == 1:

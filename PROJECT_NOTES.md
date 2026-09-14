@@ -818,6 +818,24 @@
 
 **📌 遗留提醒**：`PROJECT_NOTES.md` v3.9 条目写的「截断上限 → [:60]」在 `0af63a0` 之后已失效，**以本条为最新口径**。若还需把单条截断从 150 回滚到 200，须另行确认（会进一步增加注入字符数与 token 占用）。
 
+### v5.8.1 — 阶段 D2b：AI 人格反思周更（2026-09-14）
+**性质**：功能新增。在 D2 用户画像反思之外，新增并行的 **AI 自身人设**反思；不改 D1/D2/D3 已完成逻辑；不改 schema / RLS；无新 migration；**不改**环境变量 `AI_PERSONA`（仅写库 `user_facts.sys_ai_persona`）。
+
+**D2b · AI 人格反思**（新模块 `memory_persona_reflect.py`）：
+- 挂在 `heartbeat._perform_deep_dreaming` 周日流程中，**D2 画像反思之后**。
+- 读取：优先 `user_facts.sys_ai_persona`，fallback `AI_PERSONA`；近 7 天 active `moment`/`shared_experience`（可选含「我」的 `current`）；**排除** `source=private_diary`。
+- 校验：直接复用 D2 `validate_profile_growth` / `split_paragraphs` / `count_new_sentences`（只增不减 + 长度 ≥ 原长 × 0.9 + 最多新增 5 句）。
+- 写入：单 key upsert `sys_ai_persona`（整体替换 value，`confidence=1.0`）；不删 key、不写空 value；首次不存在则创建。
+- 门控 `PERSONA_REFLECT_ENABLED`（默认 true）；日志只打 old_len/new_len/new_sentences/error_code，不打人设/记忆正文。
+
+**测试**：新增 `test_memory_persona_reflect_phaseD2b.py`；回归 D2 + C1；`py_compile` 通过。C1 周日 `_run_dreaming` 同步关 `PERSONA_REFLECT_ENABLED`，避免额外 `memory_items` 查询干扰「分层门控关 → 零查询」断言。
+
+**新环境变量**（已写入 `VARIABLES.md` §18）：
+- `PERSONA_REFLECT_ENABLED`（默认 `true`）
+
+**Supabase 操作声明**：未修改 schema / RLS；写入为 service_role upsert `user_facts.sys_ai_persona`（门控默认开）；本阶段未在真实库执行。
+**Pinecone 操作声明**：未涉及。
+
 ### v5.8 — 阶段 D1+D2+D3：换窗备忘 + 画像反思周更 + 日记/活动日志打通分层记忆（2026-09-14）
 **性质**：功能新增（三块彼此独立、共用 `memory_items`）。不改数据库 schema / RLS；无新 migration；**不开启** `MEMORY_EXTRACTION_WORKER_ENABLED` / `ACTIVE_MEMORY_INJECTION_ENABLED`（保持默认 false）。不物理删除任何 `memory_items`（memo 用 superseded；过期用 expires_at）。
 
