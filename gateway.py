@@ -2992,6 +2992,20 @@ class HostFixMiddleware:
             except Exception as e:
                 _log(f"⚠️ [Calendar] 日程注入失败: {e}")
 
+        # 🧠 阶段 D1：换窗备忘 memo（最新 1 条 active；追加到 volatile 区块）
+        try:
+            import memory_memo as _mm_web
+            if _mm_web.memo_enabled():
+                import server as _srv_mm
+                if _srv_mm.supabase_service:
+                    _memo_txt = await _mm_web.inject_memo_text(
+                        _srv_mm.supabase_service,
+                        _srv_mm._resolve_pinecone_user_id())
+                    if _memo_txt:
+                        volatile_block += f"\n{_memo_txt}"
+        except Exception as e:
+            _log(f"⚠️ [Memo] 备忘注入失败（已跳过）: {type(e).__name__}")
+
         # ① 注入稳定前缀到 system：已有 system 就「前置」拼接（保证稳定内容仍在最前，
         #    维持缓存前缀不被前端自带 system 内容顶开），没有就插入到最前。
         #    把 persona 放最前面，强制身份锚定，确保模型最先读到自身角色。
@@ -3483,6 +3497,35 @@ class HostFixMiddleware:
                         _log(f"🧾 [事件账本] Web 原始事件已写入 {len(_ev_rows)} 条（请求 {_ev_request_id[:8]}）")
             except Exception as e:
                 _log(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {e}")
+
+            # 🧠 阶段 D1：换窗备忘——本轮有效对话后，若沉默超时则后台写 memo
+            try:
+                import memory_memo as _mm_save
+                if _mm_save.memo_enabled() and (user_msg or "").strip():
+                    _mm_silence = 0.0
+                    try:
+                        # 用本轮 now_str 之前的最近一条计算沉默（排除刚写入的本轮流水）
+                        _prev = await asyncio.to_thread(
+                            lambda: sb.table("memories").select("created_at")
+                            .eq("tags", chat_tag)
+                            .lt("created_at", now_str)
+                            .order("created_at", desc=True)
+                            .limit(1).execute())
+                        _rows = getattr(_prev, "data", None) or []
+                        if _rows and _rows[0].get("created_at"):
+                            _last_dt = datetime.datetime.strptime(
+                                str(_rows[0]["created_at"])[:19], "%Y-%m-%dT%H:%M:%S")
+                            _now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+                            _mm_silence = max(0.0, round(
+                                (_now_bj - (_last_dt + datetime.timedelta(hours=8)))
+                                .total_seconds() / 3600, 1))
+                    except Exception:
+                        _mm_silence = 0.0
+                    _mm_save.schedule_memo_generation(
+                        user_msg=user_msg, ai_msg=final_save_text,
+                        silence_hours=_mm_silence, session_id=None)
+            except Exception as e:
+                _log(f"⚠️ [Memo] 备忘生成调度失败（不影响主流程）: {type(e).__name__}")
 
         # 3. 🧠 异步触发全渠道统一对话总结（不阻塞响应）
         #    监控网页/QQ/TG/邮件等所有渠道的对话流水，

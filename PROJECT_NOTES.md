@@ -818,8 +818,8 @@
 
 **📌 遗留提醒**：`PROJECT_NOTES.md` v3.9 条目写的「截断上限 → [:60]」在 `0af63a0` 之后已失效，**以本条为最新口径**。若还需把单条截断从 150 回滚到 200，须另行确认（会进一步增加注入字符数与 token 占用）。
 
-### v5.8 — 阶段 D3：日记/活动日志打通分层记忆（2026-09-14）
-**性质**：功能新增（日记·活动日志桥接分层记忆，共用 `memory_items`）。不改数据库 schema / RLS；无新 migration；**不开启** `MEMORY_EXTRACTION_WORKER_ENABLED` / `ACTIVE_MEMORY_INJECTION_ENABLED`（保持默认 false）。不物理删除任何 `memory_items`。
+### v5.8 — 阶段 D1+D3：换窗备忘 + 日记/活动日志打通分层记忆（2026-09-14）
+**性质**：功能新增（两块彼此独立、共用 `memory_items`）。不改数据库 schema / RLS；无新 migration；**不开启** `MEMORY_EXTRACTION_WORKER_ENABLED` / `ACTIVE_MEMORY_INJECTION_ENABLED`（保持默认 false）。不物理删除任何 `memory_items`（memo 用 superseded；过期用 expires_at）。
 
 **D3 · 行动日志 + 秘密日记 → 分层记忆**（新模块 `memory_diary_bridge.py`）：
 - `finalize_activity_log` 成功（succeeded/observed/partial）后异步调度提取；`free:secret_diary` /「写秘密日记」跳过（由日记桥单独处理，防双提取）。
@@ -829,12 +829,18 @@
 - C1 分层总结 `_fetch_layered_memories` 排除 `source=private_diary`，避免私密 moment 进入周/月/年总结后被写入普通 memories。
 - 门控 `DIARY_MEMORY_BRIDGE_ENABLED`（默认 true）。
 
-**测试**：新增 `test_memory_diary_bridge_phaseD3.py`；`test_search_memory_phaseB2.py` 增补 fail-closed import 失败用例；回归 C1 等相邻用例。`py_compile` 改动文件通过。
+**D1 · 换窗备忘 memo**（新模块 `memory_memo.py`）：
+- 写入：Web（`gateway._save_conversation`）/ TG / QQ 本轮有效对话后，若 `silence_hours > MEMORY_MEMO_SILENCE_HOURS`（默认 6）则 compression 生成一条 memo（`source=session_memo`，`subject_key=session_handoff_memo`，`expires_at`=+7 天）；同 subject 旧 active → `superseded`（不物理删）。
+- 读取：`gateway._inject_context` volatile 与 `server._build_channel_context` 追加「【上次交接备忘】」最新 1 条 active 未过期 memo。
+- 门控 `MEMORY_MEMO_ENABLED`（默认 true）。Web `session_id` 恒 None **不**单独触发写入。
+
+**测试**：新增 `test_memory_diary_bridge_phaseD3.py` + `test_memory_memo_phaseD1.py`；`test_search_memory_phaseB2.py` 增补 fail-closed import 失败用例；回归 C1 等相邻用例。`py_compile` 改动文件通过。
 
 **新环境变量**（已写入 `VARIABLES.md` §18）：
+- `MEMORY_MEMO_ENABLED`（默认 `true`）/ `MEMORY_MEMO_SILENCE_HOURS`（默认 `6`）
 - `DIARY_MEMORY_BRIDGE_ENABLED`（默认 `true`）
 
-**Supabase 操作声明**：未修改 schema / RLS；D3 写入为 service_role INSERT `memory_items`（门控默认开，部署后按需关闭）；本阶段未在真实库执行。
+**Supabase 操作声明**：未修改 schema / RLS；D1/D3 写入为 service_role INSERT/UPDATE `memory_items`（门控默认开，部署后按需关闭）；本阶段未在真实库执行。
 **Pinecone 操作声明**：未涉及。
 
 ### v5.6 — 阶段 C1+C2：四级总结接分层记忆 + 原始事件安全清理（2026-09-13）

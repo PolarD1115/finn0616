@@ -1100,6 +1100,17 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
+    # 🧠 阶段 D1：换窗备忘 memo（最新 1 条 active；门控 MEMORY_MEMO_ENABLED 默认开）
+    try:
+        import memory_memo as _mm_d1
+        if _mm_d1.memo_enabled() and supabase_service:
+            _memo_txt = await _mm_d1.inject_memo_text(
+                supabase_service, _resolve_pinecone_user_id())
+            if _memo_txt:
+                volatile_parts.append(_memo_txt)
+    except Exception as e:
+        print(f"⚠️ [Memo] 渠道备忘注入失败（已跳过）: {type(e).__name__}")
+
     # 🧠 阶段 B3：长期记忆（memory_items 分层）主动注入（与 Web 第 41/42 阶段对齐）。
     #    - 复用 gateway 门控（ACTIVE_MEMORY_INJECTION_ENABLED，默认关）与第 41 阶段
     #      构建体 build_active_memory_injection（召回/去重算法零复制）；

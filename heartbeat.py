@@ -1229,6 +1229,42 @@ async def async_telegram_polling():
         except Exception as _ev_err:
             _tg_log(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
 
+        # 🧠 阶段 D1：换窗备忘（TG）——沉默超时后本轮有效对话触发
+        try:
+            import memory_memo as _mm_tg
+            if _mm_tg.memo_enabled() and text and reply:
+                _mm_silence = 0.0
+                try:
+                    _now_utc = datetime.datetime.now(datetime.timezone.utc)
+                    _prev = await asyncio.to_thread(
+                        lambda: supabase.table("memories").select("created_at")
+                        .eq("tags", "TG_MSG")
+                        .order("created_at", desc=True).limit(6).execute())
+                    for _row in (getattr(_prev, "data", None) or []):
+                        _ca = _row.get("created_at")
+                        if not _ca:
+                            continue
+                        try:
+                            _last_dt = datetime.datetime.fromisoformat(
+                                str(_ca).replace("Z", "+00:00"))
+                            if _last_dt.tzinfo is None:
+                                _last_dt = _last_dt.replace(tzinfo=datetime.timezone.utc)
+                        except Exception:
+                            continue
+                        # 跳过本轮刚写入的流水（2 分钟内），取更早一条算沉默
+                        if (_now_utc - _last_dt).total_seconds() < 120:
+                            continue
+                        _mm_silence = max(0.0, round(
+                            (_now_utc - _last_dt).total_seconds() / 3600, 1))
+                        break
+                except Exception:
+                    _mm_silence = 0.0
+                _mm_tg.schedule_memo_generation(
+                    user_msg=text, ai_msg=reply, silence_hours=_mm_silence,
+                    session_id=None)
+        except Exception as _mm_err:
+            _tg_log(f"⚠️ [Memo] 备忘生成调度失败: {type(_mm_err).__name__}")
+
     from aggregator import get_aggregator
     _tg_agg = get_aggregator("TG", _handle_merged)
 

@@ -459,6 +459,43 @@ def _get_qq_aggregator(send):
         except Exception as _ev_err:
             _naplog(f"⚠️ [事件账本] memory_events 写入失败（不影响主流程）: {_ev_err}")
 
+        # 🧠 阶段 D1：换窗备忘（QQ）——沉默超时后本轮有效对话触发
+        try:
+            import memory_memo as _mm_qq
+            if _mm_qq.memo_enabled() and text and reply:
+                _mm_silence = 0.0
+                try:
+                    from server import supabase as _sb_qq
+                    _now_utc = datetime.datetime.now(datetime.timezone.utc)
+                    if _sb_qq:
+                        _prev = await asyncio.to_thread(
+                            lambda: _sb_qq.table("memories").select("created_at")
+                            .eq("tags", "QQ_MSG")
+                            .order("created_at", desc=True).limit(6).execute())
+                        for _row in (getattr(_prev, "data", None) or []):
+                            _ca = _row.get("created_at")
+                            if not _ca:
+                                continue
+                            try:
+                                _last_dt = datetime.datetime.fromisoformat(
+                                    str(_ca).replace("Z", "+00:00"))
+                                if _last_dt.tzinfo is None:
+                                    _last_dt = _last_dt.replace(tzinfo=datetime.timezone.utc)
+                            except Exception:
+                                continue
+                            if (_now_utc - _last_dt).total_seconds() < 120:
+                                continue
+                            _mm_silence = max(0.0, round(
+                                (_now_utc - _last_dt).total_seconds() / 3600, 1))
+                            break
+                except Exception:
+                    _mm_silence = 0.0
+                _mm_qq.schedule_memo_generation(
+                    user_msg=text, ai_msg=reply, silence_hours=_mm_silence,
+                    session_id=None)
+        except Exception as _mm_err:
+            _naplog(f"⚠️ [Memo] 备忘生成调度失败: {type(_mm_err).__name__}")
+
         # 🧠 异步触发全渠道统一对话总结（不阻塞回复）
         asyncio.create_task(check_and_summarize_all())
 
