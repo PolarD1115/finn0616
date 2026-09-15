@@ -232,7 +232,9 @@ async def run_preview(supabase_service, limit=MAX_PREVIEW_EVENTS,
     supabase_service: server.supabase_service（只读使用，绝不调用其写入方法）。
     llm_call: 可注入的模型调用（测试用 mock）；None 时使用
               memory_extractor.make_compression_llm_call()（真实 compression）。
+    ai_name / user_name: 由 gateway 注入显示名；本模块不读取进程环境配置。
     返回：API 安全响应 dict——零写入、脱敏。"""
+    ai_name, user_name = mx.resolve_identity_names(ai_name, user_name)
     limit = max(MIN_PREVIEW_EVENTS, min(MAX_PREVIEW_EVENTS, int(limit)))
     stats = {"selected_events": 0, "user_events": 0, "assistant_events": 0,
              "candidate_count": 0, "rejected_count": 0}

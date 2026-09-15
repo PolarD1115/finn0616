@@ -131,9 +131,11 @@ def build_memo_prompt(user_msg: str, ai_msg: str, *,
                       user_name: str = "用户", ai_name: str = "助手") -> str:
     return (
         f"你是会话交接备忘生成器。根据本轮对话，写一条给下次新窗口用的交接纸条。\n"
+        f"身份：对话中的「对方/用户」是「{user_name}」本人；你是「{ai_name}」。\n"
+        f"禁止把「{user_name}」写成用户身边的第三人，禁止把 {ai_name} 写成「用户」。\n"
         f"要求：只输出纯文本，按下面四行格式（每行一句，简洁）：\n"
         f"上次聊到：…\n未完成：…\n对方状态：…\n建议：…\n"
-        f"不要 Markdown，不要 JSON，不要角色前缀。\n\n"
+        f"「对方」=「{user_name}」。不要 Markdown，不要 JSON，不要角色前缀。\n\n"
         f"【本轮对话】\n{user_name}：{(user_msg or '')[:800]}\n"
         f"{ai_name}：{(ai_msg or '')[:800]}\n"
     )

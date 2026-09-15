@@ -36,6 +36,13 @@ _SECRET_DIARY_ACTIVITY_NAMES = frozenset({"写秘密日记"})
 _BRIDGE_OK_STATUSES = frozenset({"succeeded", "observed", "partial"})
 
 
+def _env_identity_names():
+    """从环境变量读取 AI_NAME / USER_NAME（日记桥侧允许读非密钥配置）。"""
+    ai = (os.environ.get("AI_NAME") or "").strip() or "助手"
+    user = (os.environ.get("USER_NAME") or "").strip() or "用户"
+    return ai, user
+
+
 def diary_bridge_enabled() -> bool:
     """DIARY_MEMORY_BRIDGE_ENABLED 门控（默认 true）。"""
     return os.environ.get("DIARY_MEMORY_BRIDGE_ENABLED", "true").strip().lower() \
@@ -95,11 +102,23 @@ def to_extractable_events(events: list) -> list:
 def build_activity_events(activity_name: str = "", activity_id: str = "",
                           thought_summary: str = "", result_summary: str = "",
                           user_id: str = "default",
-                          finished_at: str | None = None) -> list:
+                          finished_at: str | None = None,
+                          user_name: str | None = None,
+                          ai_name: str | None = None) -> list:
     """活动日志 → 临时 event 列表（供提取）。"""
+    if ai_name is None or user_name is None:
+        env_ai, env_user = _env_identity_names()
+        ai_name = ai_name if ai_name is not None else env_ai
+        user_name = user_name if user_name is not None else env_user
+    import memory_extractor as mx
+    ai_name, user_name = mx.resolve_identity_names(ai_name, user_name)
     parts = []
     name = (activity_name or activity_id or "活动").strip()
-    parts.append(f"AI 完成了活动「{name}」。")
+    parts.append(
+        f"【身份说明】作者是 AI「{ai_name}」，用户本人是「{user_name}」。"
+        f"文中的「{user_name}」即用户本人，禁止写成用户身边的第三人。"
+    )
+    parts.append(f"AI「{ai_name}」完成了活动「{name}」。")
     thought = (thought_summary or "").strip()
     result = (result_summary or "").strip()
     if thought:
@@ -107,9 +126,9 @@ def build_activity_events(activity_name: str = "", activity_id: str = "",
     if result:
         parts.append(f"活动结果：{result}")
     content = "\n".join(parts).strip()
-    if not content or content == f"AI 完成了活动「{name}」。":
-        if not result and not thought:
-            return []
+    # 仅有身份说明 + 空活动名时不提取
+    if not thought and not result:
+        return []
     return [build_temp_event(
         content=content, user_id=user_id, channel=SOURCE_ACTIVITY,
         occurred_at=finished_at)]
@@ -117,8 +136,16 @@ def build_activity_events(activity_name: str = "", activity_id: str = "",
 
 def build_private_diary_events(title: str = "", content: str = "",
                                mood: str = "", user_id: str = "default",
-                               created_at: str | None = None) -> list:
+                               created_at: str | None = None,
+                               user_name: str | None = None,
+                               ai_name: str | None = None) -> list:
     """秘密日记 → 临时 event 列表（供提取；正文不入日志）。"""
+    if ai_name is None or user_name is None:
+        env_ai, env_user = _env_identity_names()
+        ai_name = ai_name if ai_name is not None else env_ai
+        user_name = user_name if user_name is not None else env_user
+    import memory_extractor as mx
+    ai_name, user_name = mx.resolve_identity_names(ai_name, user_name)
     body = (content or "").strip()
     if not body:
         return []
@@ -128,8 +155,14 @@ def build_private_diary_events(title: str = "", content: str = "",
     if mood_s:
         head += f"·心情{mood_s}"
     head += "）"
-    # 用用户侧叙事承载，便于提取器证据映射；channel 标记隐私来源
-    text = f"{head}\n{body}"
+    # 秘密日记由 AI 撰写；仍映射为 user 角色以便证据索引，但必须先钉死身份，
+    # 避免 compression 把 AI 当成「用户」、把真人名当成互动对象。
+    identity = (
+        f"【身份说明】本文是 AI「{ai_name}」撰写的关于用户「{user_name}」的私密日记。"
+        f"日记作者是 {ai_name}，不是用户；文中出现的「{user_name}」及其小名/昵称/全名"
+        f"一律指用户本人。禁止写成「用户身边有一位名叫{user_name}…」或把角色对调。"
+    )
+    text = f"{head}\n{identity}\n{body}"
     return [build_temp_event(
         content=text, user_id=user_id, channel=SOURCE_PRIVATE_DIARY,
         occurred_at=created_at)]
@@ -234,7 +267,9 @@ async def _write_items(supabase_service, candidates: list) -> dict:
 async def extract_and_store(events: list, *, source: str,
                             force_moment: bool = False,
                             llm_call=None, supabase_service=None,
-                            user_id: str | None = None) -> dict:
+                            user_id: str | None = None,
+                            user_name: str | None = None,
+                            ai_name: str | None = None) -> dict:
     """提取 + 写入主入口（可注入 llm_call / supabase 供测试）。"""
     result = {"ok": False, "inserted": 0, "duplicate_skipped": 0,
               "candidates": 0, "error_code": None}
@@ -247,6 +282,11 @@ async def extract_and_store(events: list, *, source: str,
         return result
 
     import memory_extractor as mx
+    if ai_name is None or user_name is None:
+        env_ai, env_user = _env_identity_names()
+        ai_name = ai_name if ai_name is not None else env_ai
+        user_name = user_name if user_name is not None else env_user
+    ai_name, user_name = mx.resolve_identity_names(ai_name, user_name)
     if llm_call is None:
         llm_call = mx.make_compression_llm_call()
     if supabase_service is None:
@@ -264,7 +304,8 @@ async def extract_and_store(events: list, *, source: str,
 
     try:
         extraction = await mx.extract_memory_candidates(
-            extractable, llm_call, user_id=user_id)
+            extractable, llm_call, user_id=user_id,
+            ai_name=ai_name, user_name=user_name)
     except Exception as e:  # noqa: BLE001
         _log(f"提取异常: {type(e).__name__}")
         result["error_code"] = "EXTRACT_EXCEPTION"

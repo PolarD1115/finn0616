@@ -538,5 +538,41 @@ class TestNoDatabaseAccess(unittest.TestCase):
             self.assertNotIn(token, src, msg=f"不得包含自动调度: {token}")
 
 
+class TestIdentityAnchoring(unittest.TestCase):
+    """身份锚定：禁止把用户本名第三人化。"""
+
+    def test_prompt_contains_identity_block(self):
+        events = [_ev(0, "user", USER_TS), _ev(1, "assistant", ASSISTANT_ACK)]
+        prompt = mx.build_memory_extraction_prompt(events, "Finn", "昕")
+        self.assertIn("身份锚定", prompt)
+        self.assertIn("用户·昕", prompt)
+        self.assertIn("禁止把 Finn 当成「用户」", prompt)
+        self.assertIn("用户身边有一位名叫昕", prompt)
+
+    def test_reject_user_as_third_party(self):
+        events = [_ev(0, "user", "今天胃不太舒服，Finn陪着我。"),
+                  _ev(1, "assistant", "好的。")]
+        bad = _cand(
+            content="用户身边有一位名叫“小满”的女性，用户会照顾其起居。",
+            source_event_indexes=[0],
+        )
+        result, _ = _run(events, _llm_returning({"memories": [bad]}))
+        self.assertFalse(result["ok"])
+        self.assertIn("USER_AS_THIRD_PARTY", result.get("rejected") or [])
+
+    def test_accept_self_named_fact(self):
+        events = [_ev(0, "user", "记住：我叫小满，胃容易难受。"),
+                  _ev(1, "assistant", "好的。")]
+        good = _cand(
+            content="小满胃容易难受。",
+            source_event_indexes=[0],
+            importance=5,
+            confidence=0.9,
+        )
+        result, _ = _run(events, _llm_returning({"memories": [good]}))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["candidates"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@
 
 import asyncio
 import datetime
+import os
 
 import memory_extractor as mx
 from memory_preview import _DEDUP_STATUSES, _MEMORY_ITEM_FIELDS
@@ -295,8 +296,11 @@ async def run_auto_extraction(supabase_service, *, user_id,
             return stats
 
         # 4. 提取（memory_extractor 永不抛异常、永不写库；llm_call 为同步 callable）
-        result = await mx.extract_memory_candidates(claimed_events, llm_call,
-                                                    user_id=user_id)
+        ai_name = (os.environ.get("AI_NAME") or "").strip() or "助手"
+        user_name = (os.environ.get("USER_NAME") or "").strip() or "用户"
+        result = await mx.extract_memory_candidates(
+            claimed_events, llm_call, user_id=user_id,
+            ai_name=ai_name, user_name=user_name)
         if result.get("ok"):
             stats["extracted"] = len(result.get("candidates") or [])
 

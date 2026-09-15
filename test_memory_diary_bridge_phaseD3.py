@@ -123,6 +123,23 @@ class TestDiaryBridgePhaseD3(unittest.TestCase):
         self.assertEqual(adapted[0]["role"], "user")
         self.assertEqual(adapted[0]["channel"], mdb.SOURCE_ACTIVITY)
 
+    def test_a2_private_diary_identity_framing(self):
+        os.environ["USER_NAME"] = "昕"
+        os.environ["AI_NAME"] = "Finn"
+        try:
+            evs = mdb.build_private_diary_events(
+                title="夜记", content=SECRET_MARKER, mood="平静", user_id="u1")
+            self.assertEqual(len(evs), 1)
+            text = evs[0]["content"]
+            self.assertIn("身份说明", text)
+            self.assertIn("Finn", text)
+            self.assertIn("昕", text)
+            self.assertIn("不是用户", text)
+            self.assertIn(SECRET_MARKER, text)
+        finally:
+            os.environ.pop("USER_NAME", None)
+            os.environ.pop("AI_NAME", None)
+
     def test_b_activity_bridge_writes_moment(self):
         fake = FakeItemsService()
         content = f"用户喜欢在周末散步。含标记{ACTIVITY_MARKER}"

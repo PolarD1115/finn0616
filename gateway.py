@@ -3597,8 +3597,11 @@ class HostFixMiddleware:
         try:
             import memory_preview
             import server as _srv_preview
+            _ai = os.environ.get("AI_NAME", "助手")
+            _user = os.environ.get("USER_NAME", "用户")
             result = await memory_preview.run_preview(
-                _srv_preview.supabase_service, limit=limit_raw)
+                _srv_preview.supabase_service, limit=limit_raw,
+                ai_name=_ai, user_name=_user)
             await _send_json_resp(send, 200, result)
         except Exception as e:
             # 零写入保证：任何异常都不落库，只返回脱敏错误

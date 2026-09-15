@@ -196,24 +196,105 @@ def _clip_events(events):
 # Prompt 构造
 # ════════════════════════════════════════════════════════════
 
+def resolve_identity_names(ai_name=None, user_name=None):
+    """规范化用户/AI 显示名（不读环境变量；由调用方注入 USER_NAME/AI_NAME）。
+
+    None / 空串 → 默认「助手」「用户」。显式传入的真名原样保留。
+    """
+    ai = ("" if ai_name is None else str(ai_name)).strip() or "助手"
+    user = ("" if user_name is None else str(user_name)).strip() or "用户"
+    return ai, user
+
+
+def _user_role_label(user_name):
+    """事件列表中的用户角色标签：有真名时写成「用户·真名」。"""
+    name = (user_name or "").strip()
+    if name and name != "用户":
+        return f"用户·{name}"
+    return "用户"
+
+
+def _looks_like_user_as_third_party(content, user_name):
+    """检测「把用户本名写成用户身边第三人」的典型错记。
+
+    仅在 user_name 有意义（非空且不是泛称「用户」）时生效；命中则应拒绝候选。
+    """
+    name = (user_name or "").strip()
+    if not name or name == "用户" or not isinstance(content, str):
+        return False
+    if name not in content:
+        return False
+    # 用户 vs 真名被拆成两个角色的常见句式
+    markers = (
+        "用户身边",
+        "用户的同学",
+        "用户的朋友",
+        "用户的社交",
+        "与用户关系亲近",
+        "同学兼朋友",
+        "亲近女性",
+        "亲近之人",
+        "亲近人物",
+        "亲近的人",
+    )
+    if any(m in content for m in markers):
+        return True
+    # 「名叫/名为 真名」且同时出现「用户」→ 几乎总是第三人化
+    if "用户" in content and (
+        f"名叫“{name}”" in content or f"名叫「{name}」" in content
+        or f"名叫\"{name}\"" in content or f"名叫'{name}'" in content
+        or f"名为“{name}”" in content or f"名为「{name}」" in content
+        or f"名叫{name}" in content or f"名为{name}" in content
+    ):
+        return True
+    # 「真名 … 向用户 …」或「用户在…安抚/照料 真名」——日记桥常见角色对调
+    if "向用户" in content:
+        return True
+    if "用户" in content and any(
+        a in content for a in ("协助", "照顾", "安抚", "照料", "催她", "哄其")
+    ):
+        return True
+    return False
+
+
 def build_memory_extraction_prompt(events, ai_name="助手", user_name="用户"):
     """构造事实提取 Prompt。events 必须是已截断的 user/assistant 事件列表；
     渲染行号 [i] 即 validate 的 source_event_indexes 索引空间。"""
+    ai_name, user_name = resolve_identity_names(ai_name, user_name)
+    user_label = _user_role_label(user_name)
     lines = []
     for i, e in enumerate(events):
         raw_content = str(e.get("content", ""))
         if e.get("role") == "assistant":
             # 🔒 第 10 阶段：assistant 事件剥离 <final> 内部包装后再渲染（user 事件原样）
             raw_content = _strip_internal_markup(raw_content)
-        role_label = "用户" if e.get("role") == "user" else f"{ai_name}(AI，仅用于理解对话结果，不是事实来源、不是语气样本)"
+        role_label = (
+            user_label if e.get("role") == "user"
+            else f"{ai_name}(AI，仅用于理解对话结果，不是事实来源、不是语气样本)"
+        )
         part = f"[{i}] [{role_label}|{e.get('channel', '?')}|{e.get('occurred_at', '')}] " \
                f"{raw_content[:MAX_INPUT_EVENT_CHARS]}"
         lines.append(part)
     events_text = "\n".join(lines)
 
+    identity_block = (
+        f"【身份锚定 · 最高优先级】\n"
+        f"- 用户本人显示名/本名是「{user_name}」；AI 是「{ai_name}」。\n"
+        f"- 文中出现的「{user_name}」、其小名、昵称、全名，一律指用户本人，"
+        f"不是用户身边的同学/朋友/伴侣/女性第三人。\n"
+        f"- 禁止写出「用户身边有一位名叫{user_name}…」「用户的同学兼朋友{user_name}」"
+        f"「与用户关系亲近的{user_name}」这类把本人第三人化的句子。\n"
+        f"- 禁止把 {ai_name} 当成「用户」，再把真实用户「{user_name}」当成互动对象；"
+        f"角色不得对调。\n"
+        f"- 若事件来自私密日记/活动日志：作者常常是 {ai_name} 在写 {user_name}；"
+        f"仍应提炼关于用户「{user_name}」的事实，content 用「用户」或「{user_name}」指本人。\n"
+        f"- content 陈述主体应是用户本人的状态/经历/偏好；不要编造一个与用户同名的旁人。\n\n"
+    )
+
     return (
         "你是长期记忆事实提取模块，不是回复生成模块。唯一任务：从下面的原始事件中提取"
         "「未来可能有用的事实」，输出严格 JSON；没有可提取内容时输出 {\"memories\":[]}。\n\n"
+        f"{identity_block}"
         f"【事件列表】（[i] 为事件索引，source_event_indexes 必须引用这些索引）\n{events_text}\n\n"
         "【事实来源与防模仿】\n"
         f"1. 只提取用户明确表达或事件明确证明的内容；不要把 {ai_name} 自己的回复当成用户事实。\n"
@@ -337,7 +418,8 @@ def parse_memory_extraction_response(text):
 # 单候选验证与规范化
 # ════════════════════════════════════════════════════════════
 
-def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc):
+def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc,
+                                     user_name="用户"):
     """验证并规范化单条候选。
     返回 (item_dict, None) 或 (None, 脱敏拒绝原因代码)。"""
     # 1. memory_type
@@ -354,6 +436,8 @@ def validate_and_normalize_candidate(cand, events, user_id, batch_id, now_utc):
         return None, "EMPTY_CONTENT"
     if len(content) > MAX_CONTENT_CHARS:
         return None, "CONTENT_TOO_LONG"
+    if _looks_like_user_as_third_party(content, user_name):
+        return None, "USER_AS_THIRD_PARTY"
 
     # 3. 数值字段
     imp = cand.get("importance", DEFAULT_IMPORTANCE)
@@ -549,11 +633,13 @@ async def extract_memory_candidates(events, llm_call, user_id=None,
     llm_call: 同步 callable(prompt) -> str（可注入；真实实现见
               make_compression_llm_call，返回空串视为失败——与项目 ask_role_sync 约定一致）。
     user_id:  目标用户；缺省时取第一个事件的 user_id。
+    ai_name / user_name: 显示名；占位「助手/用户」会回退到环境变量。
 
     返回 {ok, error_code, candidates, rejected, status_plan, batch_id}；
     永不抛出未处理异常、永不写库、candidates 均为通过全部验证的规范化数据。"""
     batch_id = str(uuid.uuid4())
     now_utc = datetime.datetime.now(datetime.timezone.utc)
+    ai_name, user_name = resolve_identity_names(ai_name, user_name)
 
     if not isinstance(events, list) or not events:
         return _fail_result(batch_id, ERR_VALIDATION, [])
@@ -584,7 +670,8 @@ async def extract_memory_candidates(events, llm_call, user_id=None,
 
     items, rejected = [], []
     for cand in rows:
-        item, reason = validate_and_normalize_candidate(cand, clipped, user_id, batch_id, now_utc)
+        item, reason = validate_and_normalize_candidate(
+            cand, clipped, user_id, batch_id, now_utc, user_name=user_name)
         if item is not None:
             items.append(item)
         else:
