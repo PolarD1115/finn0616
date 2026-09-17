@@ -407,6 +407,7 @@ def _get_qq_aggregator(send):
         #      走到这里必然开启，事件与 memories 流水同开同关）；
         #    - 独立 try 块：任何失败只记日志，绝不影响 memories 写入与总结触发；
         #    - user + assistant 两条事件一次批量 insert（同一请求原子落库）。
+        _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             import uuid as _uuid
             import hashlib as _hashlib
@@ -419,8 +420,7 @@ def _get_qq_aggregator(send):
                 # 统一用户隔离 ID：复用全项目唯一解析规则（USER_ID → MEM0_USER_ID → default）
                 _ev_uid = dep._resolve_pinecone_user_id()
                 # ⚠️ timestamptz 列必须写显式带时区 ISO；紧邻上方 memories 写入取得，
-                #    保证跨表时间线可对账
-                _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                #    保证跨表时间线可对账。_ev_now 在本段 try 之前已取值，供 memo 排除本轮。
                 _ev_rows = [
                     {
                         "user_id": _ev_uid,
@@ -465,29 +465,10 @@ def _get_qq_aggregator(send):
             if _mm_qq.memo_enabled() and text and reply:
                 _mm_silence = 0.0
                 try:
-                    from server import supabase as _sb_qq
-                    _now_utc = datetime.datetime.now(datetime.timezone.utc)
-                    if _sb_qq:
-                        _prev = await asyncio.to_thread(
-                            lambda: _sb_qq.table("memories").select("created_at")
-                            .eq("tags", "QQ_MSG")
-                            .order("created_at", desc=True).limit(6).execute())
-                        for _row in (getattr(_prev, "data", None) or []):
-                            _ca = _row.get("created_at")
-                            if not _ca:
-                                continue
-                            try:
-                                _last_dt = datetime.datetime.fromisoformat(
-                                    str(_ca).replace("Z", "+00:00"))
-                                if _last_dt.tzinfo is None:
-                                    _last_dt = _last_dt.replace(tzinfo=datetime.timezone.utc)
-                            except Exception:
-                                continue
-                            if (_now_utc - _last_dt).total_seconds() < 120:
-                                continue
-                            _mm_silence = max(0.0, round(
-                                (_now_utc - _last_dt).total_seconds() / 3600, 1))
-                            break
+                    _mm_silence = await _mm_qq.hours_since_last_chat_event(
+                        dep.supabase_service,
+                        dep._resolve_pinecone_user_id(),
+                        before_iso=_ev_now)
                 except Exception:
                     _mm_silence = 0.0
                 _mm_qq.schedule_memo_generation(

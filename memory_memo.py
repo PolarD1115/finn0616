@@ -3,6 +3,8 @@
 
 职责：
 - 长沉默 / session 断开后，本轮有效对话落库时后台生成 1 条 memo；
+- 沉默时长查 memory_events（跨 web/tg/qq/email 的 user/assistant），
+  不看 memories 流水标签（避免总结归档改成 Archived_Chat 后误判成「几天没聊」）；
 - 读取：volatile 区块注入最新 1 条 active memo；
 - 去重：同 subject_key 或同 source_event_ids 的旧 active → superseded；
 - 门控 MEMORY_MEMO_ENABLED（默认 true）；关闭时不写不读。
@@ -26,6 +28,9 @@ SOURCE = "session_memo"
 DEFAULT_SILENCE_HOURS = 6.0
 DEFAULT_EXPIRES_DAYS = 7
 MEMO_SUBJECT_KEY = "session_handoff_memo"
+# 只计真人对话渠道；排除 background/home/mcp（主动问候、家中活动不重置沉默）
+CHAT_EVENT_CHANNELS = ("web", "tg", "qq", "email")
+CHAT_EVENT_ROLES = ("user", "assistant")
 
 
 def memo_enabled() -> bool:
@@ -52,6 +57,62 @@ def _utcnow() -> datetime.datetime:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _parse_occurred_at(raw) -> datetime.datetime | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            dt = datetime.datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            try:
+                dt = datetime.datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+async def hours_since_last_chat_event(supabase_service, user_id: str, *,
+                                      before_iso: str | None = None) -> float:
+    """跨渠道真实沉默小时数（memory_events，不受 memories 归档改标签影响）。
+
+    只计 web/tg/qq/email 的 user/assistant；before_iso 之前（不含）的最近一条。
+    查不到或失败返回 0.0，避免误触发 memo。
+    """
+    if supabase_service is None or not user_id:
+        return 0.0
+    before = before_iso or _utcnow().isoformat()
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase_service.table("memory_events")
+            .select("occurred_at")
+            .eq("user_id", user_id)
+            .in_("role", list(CHAT_EVENT_ROLES))
+            .in_("channel", list(CHAT_EVENT_CHANNELS))
+            .lt("occurred_at", before)
+            .order("occurred_at", desc=True)
+            .limit(1)
+            .execute())
+        rows = getattr(res, "data", None) or []
+        if not rows or not isinstance(rows[0], dict):
+            return 0.0
+        last_dt = _parse_occurred_at(rows[0].get("occurred_at"))
+        if last_dt is None:
+            return 0.0
+        hours = (_utcnow() - last_dt).total_seconds() / 3600.0
+        return max(0.0, round(hours, 1))
+    except Exception as e:  # noqa: BLE001
+        _log(f"查询 memory_events 沉默失败: {type(e).__name__}")
+        return 0.0
 
 
 def should_generate_memo(*, silence_hours: float | None = None,

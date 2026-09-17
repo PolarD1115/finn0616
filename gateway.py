@@ -3520,21 +3520,12 @@ class HostFixMiddleware:
                 if _mm_save.memo_enabled() and (user_msg or "").strip():
                     _mm_silence = 0.0
                     try:
-                        # 用本轮 now_str 之前的最近一条计算沉默（排除刚写入的本轮流水）
-                        _prev = await asyncio.to_thread(
-                            lambda: sb.table("memories").select("created_at")
-                            .eq("tags", chat_tag)
-                            .lt("created_at", now_str)
-                            .order("created_at", desc=True)
-                            .limit(1).execute())
-                        _rows = getattr(_prev, "data", None) or []
-                        if _rows and _rows[0].get("created_at"):
-                            _last_dt = datetime.datetime.strptime(
-                                str(_rows[0]["created_at"])[:19], "%Y-%m-%dT%H:%M:%S")
-                            _now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                            _mm_silence = max(0.0, round(
-                                (_now_bj - (_last_dt + datetime.timedelta(hours=8)))
-                                .total_seconds() / 3600, 1))
+                        import server as _srv_mm_sil
+                        # 查 memory_events（排除本轮 now_str），不看 memories 标签
+                        _mm_silence = await _mm_save.hours_since_last_chat_event(
+                            _srv_mm_sil.supabase_service,
+                            _srv_mm_sil._resolve_pinecone_user_id(),
+                            before_iso=now_str)
                     except Exception:
                         _mm_silence = 0.0
                     _mm_save.schedule_memo_generation(

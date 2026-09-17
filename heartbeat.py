@@ -1205,6 +1205,7 @@ async def async_telegram_polling():
         #      走到这里必然开启，事件与 memories/Pinecone 流水同开同关）；
         #    - 独立 try 块：任何失败只记日志，绝不影响 memories/Pinecone 写入；
         #    - user + assistant 两条事件一次批量 insert（同一请求原子落库）。
+        _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             import uuid as _uuid
             import hashlib as _hashlib
@@ -1218,8 +1219,7 @@ async def async_telegram_polling():
                 # 统一用户隔离 ID：复用全项目唯一解析规则（USER_ID → MEM0_USER_ID → default）
                 _ev_uid = _srv_ev._resolve_pinecone_user_id()
                 # ⚠️ timestamptz 列必须写显式带时区 ISO；紧邻上方 memories 写入取得，
-                #    保证跨表时间线可对账
-                _ev_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                #    保证跨表时间线可对账。_ev_now 在本段 try 之前已取值，供 memo 排除本轮。
                 _ev_rows = [
                     {
                         "user_id": _ev_uid,
@@ -1264,28 +1264,11 @@ async def async_telegram_polling():
             if _mm_tg.memo_enabled() and text and reply:
                 _mm_silence = 0.0
                 try:
-                    _now_utc = datetime.datetime.now(datetime.timezone.utc)
-                    _prev = await asyncio.to_thread(
-                        lambda: supabase.table("memories").select("created_at")
-                        .eq("tags", "TG_MSG")
-                        .order("created_at", desc=True).limit(6).execute())
-                    for _row in (getattr(_prev, "data", None) or []):
-                        _ca = _row.get("created_at")
-                        if not _ca:
-                            continue
-                        try:
-                            _last_dt = datetime.datetime.fromisoformat(
-                                str(_ca).replace("Z", "+00:00"))
-                            if _last_dt.tzinfo is None:
-                                _last_dt = _last_dt.replace(tzinfo=datetime.timezone.utc)
-                        except Exception:
-                            continue
-                        # 跳过本轮刚写入的流水（2 分钟内），取更早一条算沉默
-                        if (_now_utc - _last_dt).total_seconds() < 120:
-                            continue
-                        _mm_silence = max(0.0, round(
-                            (_now_utc - _last_dt).total_seconds() / 3600, 1))
-                        break
+                    import server as _srv_mm_sil
+                    _mm_silence = await _mm_tg.hours_since_last_chat_event(
+                        _srv_mm_sil.supabase_service,
+                        _srv_mm_sil._resolve_pinecone_user_id(),
+                        before_iso=_ev_now)
                 except Exception:
                     _mm_silence = 0.0
                 _mm_tg.schedule_memo_generation(

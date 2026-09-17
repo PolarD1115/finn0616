@@ -10,6 +10,7 @@
   D. 同 subject_key 去重 → superseded
   E. 门控关闭零行为
   F. 只操作 memory_type=memo
+  I. 沉默时长查 memory_events（排除本轮 / background）
 
 运行：  python -m unittest test_memory_memo_phaseD1 -v
 """
@@ -212,6 +213,77 @@ class TestMemoPhaseD1(unittest.TestCase):
             supabase_service=fake, user_id="u"))
         self.assertEqual(r["error_code"], "EMPTY_MEMO")
         self.assertEqual(len(fake.items), 0)
+
+    def test_i_hours_from_memory_events(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        before = now.isoformat()
+        fake = EventsFake([
+            {"user_id": "u1", "role": "user", "channel": "web",
+             "occurred_at": (now - datetime.timedelta(hours=8, minutes=6)).isoformat()},
+            {"user_id": "u1", "role": "assistant", "channel": "background",
+             "occurred_at": (now - datetime.timedelta(hours=1)).isoformat()},
+            {"user_id": "u1", "role": "user", "channel": "web",
+             "occurred_at": before},  # 本轮，应被 before_iso 排除
+            {"user_id": "other", "role": "user", "channel": "qq",
+             "occurred_at": (now - datetime.timedelta(hours=20)).isoformat()},
+        ])
+        hours = _run(mm.hours_since_last_chat_event(fake, "u1", before_iso=before))
+        self.assertGreaterEqual(hours, 8.0)
+        self.assertLess(hours, 8.3)
+
+    def test_j_hours_no_events_is_zero(self):
+        self.assertEqual(_run(mm.hours_since_last_chat_event(None, "u1")), 0.0)
+        fake = EventsFake([])
+        self.assertEqual(
+            _run(mm.hours_since_last_chat_event(fake, "u1", before_iso="2026-09-17T12:00:00+00:00")),
+            0.0)
+
+
+class EventsFake:
+    """只读 fake：支撑 hours_since_last_chat_event 的 select/eq/in_/lt/order/limit。"""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def table(self, name):
+        assert name == "memory_events"
+        return _EventsQ(self)
+
+
+class _EventsQ:
+    def __init__(self, owner):
+        self._owner = owner
+        self._path = []
+
+    def _rec(self, method, *a, **k):
+        self._path.append((method, a, k))
+        return self
+
+    def select(self, *a, **k): return self._rec("select", *a, **k)
+    def eq(self, *a, **k): return self._rec("eq", *a, **k)
+    def in_(self, *a, **k): return self._rec("in_", *a, **k)
+    def lt(self, *a, **k): return self._rec("lt", *a, **k)
+    def order(self, *a, **k): return self._rec("order", *a, **k)
+    def limit(self, *a, **k): return self._rec("limit", *a, **k)
+
+    def execute(self):
+        rows = list(self._owner.rows)
+        for method, a, _ in self._path:
+            if method == "eq":
+                col, val = a[0], a[1]
+                rows = [r for r in rows if r.get(col) == val]
+            elif method == "in_":
+                col, vals = a[0], list(a[1])
+                rows = [r for r in rows if r.get(col) in vals]
+            elif method == "lt":
+                col, val = a[0], a[1]
+                rows = [r for r in rows if str(r.get(col) or "") < str(val)]
+        if any(m == "order" for m, _, _ in self._path):
+            rows = sorted(rows, key=lambda r: r.get("occurred_at") or "", reverse=True)
+        lim = next((a[0] for m, a, _ in self._path if m == "limit"), None)
+        if lim is not None:
+            rows = rows[:lim]
+        return FakeResult([dict(r) for r in rows])
 
 
 if __name__ == "__main__":
