@@ -30,6 +30,22 @@
 
 ## 📦 变更日志
 
+### 课程表功能（2026-09-17）
+
+**内容**：
+- migrations/20260916_001_courses.sql：新增 courses 表（课程名/教师/地点/星期 1-7/起止节次 1-12/颜色），RLS deny-by-default + REVOKE anon，读写走 service_role（已通过 Supabase MCP 执行）
+- gateway.py：新增 /api/courses CRUD（GET 列表 / POST 创建 / GET 详情 / PATCH 更新 / DELETE 删除），服务端字段校验 + 同星期节次重叠冲突检测（409 中文报错）；_inject_context（网页 /v1）新增「📚 课程注入」段
+- server.py：新增 fetch_courses_for_injection()，北京时区取今日+明日课程，格式化后注入 volatile_block；5 分钟内存缓存（按北京日期跨天强制失效）；COURSE_INJECT=false 可关；查询失败静默降级不影响聊天；_build_channel_context（QQ/TG）同步加课程注入
+- console.html：新增「课程表」页（周视图网格：7 列 × 12 节，彩色课程块支持跨节显示），支持新增/编辑/删除，冲突时 toast 展示后端中文报错；窄屏可横向滚动
+- miniapp.html：新增「课程表」页（按天分组列表 + 今日/明日徽标 + 今明摘要行 + 进入自动滚动到今天），底部抽屉式编辑 modal，与 console 共用同一后端数据
+- VARIABLES.md：新增 COURSE_INJECT 文档
+
+**验证**：
+- API 联调：建课/冲突 409/列表/详情/更新/删除全部通过（本地 18765 实例）
+- 注入：fetch_courses_for_injection() 输出今日+明日格式化课程文本；COURSE_INJECT=false 返回 None；端到端 /v1/chat/completions 后 /api/prompts 快照 volatile_block 含「📚 今日课程」
+- console UI：新增/编辑/删除/跨节块/409 冲突提示/前端节次校验/375px 横向滚动全部通过，无 JS 报错
+- miniapp UI：今日/明日徽标/摘要行/编辑抽屉/409 提示/前端校验/自动滚动到今天/与 console 数据互通全部通过，无 JS 报错
+
 ### Phase 5 — 旧 Pinecone assistant 混合向量隔离（2026-08-25）
 **性质**：召回结果隔离，不是数据删除。旧向量仍保留在 Pinecone 中。
 

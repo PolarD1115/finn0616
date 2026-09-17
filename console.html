@@ -249,6 +249,36 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
 .pet-info .row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line-soft);padding:3px 0;}
 .pet-info .k{color:var(--sub);}
 .pet-info .v{color:var(--txt);font-weight:500;}
+
+/* ===== 课程表网格 ===== */
+.course-head{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap;}
+.course-head h2{margin:0;font-size:16px;font-weight:700;color:var(--txt);letter-spacing:.3px;}
+.course-head .sp{flex:1;}
+.course-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--paper);
+  box-shadow:0 1px 6px rgba(120,95,55,.05);}
+.course-grid{display:grid;grid-template-columns:44px repeat(7,1fr);grid-template-rows:44px repeat(12,56px);
+  min-width:720px;position:relative;}
+.course-grid .cs-corner{background:var(--paper2);border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);}
+.course-grid .cs-hd{display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:600;
+  color:var(--txt);background:var(--paper2);border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);}
+.course-grid .cs-slot{display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--faint);
+  background:var(--paper);border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);}
+.course-grid .cs-cell{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);background:var(--paper);}
+.course-grid .cs-block{margin:1px;border-radius:8px;padding:6px;font-size:11px;line-height:1.35;color:#fff;
+  overflow:hidden;cursor:pointer;z-index:1;display:flex;flex-direction:column;gap:1px;min-height:0;}
+.course-grid .cs-block .cs-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.course-grid .cs-block > div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cs-blue{background:#5b8def;}
+.cs-pink{background:#ef7ba9;}
+.cs-purple{background:#8b7bd8;}
+.cs-gray{background:#6b7a99;}
+.cs-orange{background:#f0a35e;}
+.cs-green{background:#4fbf8f;}
+.cs-color-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 4px;}
+button.cs-swatch{width:28px;height:28px;border-radius:50%;padding:0;border:2px solid transparent;box-shadow:none;
+  min-width:28px;}
+button.cs-swatch.on{border-color:var(--txt);box-shadow:0 0 0 2px var(--paper),0 0 0 4px rgba(59,50,39,.25);}
+.btn-row .cs-del{margin-right:auto;}
 </style>
 </head>
 <body>
@@ -276,6 +306,7 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
       <a data-p="ticks"><i data-lucide="paw-print"></i>状态面板</a>
       <a data-p="prompts"><i data-lucide="scroll-text"></i>注入提示词</a>
       <a data-p="todos"><i data-lucide="list-checks"></i>AI 待办</a>
+      <a data-p="courses"><i data-lucide="calendar-days"></i>课程表</a>
     </nav>
     <div class="foot">v5.0 · 桌面控制台</div>
   </aside>
@@ -612,6 +643,16 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
           <div id="todoList"></div>
         </div>
       </section>
+
+      <!-- ===== 课程表 ===== -->
+      <section class="page" id="p-courses">
+        <div class="course-head">
+          <h2><i data-lucide="calendar-days" style="width:18px;height:18px;vertical-align:-3px"></i> 课程表</h2>
+          <span class="sp"></span>
+          <button onclick="openCourseModal(null)"><i data-lucide="plus"></i>添加课程</button>
+        </div>
+        <div class="course-wrap"><div class="course-grid" id="courseGrid"></div></div>
+      </section>
     </div>
   </div>
 </div>
@@ -626,7 +667,7 @@ td.actions button{padding:5px 9px;font-size:11.5px;}
  * ============================================================ */
 const IS_FILE_PROTOCOL = location.protocol === "file:";
 const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
-const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词",todos:"AI 待办"};
+const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词",todos:"AI 待办",courses:"课程表"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
@@ -687,7 +728,7 @@ function showPage(name){
   document.querySelectorAll(".nav a").forEach(a=>a.classList.toggle("active",a.dataset.p===name));
   document.getElementById("pageTitle").textContent=PAGE_TITLES[name];
   if(window.innerWidth<=1024)document.getElementById("sidebar").classList.remove("open");
-  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts,todos:loadTodos};
+  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts,todos:loadTodos,courses:loadCourses};
   if(loaders[name])loaders[name]();
   // 自动刷新
   if(name==="ticks"){
@@ -1907,6 +1948,127 @@ async function cancelTodo(id){
     if(!d)return;
     toast("已取消","ok");
     loadTodos();
+  }catch(e){toast(e.message,"err");}
+}
+
+/* ============ 课程表 ===== */
+let _courseItems=[];
+const COURSE_COLORS=["blue","pink","purple","gray","orange","green"];
+const COURSE_WEEKDAYS=["周一","周二","周三","周四","周五","周六","周日"];
+function courseSafeId(c){return String(c&&c.id||"").replace(/[^0-9a-fA-F-]/g,"").slice(0,64);}
+function courseColorClass(c){
+  const v=String(c||"blue").toLowerCase();
+  return COURSE_COLORS.includes(v)?"cs-"+v:"cs-blue";
+}
+async function loadCourses(){
+  try{
+    const d=await api("/api/courses");
+    if(!d)return;
+    _courseItems=Array.isArray(d.items)?d.items:[];
+    renderCourseGrid();
+  }catch(e){
+    document.getElementById("courseGrid").innerHTML='<div class="empty" style="grid-column:1/-1;padding:24px">'+esc(e.message)+'</div>';
+  }
+}
+function renderCourseGrid(){
+  const grid=document.getElementById("courseGrid");
+  if(!grid)return;
+  let html='<div class="cs-corner" style="grid-column:1;grid-row:1"></div>';
+  COURSE_WEEKDAYS.forEach((n,i)=>{
+    html+='<div class="cs-hd" style="grid-column:'+(i+2)+';grid-row:1">'+n+'</div>';
+  });
+  for(let s=1;s<=12;s++){
+    html+='<div class="cs-slot" style="grid-column:1;grid-row:'+(s+1)+'">'+s+'</div>';
+    for(let w=1;w<=7;w++){
+      html+='<div class="cs-cell" style="grid-column:'+(w+1)+';grid-row:'+(s+1)+'"></div>';
+    }
+  }
+  _courseItems.forEach(c=>{
+    const wd=parseInt(c.weekday,10), st=parseInt(c.start_slot,10), en=parseInt(c.end_slot,10);
+    if(!(wd>=1&&wd<=7&&st>=1&&st<=12&&en>=st&&en<=12))return;
+    const span=en-st+1;
+    const id=courseSafeId(c);
+    const teacher=String(c.teacher||"").trim();
+    const loc=String(c.location||"").trim();
+    let inner='<div class="cs-name">'+esc(c.name||"")+'</div>';
+    if(teacher)inner+='<div>'+esc(teacher)+'</div>';
+    if(loc)inner+='<div>@'+esc(loc)+'</div>';
+    html+='<div class="cs-block '+courseColorClass(c.color)+'" style="grid-column:'+(wd+1)+';grid-row:'+(st+1)+' / span '+span+'" onclick="openCourseModal(\''+id+'\')" title="'+esc(c.name||'')+'">'+inner+'</div>';
+  });
+  grid.innerHTML=html;
+  refreshIcons();
+}
+function pickCourseColor(c){
+  const v=COURSE_COLORS.includes(c)?c:"blue";
+  const hid=document.getElementById("csColor");
+  if(hid)hid.value=v;
+  document.querySelectorAll("#csColorRow .cs-swatch").forEach(el=>{
+    el.classList.toggle("on",el.dataset.c===v);
+  });
+}
+function openCourseModal(id){
+  const c=id?_courseItems.find(x=>courseSafeId(x)===id):null;
+  const color=c?(COURSE_COLORS.includes(c.color)?c.color:"blue"):"blue";
+  const wd=c?parseInt(c.weekday,10):1;
+  const st=c?parseInt(c.start_slot,10):1;
+  const en=c?parseInt(c.end_slot,10):2;
+  const wdOpts=COURSE_WEEKDAYS.map((n,i)=>'<option value="'+(i+1)+'" '+(wd===(i+1)?"selected":"")+'>'+n+'</option>').join("");
+  const slotOpts=(sel)=>Array.from({length:12},(_,i)=>'<option value="'+(i+1)+'" '+(sel===(i+1)?"selected":"")+'>'+(i+1)+'</option>').join("");
+  const swatches=COURSE_COLORS.map(col=>
+    '<button type="button" class="cs-swatch cs-'+col+(col===color?" on":"")+'" data-c="'+col+'" onclick="pickCourseColor(\''+col+'\')" title="'+col+'"></button>'
+  ).join("");
+  const delBtn=c?'<button class="danger cs-del" onclick="delCourse(\''+courseSafeId(c)+'\')"><i data-lucide="trash-2"></i>删除</button>':"";
+  const html='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">'+
+    '<h3>'+(c?"编辑课程":"添加课程")+'<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3>'+
+    '<label>课程名（必填）</label><input id="csName" maxlength="100" value="'+esc(c?(c.name||""):"")+'" placeholder="如：毛概"/>'+
+    '<div class="row2"><div><label>教师</label><input id="csTeacher" maxlength="100" value="'+esc(c?(c.teacher||""):"")+'"/></div>'+
+    '<div><label>地点</label><input id="csLocation" maxlength="100" value="'+esc(c?(c.location||""):"")+'"/></div></div>'+
+    '<div class="row2"><div><label>星期</label><select id="csWeekday">'+wdOpts+'</select></div>'+
+    '<div><label>起始节</label><select id="csStart">'+slotOpts(st)+'</select></div></div>'+
+    '<label>结束节</label><select id="csEnd">'+slotOpts(en)+'</select>'+
+    '<label>颜色</label><div class="cs-color-row" id="csColorRow">'+swatches+'</div>'+
+    '<input type="hidden" id="csColor" value="'+color+'"/>'+
+    '<div class="btn-row">'+delBtn+
+    '<button onclick="saveCourse('+(c?"'"+courseSafeId(c)+"'":"null")+')"><i data-lucide="save"></i>保存</button>'+
+    '<button class="ghost" onclick="closeModal()">取消</button></div>'+
+    '</div></div>';
+  document.getElementById("modalRoot").innerHTML=html;
+  refreshIcons();
+}
+async function saveCourse(idOrNull){
+  const name=document.getElementById("csName").value.trim();
+  const teacher=document.getElementById("csTeacher").value.trim();
+  const location=document.getElementById("csLocation").value.trim();
+  const weekday=parseInt(document.getElementById("csWeekday").value,10);
+  const start_slot=parseInt(document.getElementById("csStart").value,10);
+  const end_slot=parseInt(document.getElementById("csEnd").value,10);
+  const color=document.getElementById("csColor").value||"blue";
+  if(!name){toast("请填写课程名","err");return;}
+  if(!(end_slot>=start_slot)){toast("结束节必须 ≥ 起始节","err");return;}
+  const body={name,teacher,location,weekday,start_slot,end_slot,color};
+  try{
+    let d;
+    if(idOrNull){
+      d=await api("/api/courses/"+idOrNull,{method:"PATCH",body});
+    }else{
+      d=await api("/api/courses",{method:"POST",body});
+    }
+    if(!d)return;
+    closeModal();
+    toast("已保存","ok");
+    loadCourses();
+  }catch(e){toast(e.message,"err");}
+}
+async function delCourse(id){
+  const c=_courseItems.find(x=>courseSafeId(x)===id);
+  const nm=c?(c.name||""):"";
+  if(!confirm("确认删除课程「"+nm+"」？"))return;
+  try{
+    const d=await api("/api/courses/"+id,{method:"DELETE"});
+    if(!d)return;
+    closeModal();
+    toast("已删除","ok");
+    loadCourses();
   }catch(e){toast(e.message,"err");}
 }
 

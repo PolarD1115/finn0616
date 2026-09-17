@@ -2267,6 +2267,11 @@ class HostFixMiddleware:
             await self._handle_ai_todos_api(scope, receive, send)
             return
 
+        # ---------- ✅ 课程表 CRUD（受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/courses" or scope["path"].startswith("/api/courses/"):
+            await self._handle_courses_api(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -2991,6 +2996,17 @@ class HostFixMiddleware:
                     _log(f"📅 [Calendar] 日程已注入上下文")
             except Exception as e:
                 _log(f"⚠️ [Calendar] 日程注入失败: {e}")
+
+        # 📚 课程表注入：今日+明日课程
+        if os.environ.get("COURSE_INJECT", "true").strip().lower() == "true":
+            try:
+                from server import fetch_courses_for_injection
+                _courses = await asyncio.wait_for(fetch_courses_for_injection(), timeout=8)
+                if _courses:
+                    volatile_block += f"\n{_courses}"
+                    _log(f"📚 [Courses] 课程已注入上下文")
+            except Exception as e:
+                _log(f"⚠️ [Courses] 课程注入失败: {e}")
 
         # 🧠 阶段 D1：换窗备忘 memo（最新 1 条 active；追加到 volatile 区块）
         try:
@@ -6633,10 +6649,404 @@ class HostFixMiddleware:
         _log(f"✅ [AI待办API] 待办 {todo_id} -> {target}")
         await _send_json_resp(send, 200, {"ok": True, "todo": res.data[0]})
 
+    # ------------------------------------------
+    # ✅ 课程表 CRUD（courses 表；受 /api/* 统一鉴权）
+    #    全量列表 / 创建 / 详情 / 更新 / 物理删除；同日节次重叠返回 409。
+    # ------------------------------------------
+
+    async def _handle_courses_api(self, scope, receive, send):
+        """课程表管理 API 路由分发。
+
+        GET    /api/courses                 全量列表（按 weekday, start_slot 升序）
+        POST   /api/courses                 创建
+        GET    /api/courses/{id}            单条详情
+        PATCH  /api/courses/{id}            局部更新
+        DELETE /api/courses/{id}            物理删除
+        """
+        # 双保险鉴权：全局 /api/* 拦截已校验过，这里显式再查一次，保证本 handler 独立调用时同样安全
+        if not await _check_api_secret(scope, send):
+            return
+
+        path = scope["path"]
+        if path == "/api/courses":
+            course_id, sub = None, ""
+        elif path.startswith("/api/courses/"):
+            rest = path[len("/api/courses/"):]
+            parts = rest.split("/", 1)
+            course_id = _normalize_course_id(parts[0])
+            if course_id is None:
+                await _send_json_resp(send, 400, {"error": "课程 ID 格式不合法。"})
+                return
+            sub = parts[1] if len(parts) > 1 else ""
+            if sub:
+                await _send_json_resp(send, 404, {"error": "接口不存在。"})
+                return
+        else:
+            await _send_json_resp(send, 404, {"error": "接口不存在。"})
+            return
+
+        # courses 对 anon/authenticated REVOKE 且无 RLS 策略（迁移 deny-by-default），
+        # 读写走 service_role 客户端，与 ai_todos 等敏感表同风格；不能用 _get_supabase() 的 anon 客户端。
+        import server as _srv
+        sb = _srv.supabase_service
+        if not sb:
+            await _send_json_resp(send, 503, {"error": "数据库未配置，课程表功能暂不可用。"})
+            return
+
+        method = scope["method"]
+        if course_id is None:
+            if method == "GET":
+                await self._courses_list(send, sb)
+            elif method == "POST":
+                await self._courses_create(scope, receive, send, sb)
+            else:
+                await _send_json_resp(send, 405, {"error": "仅支持 GET / POST。"})
+            return
+
+        if method == "GET":
+            await self._courses_detail(send, sb, course_id)
+        elif method == "PATCH":
+            await self._courses_update(scope, receive, send, sb, course_id)
+        elif method == "DELETE":
+            await self._courses_delete(send, sb, course_id)
+        else:
+            await _send_json_resp(send, 405, {"error": "仅支持 GET / PATCH / DELETE。"})
+        return
+
+    async def _courses_list(self, send, sb):
+        """GET /api/courses：全量列表，按 (weekday, start_slot) 升序。"""
+        def _fetch():
+            return (
+                sb.table("courses")
+                .select("*")
+                .order("weekday", desc=False)
+                .order("start_slot", desc=False)
+                .execute()
+            )
+
+        try:
+            res = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            _log(f"⚠️ [Courses] list失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        rows = list(res.data) if res and res.data else []
+        await _send_json_resp(send, 200, {"items": rows})
+
+    async def _courses_create(self, scope, receive, send, sb):
+        """POST /api/courses：创建课程。"""
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        fields, err = _validate_course_fields(req, partial=False)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        conflict = await self._courses_find_conflict(
+            sb,
+            weekday=fields["weekday"],
+            start_slot=fields["start_slot"],
+            end_slot=fields["end_slot"],
+            exclude_id=None,
+        )
+        if isinstance(conflict, str):
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if conflict:
+            await _send_json_resp(send, 409, {"error": _course_conflict_message(conflict)})
+            return
+
+        def _insert():
+            return sb.table("courses").insert(fields).execute()
+
+        try:
+            res = await asyncio.to_thread(_insert)
+        except Exception as e:
+            _log(f"⚠️ [Courses] create失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = (res.data or [{}])[0] if res else {}
+        new_id = row.get("id", "")
+        _log(f"✅ [Courses] 已创建课程 id={new_id}")
+        await _send_json_resp(send, 200, {"ok": True, "id": new_id})
+
+    async def _courses_detail(self, send, sb, course_id):
+        """GET /api/courses/{id}：单条详情（编辑回显）。"""
+        def _get():
+            return sb.table("courses").select("*").eq("id", course_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Courses] detail失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "课程不存在。"})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "item": row})
+
+    async def _courses_update(self, scope, receive, send, sb, course_id):
+        """PATCH /api/courses/{id}：局部更新，未提供字段保持原值。"""
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        def _get():
+            return sb.table("courses").select("*").eq("id", course_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Courses] update前置查询失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "课程不存在。"})
+            return
+
+        fields, err = _validate_course_fields(req, partial=True)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+        if not fields:
+            await _send_json_resp(send, 400, {"error": "没有提供任何要更新的字段。"})
+            return
+
+        final_weekday = fields.get("weekday", row.get("weekday"))
+        final_start = fields.get("start_slot", row.get("start_slot"))
+        final_end = fields.get("end_slot", row.get("end_slot"))
+        # 合并后仍须满足 end_slot >= start_slot（可能只改一端）
+        try:
+            final_weekday = int(final_weekday)
+            final_start = int(final_start)
+            final_end = int(final_end)
+        except (TypeError, ValueError):
+            await _send_json_resp(send, 400, {"error": "weekday / start_slot / end_slot 必须是整数。"})
+            return
+        if final_end < final_start:
+            await _send_json_resp(send, 400, {"error": "end_slot 必须 ≥ start_slot。"})
+            return
+
+        conflict = await self._courses_find_conflict(
+            sb,
+            weekday=final_weekday,
+            start_slot=final_start,
+            end_slot=final_end,
+            exclude_id=course_id,
+        )
+        if isinstance(conflict, str):
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if conflict:
+            await _send_json_resp(send, 409, {"error": _course_conflict_message(conflict)})
+            return
+
+        fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        def _update():
+            return sb.table("courses").update(fields).eq("id", course_id).execute()
+
+        try:
+            res = await asyncio.to_thread(_update)
+        except Exception as e:
+            _log(f"⚠️ [Courses] update失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if not res or not res.data:
+            await _send_json_resp(send, 404, {"error": "课程不存在。"})
+            return
+        _log(f"✅ [Courses] 已更新课程 id={course_id}")
+        await _send_json_resp(send, 200, {"ok": True})
+
+    async def _courses_delete(self, send, sb, course_id):
+        """DELETE /api/courses/{id}：物理删除。"""
+        def _get():
+            return sb.table("courses").select("id").eq("id", course_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Courses] delete前置查询失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if not (res and res.data):
+            await _send_json_resp(send, 404, {"error": "课程不存在。"})
+            return
+
+        def _delete():
+            return sb.table("courses").delete().eq("id", course_id).execute()
+
+        try:
+            await asyncio.to_thread(_delete)
+        except Exception as e:
+            _log(f"⚠️ [Courses] delete失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        _log(f"✅ [Courses] 已删除课程 id={course_id}")
+        await _send_json_resp(send, 200, {"ok": True})
+
+    async def _courses_find_conflict(self, sb, weekday, start_slot, end_slot, exclude_id=None):
+        """查同 weekday 且节次区间重叠的课程。
+
+        重叠条件：已有.start_slot <= new.end_slot AND 已有.end_slot >= new.start_slot。
+        成功返回冲突行 dict 或 None；查询失败返回字符串 \"error\"（调用方记日志后回 500）。
+        """
+        def _query():
+            q = (
+                sb.table("courses")
+                .select("id,name,weekday,start_slot,end_slot")
+                .eq("weekday", weekday)
+                .lte("start_slot", end_slot)
+                .gte("end_slot", start_slot)
+            )
+            if exclude_id:
+                q = q.neq("id", exclude_id)
+            return q.limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_query)
+        except Exception as e:
+            _log(f"⚠️ [Courses] 冲突检测失败: {e}")
+            return "error"
+        if res and res.data:
+            return res.data[0]
+        return None
+
 
 # ==========================================
 # 辅助函数
 # ==========================================
+
+# ---------- ✅ 课程表 API 辅助 ----------
+
+_COURSE_COLORS = frozenset({"blue", "pink", "purple", "gray", "orange", "green"})
+_COURSE_WEEKDAY_CN = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "日"}
+
+
+def _normalize_course_id(raw_key: str):
+    """校验 courses 路径参数 id（合法 UUID）。合法返回 id 字符串，非法返回 None。"""
+    import uuid as _uuid
+    from urllib.parse import unquote as _unquote
+    try:
+        tid = _unquote(raw_key or "")
+    except Exception:
+        return None
+    tid = (tid or "").strip()
+    if not tid or len(tid) > 64 or "/" in tid or "\\" in tid or "%" in tid:
+        return None
+    try:
+        _uuid.UUID(tid)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return tid
+
+
+def _course_conflict_message(row: dict) -> str:
+    """生成 409 冲突文案。"""
+    name = str(row.get("name") or "")
+    w = int(row.get("weekday") or 0)
+    a = int(row.get("start_slot") or 0)
+    b = int(row.get("end_slot") or 0)
+    cn = _COURSE_WEEKDAY_CN.get(w, str(w))
+    return f"与已有课程「{name}」时间冲突（周{cn} 第{a}-{b}节）"
+
+
+def _validate_course_fields(req: dict, partial: bool):
+    """校验课程字段。成功返回 (fields_dict, \"\")；失败返回 (None, 中文错误)。
+
+    partial=False（POST）：name/weekday/start_slot/end_slot 必填，其余有默认。
+    partial=True（PATCH）：只校验出现的字段；未出现的不写入返回 dict。
+    """
+    if not isinstance(req, dict):
+        return None, "请求体必须是 JSON 对象。"
+
+    out = {}
+
+    def _text(v):
+        if v is None:
+            return ""
+        return v if isinstance(v, str) else str(v)
+
+    def _require_int(field, v, lo, hi):
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None, f"{field} 必须是 {lo}-{hi} 的整数。"
+        if v < lo or v > hi:
+            return None, f"{field} 必须是 {lo}-{hi} 的整数。"
+        return v, ""
+
+    if (not partial) or ("name" in req):
+        name = _text(req.get("name")).strip()
+        if not name:
+            return None, "name 不能为空。"
+        if len(name) > 100:
+            return None, "name 长度不能超过 100。"
+        out["name"] = name
+
+    if (not partial) or ("weekday" in req):
+        if "weekday" not in req and not partial:
+            return None, "weekday 必须是 1-7 的整数。"
+        if "weekday" in req:
+            v, e = _require_int("weekday", req.get("weekday"), 1, 7)
+            if e:
+                return None, e
+            out["weekday"] = v
+
+    has_start = (not partial) or ("start_slot" in req)
+    has_end = (not partial) or ("end_slot" in req)
+    start_slot = end_slot = None
+    if has_start:
+        if "start_slot" not in req and not partial:
+            return None, "start_slot 必须是 1-12 的整数。"
+        if "start_slot" in req or not partial:
+            v, e = _require_int("start_slot", req.get("start_slot"), 1, 12)
+            if e:
+                return None, e
+            start_slot = v
+            out["start_slot"] = v
+    if has_end:
+        if "end_slot" not in req and not partial:
+            return None, "end_slot 必须是 1-12 的整数。"
+        if "end_slot" in req or not partial:
+            v, e = _require_int("end_slot", req.get("end_slot"), 1, 12)
+            if e:
+                return None, e
+            end_slot = v
+            out["end_slot"] = v
+    if start_slot is not None and end_slot is not None and end_slot < start_slot:
+        return None, "end_slot 必须 ≥ start_slot。"
+
+    if (not partial) or ("color" in req):
+        if "color" in req:
+            color = _text(req.get("color")).strip() or "blue"
+        else:
+            color = "blue"
+        if color not in _COURSE_COLORS:
+            return None, "color 必须是 blue/pink/purple/gray/orange/green 之一。"
+        out["color"] = color
+
+    if (not partial) or ("teacher" in req):
+        if "teacher" in req or not partial:
+            teacher = _text(req.get("teacher")).strip()
+            if len(teacher) > 100:
+                return None, "teacher 长度不能超过 100。"
+            out["teacher"] = teacher
+
+    if (not partial) or ("location" in req):
+        if "location" in req or not partial:
+            location = _text(req.get("location")).strip()
+            if len(location) > 100:
+                return None, "location 长度不能超过 100。"
+            out["location"] = location
+
+    return out, ""
+
 
 # ---------- ✅ AI 待办 API 辅助（阶段4） ----------
 

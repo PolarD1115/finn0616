@@ -1100,6 +1100,15 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     except Exception:
         pass
 
+    # 📚 课程表注入：QQ/TG 渠道也注入今日+明日课程
+    try:
+        if os.environ.get("COURSE_INJECT", "true").strip().lower() == "true":
+            _courses = await asyncio.wait_for(fetch_courses_for_injection(), timeout=8)
+            if _courses:
+                volatile_parts.append(_courses)
+    except Exception:
+        pass
+
     # 🧠 阶段 D1：换窗备忘 memo（最新 1 条 active；门控 MEMORY_MEMO_ENABLED 默认开）
     try:
         import memory_memo as _mm_d1
@@ -1997,6 +2006,106 @@ async def fetch_schedule_for_injection():
     result = "\n".join(lines)
     _sched_cache["text"] = result
     _sched_cache["ts"] = now_ts
+    return result
+
+
+# ==========================================
+# 📚 课程表 Prompt 注入（供 gateway._inject_context / _build_channel_context 调用）
+#    查询今日 + 明日的 courses，格式化后注入 volatile_block。
+#    查不到 / 未配置 / 关闭开关时返回 None（静默降级，绝不影响正常聊天）。
+# ==========================================
+_course_cache = {"text": None, "ts": 0, "day": None}
+_COURSE_CACHE_TTL = 300  # 5 分钟；跨北京日期强制失效
+_COURSE_WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+async def fetch_courses_for_injection():
+    """查询今日与明日课程，返回格式化文本供 prompt 注入。
+    无课 / 未配置 / 查询失败时返回 None（静默降级，不影响正常聊天）。"""
+    if os.environ.get("COURSE_INJECT", "true").strip().lower() != "true":
+        return None
+
+    if not supabase_service:
+        return None
+
+    _tz_bj = datetime.timezone(datetime.timedelta(hours=8))
+    now_bj = datetime.datetime.now(_tz_bj)
+    today = now_bj.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    today_str = today.isoformat()
+    now_ts = time.time()
+
+    # 缓存命中：同日且未过期（含 text=None 的「今天没课」结果，避免空结果反复打库）
+    if (
+        _course_cache["day"] == today_str
+        and (now_ts - _course_cache["ts"]) < _COURSE_CACHE_TTL
+    ):
+        return _course_cache["text"]
+
+    wd_today = today.isoweekday()
+    wd_tomorrow = tomorrow.isoweekday()
+
+    try:
+        def _fetch():
+            return (
+                supabase_service.table("courses")
+                .select("*")
+                .in_("weekday", [wd_today, wd_tomorrow])
+                .execute()
+            )
+
+        res = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        try:
+            import gateway as _gw
+            _gw._log(f"⚠️ [Courses] 课程查询失败: {e}")
+        except Exception:
+            pass
+        return None
+
+    rows = list(res.data) if res and res.data else []
+    rows.sort(key=lambda r: (int(r.get("weekday") or 0), int(r.get("start_slot") or 0)))
+
+    def _fmt_day(label: str, day, weekday: int) -> str:
+        day_rows = [r for r in rows if int(r.get("weekday") or 0) == weekday]
+        if not day_rows:
+            return ""
+        cn = _COURSE_WEEKDAY_CN[weekday - 1]
+        date_str = day.strftime("%m-%d")
+        lines = [f"📚 {label}课程（{cn} {date_str}）："]
+        for r in day_rows:
+            try:
+                start_slot = int(r.get("start_slot"))
+                end_slot = int(r.get("end_slot"))
+            except (TypeError, ValueError):
+                continue
+            if start_slot == end_slot:
+                slot_txt = f"第{start_slot}节"
+            else:
+                slot_txt = f"第{start_slot}-{end_slot}节"
+            name = str(r.get("name") or "").strip() or "未命名课程"
+            loc = str(r.get("location") or "").strip()
+            teacher = str(r.get("teacher") or "").strip()
+            line = f"  · {slot_txt} {name}"
+            if loc:
+                line += f" @{loc}"
+            if teacher:
+                line += f"（{teacher}）"
+            lines.append(line)
+        return "\n".join(lines)
+
+    parts = []
+    today_block = _fmt_day("今日", today, wd_today)
+    if today_block:
+        parts.append(today_block)
+    tomorrow_block = _fmt_day("明日", tomorrow, wd_tomorrow)
+    if tomorrow_block:
+        parts.append(tomorrow_block)
+
+    result = "\n".join(parts) if parts else None
+    _course_cache["text"] = result
+    _course_cache["ts"] = now_ts
+    _course_cache["day"] = today_str
     return result
 
 
