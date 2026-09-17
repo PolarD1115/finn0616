@@ -2017,6 +2017,30 @@ async def fetch_schedule_for_injection():
 _course_cache = {"text": None, "ts": 0, "day": None}
 _COURSE_CACHE_TTL = 300  # 5 分钟；跨北京日期强制失效
 _COURSE_WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+# 本校作息（每节 40 分钟）；9–12 暂无晚课，未录入钟点时注入文案只写节次
+_COURSE_SLOT_TIMES = {
+    1: ("08:20", "09:00"),
+    2: ("09:10", "09:50"),
+    3: ("10:10", "10:50"),
+    4: ("11:00", "11:40"),
+    5: ("14:30", "15:10"),
+    6: ("15:20", "16:00"),
+    7: ("16:10", "16:50"),
+    8: ("17:00", "17:40"),
+}
+
+
+def _course_slot_label(start_slot: int, end_slot: int) -> str:
+    """节次文案；有作息表时附带起止钟点，如 第1-2节（08:20-09:50）。"""
+    if start_slot == end_slot:
+        slot_txt = f"第{start_slot}节"
+    else:
+        slot_txt = f"第{start_slot}-{end_slot}节"
+    t0 = _COURSE_SLOT_TIMES.get(start_slot)
+    t1 = _COURSE_SLOT_TIMES.get(end_slot)
+    if t0 and t1:
+        slot_txt += f"（{t0[0]}-{t1[1]}）"
+    return slot_txt
 
 
 async def fetch_courses_for_injection():
@@ -2079,10 +2103,7 @@ async def fetch_courses_for_injection():
                 end_slot = int(r.get("end_slot"))
             except (TypeError, ValueError):
                 continue
-            if start_slot == end_slot:
-                slot_txt = f"第{start_slot}节"
-            else:
-                slot_txt = f"第{start_slot}-{end_slot}节"
+            slot_txt = _course_slot_label(start_slot, end_slot)
             name = str(r.get("name") or "").strip() or "未命名课程"
             loc = str(r.get("location") or "").strip()
             teacher = str(r.get("teacher") or "").strip()
