@@ -112,6 +112,10 @@ class TestMemoPhaseD1(unittest.TestCase):
         self.assertTrue(mm.should_generate_memo(session_changed=True, silence_hours=0))
         # Web session_id=None  alone 不触发
         self.assertFalse(mm.should_generate_memo(session_id=None, silence_hours=0))
+        prompt = mm.build_memo_prompt("hi", "hello")
+        self.assertIn("上次聊到", prompt)
+        self.assertIn("对方状态", prompt)
+        self.assertNotIn("建议", prompt)
 
     def test_b_gate_off(self):
         os.environ["MEMORY_MEMO_ENABLED"] = "false"
@@ -138,6 +142,7 @@ class TestMemoPhaseD1(unittest.TestCase):
         self.assertEqual(item["status"], "active")
         self.assertEqual(item["source"], mm.SOURCE)
         self.assertEqual(item["subject_key"], mm.MEMO_SUBJECT_KEY)
+        self.assertNotIn("建议", item["content"])
         self.assertIsNotNone(item["expires_at"])
         exp = datetime.datetime.fromisoformat(item["expires_at"])
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -174,6 +179,7 @@ class TestMemoPhaseD1(unittest.TestCase):
         })
         self.assertIn("【上次交接备忘】", block)
         self.assertIn("上次聊到", block)
+        self.assertNotIn("建议", block)
 
         fake = FakeService()
         fake.items.append({
@@ -186,6 +192,7 @@ class TestMemoPhaseD1(unittest.TestCase):
         txt = _run(mm.inject_memo_text(fake, "u1"))
         self.assertIn("【上次交接备忘】", txt)
         self.assertIn("咖啡", txt)
+        self.assertNotIn("建议", txt)
 
     def test_f_inject_gate_off(self):
         os.environ["MEMORY_MEMO_ENABLED"] = "false"

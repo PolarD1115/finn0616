@@ -136,11 +136,23 @@ def should_generate_memo(*, silence_hours: float | None = None,
     return sh > memo_silence_hours()
 
 
+_SUGGEST_LINE_RE = re.compile(r"^建议\s*[：:].*$", re.MULTILINE)
+
+
+def _strip_suggest_lines(text: str) -> str:
+    """去掉「建议：」行（生成侧不再要求；注入时也滤掉旧 memo）。"""
+    if not text:
+        return ""
+    cleaned = _SUGGEST_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def format_memo_block(memo_row: dict) -> str:
     """把 memo 行格式化为 volatile 注入段。"""
     content = ""
     if isinstance(memo_row, dict):
         content = str(memo_row.get("content") or "").strip()
+    content = _strip_suggest_lines(content)
     if not content:
         return ""
     # 若模型已按结构化输出，原样包标题；否则整段作为「上次聊到」
@@ -194,9 +206,10 @@ def build_memo_prompt(user_msg: str, ai_msg: str, *,
         f"你是会话交接备忘生成器。根据本轮对话，写一条给下次新窗口用的交接纸条。\n"
         f"身份：对话中的「对方/用户」是「{user_name}」本人；你是「{ai_name}」。\n"
         f"禁止把「{user_name}」写成用户身边的第三人，禁止把 {ai_name} 写成「用户」。\n"
-        f"要求：只输出纯文本，按下面四行格式（每行一句，简洁）：\n"
-        f"上次聊到：…\n未完成：…\n对方状态：…\n建议：…\n"
-        f"「对方」=「{user_name}」。不要 Markdown，不要 JSON，不要角色前缀。\n\n"
+        f"要求：只输出纯文本，按下面三行格式（每行一句，简洁）：\n"
+        f"上次聊到：…\n未完成：…\n对方状态：…\n"
+        f"不要输出其它行。不要 Markdown，不要 JSON，不要角色前缀。\n"
+        f"「对方」=「{user_name}」。\n\n"
         f"【本轮对话】\n{user_name}：{(user_msg or '')[:800]}\n"
         f"{ai_name}：{(ai_msg or '')[:800]}\n"
     )
@@ -217,15 +230,16 @@ def _parse_memo_content(raw: str) -> str | None:
             if isinstance(obj, dict):
                 parts = []
                 mapping = (("上次聊到", "topic"), ("未完成", "todo"),
-                           ("对方状态", "mood"), ("建议", "suggest"))
+                           ("对方状态", "mood"))
                 for label, key in mapping:
                     val = obj.get(label) or obj.get(key) or ""
                     if val:
                         parts.append(f"{label}：{val}")
                 if parts:
-                    return "\n".join(parts)
+                    text = "\n".join(parts)
         except Exception:
             pass
+    text = _strip_suggest_lines(text)
     # 确保至少有一行有用内容
     if len(text) < 4:
         return None
