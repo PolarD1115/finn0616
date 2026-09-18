@@ -375,6 +375,7 @@ th,td{padding:10px 9px;}
       <a data-p="prompts"><i data-lucide="scroll-text"></i>注入提示词</a>
       <a data-p="aitodos"><i data-lucide="list-checks"></i>AI 待办</a>
       <a data-p="courses"><i data-lucide="calendar-days"></i>课程表</a>
+      <a data-p="period"><i data-lucide="moon"></i>经期</a>
     </nav>
     <div class="foot">v5.0 · Mini App</div>
   </aside>
@@ -719,6 +720,19 @@ th,td{padding:10px 9px;}
           <div id="courseGrid"></div>
         </div>
       </section>
+      <!-- ===== 经期记录 ===== -->
+      <section class="page" id="p-period">
+        <div class="card">
+          <h3><i data-lucide="moon" style="width:16px;height:16px"></i>经期记录
+            <button class="ghost" style="float:right" onclick="loadPeriod()"><i data-lucide="refresh-cw"></i>刷新</button>
+            <button class="ghost" style="float:right;margin-right:6px" onclick="openPeriodModal(null)"><i data-lucide="plus"></i>记录</button></h3>
+          <div id="periodStatusCard"></div>
+        </div>
+        <div class="card">
+          <h3>历史记录</h3>
+          <div id="periodList"></div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -733,7 +747,7 @@ th,td{padding:10px 9px;}
  * ============================================================ */
 const IS_FILE_PROTOCOL = location.protocol === "file:";
 const ORIGIN = IS_FILE_PROTOCOL ? "http://localhost:10000" : location.origin;
-const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词",aitodos:"AI 待办",courses:"课程表"};
+const PAGE_TITLES = {overview:"系统概览",models:"模型设置",channels:"消息渠道",emotion:"情绪与欲望",memories:"记忆库",home:"家",logs:"行动日志",diary:"秘密日记",profile:"用户画像",storage:"上下文与存储",ticks:"状态面板",prompts:"注入提示词",aitodos:"AI 待办",courses:"课程表",period:"经期记录"};
 let _pollers = {};
 
 /* ---- 工具 ---- */
@@ -798,7 +812,7 @@ function showPage(name){
   document.querySelector(".topbar").classList.remove("config-open");
   const sbWrap=document.getElementById("sbConfigWrap");
   if(sbWrap)sbWrap.classList.toggle("mobile-visible",name==="ticks");
-  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts,aitodos:loadAiTodos,courses:loadCourses};
+  const loaders={overview:loadOverview,models:loadModels,channels:loadChannels,emotion:loadEmotion,memories:loadMemories,home:loadHome,logs:loadLogs,diary:loadDiary,profile:loadProfile,storage:loadStorage,ticks:loadStatus,prompts:loadPrompts,aitodos:loadAiTodos,courses:loadCourses,period:loadPeriod};
   if(loaders[name])loaders[name]();
   // 自动刷新
   if(name==="ticks"){
@@ -2189,6 +2203,145 @@ async function delCourse(id){
     closeModal();
     toast("已删除","ok");
     loadCourses();
+  }catch(e){toast(e.message,"err");}
+}
+
+/* ============ 经期记录（移动端） ===== */
+let _periodItems=[];
+let _periodStatus=null;
+const PERIOD_FLOWS={light:"量少",medium:"正常",heavy:"量多"};
+const PERIOD_PHASES={"经期":"🩸","卵泡期":"🌱","排卵期":"🌸","黄体期":"🍂","未知":"❓"};
+
+function periodSafeId(r){return String(r&&r.id||"").replace(/[^0-9a-fA-F-]/g,"").slice(0,64);}
+
+async function loadPeriod(){
+  try{
+    const [listRes,statusRes]=await Promise.all([
+      api("/api/period/records"),
+      api("/api/period/status")
+    ]);
+    if(!listRes||!statusRes)return;
+    _periodItems=Array.isArray(listRes.items)?listRes.items:[];
+    _periodStatus=statusRes.status||null;
+    renderPeriodStatusCard();
+    renderPeriodList();
+  }catch(e){
+    const el=document.getElementById("periodStatusCard");
+    if(el)el.innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+  }
+}
+
+function renderPeriodStatusCard(){
+  const el=document.getElementById("periodStatusCard");
+  if(!el)return;
+  const s=_periodStatus;
+  if(!s||!s.record_count){
+    el.innerHTML='<div class="empty" style="text-align:center;padding:16px">还没有经期记录<br><small>点击右上角「记录」开始</small></div>';
+    return;
+  }
+  const icon=PERIOD_PHASES[s.phase]||"❓";
+  let html='<div style="text-align:center;padding:12px 0 8px">';
+  html+='<div style="font-size:42px;margin-bottom:4px">'+icon+'</div>';
+  html+='<div style="font-size:22px;font-weight:700;color:var(--txt);margin-bottom:2px">'+esc(s.phase)+'</div>';
+  html+='<div style="font-size:13px;color:var(--sub)">'+esc(s.phase_desc||"")+'</div>';
+  if(s.days_until!==null&&s.days_until!==undefined){
+    let whenTxt;
+    if(s.days_until<0)whenTxt='已过期 '+(-s.days_until)+' 天';
+    else if(s.days_until===0)whenTxt='预计今天来';
+    else whenTxt='还有 '+s.days_until+' 天';
+    html+='<div style="font-size:13px;color:var(--sub);margin-top:6px">下次预计：'+esc(s.next_date||"?")+'（'+whenTxt+'）</div>';
+  }
+  html+='<div style="display:flex;justify-content:center;gap:20px;margin-top:10px;font-size:12px;color:var(--faint)">';
+  html+='<span>平均周期 '+s.avg_cycle+' 天</span>';
+  if(s.days_since!==null&&s.days_since!==undefined)html+='<span>周期第 '+(s.days_since+1)+' 天</span>';
+  html+='<span>共 '+s.record_count+' 条记录</span>';
+  html+='</div></div>';
+  el.innerHTML=html;
+}
+
+function renderPeriodList(){
+  const el=document.getElementById("periodList");
+  if(!el)return;
+  if(!_periodItems.length){
+    el.innerHTML='<div class="empty">还没有经期记录</div>';
+    return;
+  }
+  let html="";
+  _periodItems.forEach(r=>{
+    const sd=r.start_date||"?";
+    const ed=r.end_date||"进行中";
+    let days="—";
+    if(r.start_date&&r.end_date){
+      const d1=new Date(r.start_date),d2=new Date(r.end_date);
+      days=Math.round((d2-d1)/86400000)+1;
+    }
+    const flow=PERIOD_FLOWS[r.flow]||r.flow||"";
+    const symptoms=r.symptoms||"";
+    const notes=r.notes||"";
+    const id=periodSafeId(r);
+    const meta=[flow,symptoms,notes].filter(Boolean).join(" · ");
+    html+='<div class="cs-item cs-pink" onclick="openPeriodModal(\''+id+'\')" style="cursor:pointer">';
+    html+='<div class="cs-time">'+esc(sd)+'</div>';
+    html+='<div class="cs-info"><b>'+esc(sd)+' ~ '+esc(ed)+'</b>';
+    if(days!=="—")html+='<span>'+days+' 天'+(meta?" · "+esc(meta):"")+'</span>';
+    else if(meta)html+='<span>'+esc(meta)+'</span>';
+    html+='</div></div>';
+  });
+  el.innerHTML=html;
+  refreshIcons();
+}
+
+function openPeriodModal(id){
+  const r=id?_periodItems.find(x=>periodSafeId(x)===id):null;
+  const flowOpts=["light","medium","heavy"].map(f=>
+    '<option value="'+f+'"'+(r&&r.flow===f?" selected":(!r&&f==="medium"?" selected":""))+'>'+PERIOD_FLOWS[f]+'</option>'
+  ).join("");
+  const delBtn=r?'<button class="danger cs-del" onclick="delPeriod(\''+periodSafeId(r)+'\')"><i data-lucide="trash-2"></i>删除</button>':"";
+  const html='<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">'+
+    '<h3>'+(r?"编辑经期记录":"记录经期")+'<span class="sp"></span><button class="x ghost" onclick="closeModal()">×</button></h3>'+
+    '<label>开始日期（必填）</label><input id="pdStart" type="date" value="'+esc(r?(r.start_date||""):"")+'"/>'+
+    '<label>结束日期（可空，空=进行中）</label><input id="pdEnd" type="date" value="'+esc(r?(r.end_date||""):"")+'"/>'+
+    '<label>流量</label><select id="pdFlow">'+flowOpts+'</select>'+
+    '<label>症状</label><input id="pdSymptoms" maxlength="500" value="'+esc(r?(r.symptoms||""):"")+'" placeholder="如：痛经、腰酸、乏力"/>'+
+    '<label>备注</label><input id="pdNotes" maxlength="1000" value="'+esc(r?(r.notes||""):"")+'" placeholder="自由备注"/>'+
+    '<div class="btn-row">'+delBtn+
+    '<button onclick="savePeriod('+(r?"'"+periodSafeId(r)+"'":"null")+')"><i data-lucide="save"></i>保存</button>'+
+    '<button class="ghost" onclick="closeModal()">取消</button></div>'+
+    '</div></div>';
+  document.getElementById("modalRoot").innerHTML=html;
+  refreshIcons();
+}
+
+async function savePeriod(idOrNull){
+  const start_date=document.getElementById("pdStart").value;
+  const end_date=document.getElementById("pdEnd").value||null;
+  const flow=document.getElementById("pdFlow").value;
+  const symptoms=document.getElementById("pdSymptoms").value.trim();
+  const notes=document.getElementById("pdNotes").value.trim();
+  if(!start_date){toast("请选择开始日期","err");return;}
+  if(end_date&&end_date<start_date){toast("结束日期不能早于开始日期","err");return;}
+  const body={start_date,end_date,flow,symptoms,notes};
+  try{
+    let d;
+    if(idOrNull) d=await api("/api/period/records/"+idOrNull,{method:"PATCH",body});
+    else d=await api("/api/period/records",{method:"POST",body});
+    if(!d)return;
+    closeModal();
+    toast("已保存","ok");
+    loadPeriod();
+  }catch(e){toast(e.message,"err");}
+}
+
+async function delPeriod(id){
+  const r=_periodItems.find(x=>periodSafeId(x)===id);
+  const sd=r?(r.start_date||""):"";
+  if(!confirm("确认删除 "+sd+" 的经期记录？"))return;
+  try{
+    const d=await api("/api/period/records/"+id,{method:"DELETE"});
+    if(!d)return;
+    closeModal();
+    toast("已删除","ok");
+    loadPeriod();
   }catch(e){toast(e.message,"err");}
 }
 

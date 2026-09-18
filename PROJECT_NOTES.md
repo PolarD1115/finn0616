@@ -30,6 +30,57 @@
 
 ## 📦 变更日志
 
+### 经期记录 P4 —— 双端 UI（2026-09-18）
+
+**内容**：
+- `console.html`：侧栏「经期记录」、页面（周期状态/统计/历史表）、modal 增删改、loaders/PAGE_TITLES 接入
+- `miniapp.html`：侧栏「经期」、状态卡片 + 历史列表、抽屉式 modal 增删改、与 console 共用 `/api/period/*`
+- 无新增环境变量
+
+**验证**：
+- `/console`、`/miniapp` 响应均含 `data-p="period"`、`p-period`、`loadPeriod`
+- 浏览器：console 导航进入后状态/统计/列表正确（卵泡期、avg 28、2 条记录）；「记录经期」modal 可开
+- 浏览器：miniapp 同步显示同一数据与 modal；验证后测试记录已删除
+
+### 经期记录 P3 —— MCP 工具（2026-09-18）
+
+**内容**：
+- `server.py`：新增 4 个 MCP 工具 `add_period` / `list_periods` / `delete_period` / `get_cycle_status`
+- 辅助：`_period_today_bj` / `_period_fmt_date` / `_period_compute` / `_period_fetch_all`（周期逻辑对齐 gateway，日期按北京时间）
+- 读写走 `supabase_service`；风格对齐 `manage_ai_todo`
+- 本阶段无前端改动；无新增环境变量
+
+**验证**：
+- 语法检查通过；本地服务重启无报错
+- FastMCP 工具注册确认：`add_period` / `list_periods` / `delete_period` / `get_cycle_status` 均在工具列表中
+- 直接调用工具：add → status（单条提示不足）→ add 第二条 → list/status（avg 28、预测 10-08、卵泡期）→ delete 两条 → list 空；测试数据已清理
+
+### 经期记录 P2 —— REST API（2026-09-18）
+
+**内容**：
+- `gateway.py`：新增 `/api/period/*` 路由分发与 CRUD handler（list/create/detail/update/delete）
+- 新增 `GET /api/period/status`：基于历史记录计算当前阶段（经期/卵泡期/排卵期/黄体期）与下次预测
+- 新增模块级辅助：`_normalize_period_id` / `_validate_period_fields` / `_compute_cycle_status`
+- 风格对齐课程表：`/api/*` 统一鉴权 + handler 内双保险；读写走 `supabase_service`；校验失败返回中文错误
+- 本阶段无前端 / MCP 工具；无新增环境变量
+
+**验证**（本地 `PORT=18765`）：
+- POST 两条记录（2026-09-10、2026-08-13）成功
+- GET 列表、详情、PATCH、DELETE 均 200
+- GET `/api/period/status`：`avg_cycle=28`，`cycles=[28]`，`next_date=2026-10-08`，`days_since=8`，`phase=卵泡期`
+- 验证后已删除测试记录，表回到空
+
+### 经期记录 P1 —— 数据表迁移（2026-09-18）
+
+**内容**：
+- `migrations/20260918_001_period_tracker.sql`：新增 `public.period_records`（start_date / end_date / flow / symptoms / notes），索引 `idx_period_records_start_date`，RLS deny-by-default + REVOKE anon/authenticated，读写仅走 service_role
+- 本阶段仅数据层；未实现 REST API、前端、MCP 工具或调度逻辑
+- 无新增环境变量
+
+**验证**：
+- 已通过 Supabase MCP `apply_migration` 执行成功
+- `list_tables` / `information_schema` 确认 `period_records` 已创建，RLS 开启，列与约束符合迁移脚本
+
 ### 课程表功能（2026-09-17）
 
 **内容**：

@@ -2292,6 +2292,11 @@ class HostFixMiddleware:
             await self._handle_courses_api(scope, receive, send)
             return
 
+        # ---------- ✅ 经期记录 CRUD（受 /api/* 统一鉴权） ----------
+        if scope["path"] == "/api/period" or scope["path"].startswith("/api/period/"):
+            await self._handle_period_api(scope, receive, send)
+            return
+
         # ---------- 兜底其余请求 (Host Fix → 下游 MCP) ----------
         headers = dict(scope.get("headers", []))
         headers[b"host"] = b"localhost:8000"
@@ -6923,6 +6928,245 @@ class HostFixMiddleware:
             return res.data[0]
         return None
 
+    # ------------------------------------------
+    # ✅ 经期记录 CRUD（period_records 表；受 /api/* 统一鉴权）
+    #    全量列表 / 创建 / 详情 / 更新 / 物理删除 / 周期状态
+    # ------------------------------------------
+
+    async def _handle_period_api(self, scope, receive, send):
+        """经期记录管理 API 路由分发。
+
+        GET    /api/period/records            全量列表（按 start_date 倒序）
+        POST   /api/period/records            创建
+        GET    /api/period/records/{id}       单条详情
+        PATCH  /api/period/records/{id}       局部更新
+        DELETE /api/period/records/{id}       物理删除
+        GET    /api/period/status             当前周期阶段 + 预测
+        """
+        # 双保险鉴权：全局 /api/* 拦截已校验过，这里显式再查一次
+        if not await _check_api_secret(scope, send):
+            return
+
+        path = scope["path"]
+        record_id, sub = None, ""
+        if path == "/api/period/records":
+            pass
+        elif path == "/api/period/status":
+            sub = "status"
+        elif path.startswith("/api/period/records/"):
+            rest = path[len("/api/period/records/"):]
+            parts = rest.split("/", 1)
+            record_id = _normalize_period_id(parts[0])
+            if record_id is None:
+                await _send_json_resp(send, 400, {"error": "记录 ID 格式不合法。"})
+                return
+            sub = parts[1] if len(parts) > 1 else ""
+            if sub:
+                await _send_json_resp(send, 404, {"error": "接口不存在。"})
+                return
+        else:
+            await _send_json_resp(send, 404, {"error": "接口不存在。"})
+            return
+
+        # period_records 对 anon/authenticated REVOKE 且无 RLS 策略，读写走 service_role
+        import server as _srv
+        sb = _srv.supabase_service
+        if not sb:
+            await _send_json_resp(send, 503, {"error": "数据库未配置，经期记录功能暂不可用。"})
+            return
+
+        method = scope["method"]
+
+        # 周期状态接口
+        if sub == "status":
+            if method == "GET":
+                await self._period_status(send, sb)
+            else:
+                await _send_json_resp(send, 405, {"error": "仅支持 GET。"})
+            return
+
+        # 记录 CRUD
+        if record_id is None:
+            if method == "GET":
+                await self._period_list(send, sb)
+            elif method == "POST":
+                await self._period_create(scope, receive, send, sb)
+            else:
+                await _send_json_resp(send, 405, {"error": "仅支持 GET / POST。"})
+            return
+
+        if method == "GET":
+            await self._period_detail(send, sb, record_id)
+        elif method == "PATCH":
+            await self._period_update(scope, receive, send, sb, record_id)
+        elif method == "DELETE":
+            await self._period_delete(send, sb, record_id)
+        else:
+            await _send_json_resp(send, 405, {"error": "仅支持 GET / PATCH / DELETE。"})
+        return
+
+    async def _period_list(self, send, sb):
+        """GET /api/period/records：全量列表，按 start_date 倒序。"""
+        def _fetch():
+            return (
+                sb.table("period_records")
+                .select("*")
+                .order("start_date", desc=True)
+                .execute()
+            )
+
+        try:
+            res = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            _log(f"⚠️ [Period] list失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        rows = list(res.data) if res and res.data else []
+        await _send_json_resp(send, 200, {"items": rows})
+
+    async def _period_create(self, scope, receive, send, sb):
+        """POST /api/period/records：创建经期记录。"""
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        fields, err = _validate_period_fields(req, partial=False)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        def _insert():
+            return sb.table("period_records").insert(fields).execute()
+
+        try:
+            res = await asyncio.to_thread(_insert)
+        except Exception as e:
+            _log(f"⚠️ [Period] create失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = (res.data or [{}])[0] if res else {}
+        new_id = row.get("id", "")
+        _log(f"✅ [Period] 已创建经期记录 id={new_id}")
+        await _send_json_resp(send, 200, {"ok": True, "id": new_id})
+
+    async def _period_detail(self, send, sb, record_id):
+        """GET /api/period/records/{id}：单条详情（编辑回显）。"""
+        def _get():
+            return sb.table("period_records").select("*").eq("id", record_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Period] detail失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "记录不存在。"})
+            return
+        await _send_json_resp(send, 200, {"ok": True, "item": row})
+
+    async def _period_update(self, scope, receive, send, sb, record_id):
+        """PATCH /api/period/records/{id}：局部更新，未提供字段保持原值。"""
+        req, err = await _read_ai_todo_json_body(receive)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+
+        def _get():
+            return sb.table("period_records").select("*").eq("id", record_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Period] update前置查询失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        row = res.data[0] if res and res.data else None
+        if not row:
+            await _send_json_resp(send, 404, {"error": "记录不存在。"})
+            return
+
+        fields, err = _validate_period_fields(req, partial=True)
+        if err:
+            await _send_json_resp(send, 400, {"error": err})
+            return
+        if not fields:
+            await _send_json_resp(send, 400, {"error": "没有提供任何要更新的字段。"})
+            return
+
+        # 合并后校验 end_date >= start_date（可能只改一端）
+        final_start = fields.get("start_date", row.get("start_date"))
+        final_end = fields.get("end_date", row.get("end_date"))
+        if final_start and final_end and final_end < final_start:
+            await _send_json_resp(send, 400, {"error": "end_date 必须 ≥ start_date。"})
+            return
+
+        fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        def _update():
+            return sb.table("period_records").update(fields).eq("id", record_id).execute()
+
+        try:
+            res = await asyncio.to_thread(_update)
+        except Exception as e:
+            _log(f"⚠️ [Period] update失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if not res or not res.data:
+            await _send_json_resp(send, 404, {"error": "记录不存在。"})
+            return
+        _log(f"✅ [Period] 已更新经期记录 id={record_id}")
+        await _send_json_resp(send, 200, {"ok": True})
+
+    async def _period_delete(self, send, sb, record_id):
+        """DELETE /api/period/records/{id}：物理删除。"""
+        def _get():
+            return sb.table("period_records").select("id").eq("id", record_id).limit(1).execute()
+
+        try:
+            res = await asyncio.to_thread(_get)
+        except Exception as e:
+            _log(f"⚠️ [Period] delete前置查询失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        if not (res and res.data):
+            await _send_json_resp(send, 404, {"error": "记录不存在。"})
+            return
+
+        def _delete():
+            return sb.table("period_records").delete().eq("id", record_id).execute()
+
+        try:
+            await asyncio.to_thread(_delete)
+        except Exception as e:
+            _log(f"⚠️ [Period] delete失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        _log(f"✅ [Period] 已删除经期记录 id={record_id}")
+        await _send_json_resp(send, 200, {"ok": True})
+
+    async def _period_status(self, send, sb):
+        """GET /api/period/status：当前周期阶段 + 预测下次。"""
+        def _fetch():
+            return (
+                sb.table("period_records")
+                .select("start_date,end_date,flow,symptoms,notes")
+                .order("start_date", desc=True)
+                .execute()
+            )
+
+        try:
+            res = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            _log(f"⚠️ [Period] status查询失败: {e}")
+            await _send_json_resp(send, 500, {"error": "数据库操作失败"})
+            return
+        rows = list(res.data) if res and res.data else []
+        status = _compute_cycle_status(rows)
+        await _send_json_resp(send, 200, {"ok": True, "status": status})
+
 
 # ==========================================
 # 辅助函数
@@ -7050,6 +7294,210 @@ def _validate_course_fields(req: dict, partial: bool):
             out["location"] = location
 
     return out, ""
+
+
+# ---------- ✅ 经期记录 API 辅助 ----------
+
+_PERIOD_FLOWS = frozenset({"light", "medium", "heavy"})
+
+
+def _normalize_period_id(raw_key: str):
+    """校验 period 路径参数 id（合法 UUID）。合法返回 id 字符串，非法返回 None。"""
+    import uuid as _uuid
+    from urllib.parse import unquote as _unquote
+    try:
+        tid = _unquote(raw_key or "")
+    except Exception:
+        return None
+    tid = (tid or "").strip()
+    if not tid or len(tid) > 64 or "/" in tid or "\\" in tid or "%" in tid:
+        return None
+    try:
+        _uuid.UUID(tid)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return tid
+
+
+def _validate_period_fields(req: dict, partial: bool):
+    """校验经期记录字段。成功返回 (fields_dict, "")；失败返回 (None, 中文错误)。
+
+    partial=False（POST）：start_date 必填，其余有默认。
+    partial=True（PATCH）：只校验出现的字段；未出现的不写入返回 dict。
+    """
+    if not isinstance(req, dict):
+        return None, "请求体必须是 JSON 对象。"
+
+    out = {}
+
+    def _text(v):
+        if v is None:
+            return ""
+        return v if isinstance(v, str) else str(v)
+
+    def _valid_date(s):
+        """校验 YYYY-MM-DD 格式日期字符串，合法返回该字符串，非法返回 None。"""
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            datetime.date.fromisoformat(s)
+            return s
+        except (ValueError, TypeError):
+            return None
+
+    # start_date
+    if (not partial) or ("start_date" in req):
+        sd = _valid_date(_text(req.get("start_date")))
+        if not sd:
+            return None, "start_date 必须是 YYYY-MM-DD 格式的合法日期。"
+        out["start_date"] = sd
+
+    # end_date（可空；PATCH 时传 null/空字符串表示清除）
+    if "end_date" in req:
+        raw_end = req.get("end_date")
+        if raw_end is None or (isinstance(raw_end, str) and not raw_end.strip()):
+            out["end_date"] = None
+        else:
+            ed = _valid_date(_text(raw_end))
+            if not ed:
+                return None, "end_date 必须是 YYYY-MM-DD 格式的合法日期或 null。"
+            out["end_date"] = ed
+
+    # flow
+    if (not partial) or ("flow" in req):
+        if "flow" in req:
+            flow = _text(req.get("flow")).strip() or "medium"
+        else:
+            flow = "medium"
+        if flow not in _PERIOD_FLOWS:
+            return None, "flow 必须是 light/medium/heavy 之一。"
+        out["flow"] = flow
+
+    # symptoms
+    if (not partial) or ("symptoms" in req):
+        if "symptoms" in req or not partial:
+            symptoms = _text(req.get("symptoms")).strip()
+            if len(symptoms) > 500:
+                return None, "symptoms 长度不能超过 500。"
+            out["symptoms"] = symptoms
+
+    # notes
+    if (not partial) or ("notes" in req):
+        if "notes" in req or not partial:
+            notes = _text(req.get("notes")).strip()
+            if len(notes) > 1000:
+                return None, "notes 长度不能超过 1000。"
+            out["notes"] = notes
+
+    # POST 时校验 end_date >= start_date（两者都已知）
+    if not partial and out.get("end_date") and out.get("start_date"):
+        if out["end_date"] < out["start_date"]:
+            return None, "end_date 必须 ≥ start_date。"
+
+    return out, ""
+
+
+def _compute_cycle_status(rows: list) -> dict:
+    """根据经期记录计算当前周期阶段与预测。rows 按 start_date 倒序。
+
+    返回 dict：
+      phase: 当前阶段（经期/卵泡期/排卵期/黄体期/未知）
+      phase_desc: 阶段描述
+      last_start: 上次开始日（YYYY-MM-DD 或 None）
+      last_end: 上次结束日（YYYY-MM-DD 或 None）
+      days_since: 距上次开始天数（int 或 None）
+      avg_cycle: 平均周期天数（int，无数据默认 28）
+      next_date: 预测下次开始日（YYYY-MM-DD 或 None）
+      days_until: 距预测天数（int 或 None，负数=已过期）
+      cycles: 历史周期长度列表（list[int]）
+      record_count: 记录总数
+    """
+    import datetime as _dt
+
+    result = {
+        "phase": "未知",
+        "phase_desc": "还没有经期记录，无法判断周期阶段。",
+        "last_start": None,
+        "last_end": None,
+        "days_since": None,
+        "avg_cycle": 28,
+        "next_date": None,
+        "days_until": None,
+        "cycles": [],
+        "record_count": len(rows),
+    }
+    if not rows:
+        return result
+
+    # 上次经期
+    last = rows[0]
+    last_start_str = last.get("start_date")
+    last_end_str = last.get("end_date")
+    result["last_start"] = last_start_str
+    result["last_end"] = last_end_str
+
+    try:
+        last_start = _dt.date.fromisoformat(last_start_str)
+    except (ValueError, TypeError):
+        return result
+
+    today = _dt.date.today()
+    days_since = (today - last_start).days
+    result["days_since"] = days_since
+
+    # 计算历史周期长度（相邻开始日间隔）
+    cycles = []
+    for i in range(len(rows) - 1):
+        try:
+            cur = _dt.date.fromisoformat(rows[i]["start_date"])
+            prev = _dt.date.fromisoformat(rows[i + 1]["start_date"])
+            diff = (cur - prev).days
+            if 15 <= diff <= 60:  # 过滤异常值
+                cycles.append(diff)
+        except (ValueError, TypeError, KeyError):
+            continue
+    result["cycles"] = cycles
+
+    avg = round(sum(cycles) / len(cycles)) if cycles else 28
+    result["avg_cycle"] = avg
+
+    # 预测下次
+    next_date = last_start + _dt.timedelta(days=avg)
+    result["next_date"] = next_date.isoformat()
+    days_until = (next_date - today).days
+    result["days_until"] = days_until
+
+    # 判断当前阶段
+    # 经期：在进行中（end_date 为空且 days_since <= 7）或 end_date 覆盖今天
+    in_period = False
+    if last_end_str:
+        try:
+            last_end = _dt.date.fromisoformat(last_end_str)
+            if last_start <= today <= last_end:
+                in_period = True
+        except (ValueError, TypeError):
+            pass
+    else:
+        # 无结束日：开始日后 7 天内视为经期进行中
+        if 0 <= days_since <= 6:
+            in_period = True
+
+    if in_period:
+        result["phase"] = "经期"
+        day_n = days_since + 1
+        result["phase_desc"] = f"经期第 {day_n} 天"
+    elif days_since <= 13:
+        result["phase"] = "卵泡期"
+        result["phase_desc"] = f"卵泡期（周期第 {days_since + 1} 天），身体逐渐恢复活力。"
+    elif days_since <= 16:
+        result["phase"] = "排卵期"
+        result["phase_desc"] = f"排卵期（周期第 {days_since + 1} 天），可能排卵。"
+    else:
+        result["phase"] = "黄体期"
+        result["phase_desc"] = f"黄体期（周期第 {days_since + 1} 天），下次经期临近。"
+
+    return result
 
 
 # ---------- ✅ AI 待办 API 辅助（阶段4） ----------

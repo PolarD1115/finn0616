@@ -3568,6 +3568,357 @@ async def manage_ai_todo(
     return "❌ 未知操作。支持：add、list、update、complete、cancel"
 
 
+# ==========================================
+# 经期记录（period_records）：MCP 工具
+# ==========================================
+# 独立表 period_records（migrations/20260918_001_period_tracker.sql），
+# 读写走 service_role 客户端（与 ai_todos 同风格，RLS deny-by-default）。
+# 周期计算逻辑与 gateway.py _compute_cycle_status 保持一致。
+# ==========================================
+
+_PERIOD_TZ_BJ = datetime.timezone(datetime.timedelta(hours=8), name="Asia/Shanghai")
+
+
+def _period_today_bj() -> datetime.date:
+    """当前北京时间的日历日。"""
+    return datetime.datetime.now(_PERIOD_TZ_BJ).date()
+
+
+def _period_fmt_date(d_str: str) -> str:
+    """YYYY-MM-DD -> MM-DD 简短格式。"""
+    try:
+        d = datetime.date.fromisoformat(d_str)
+        return d.strftime("%m-%d")
+    except (ValueError, TypeError):
+        return d_str or "?"
+
+
+def _period_compute(rows: list) -> dict:
+    """根据经期记录计算周期状态（与 gateway._compute_cycle_status 同逻辑）。
+
+    rows 按 start_date 倒序。返回 dict 含 phase/avg_cycle/next_date/days_until 等。
+    """
+    result = {
+        "phase": "未知",
+        "last_start": None,
+        "days_since": None,
+        "avg_cycle": 28,
+        "next_date": None,
+        "days_until": None,
+        "cycles": [],
+        "record_count": len(rows),
+    }
+    if not rows:
+        return result
+
+    last = rows[0]
+    last_start_str = last.get("start_date")
+    last_end_str = last.get("end_date")
+    result["last_start"] = last_start_str
+
+    try:
+        last_start = datetime.date.fromisoformat(last_start_str)
+    except (ValueError, TypeError):
+        return result
+
+    today = _period_today_bj()
+    days_since = (today - last_start).days
+    result["days_since"] = days_since
+
+    cycles = []
+    for i in range(len(rows) - 1):
+        try:
+            cur = datetime.date.fromisoformat(rows[i]["start_date"])
+            prev = datetime.date.fromisoformat(rows[i + 1]["start_date"])
+            diff = (cur - prev).days
+            if 15 <= diff <= 60:
+                cycles.append(diff)
+        except (ValueError, TypeError, KeyError):
+            continue
+    result["cycles"] = cycles
+
+    avg = round(sum(cycles) / len(cycles)) if cycles else 28
+    result["avg_cycle"] = avg
+
+    next_date = last_start + datetime.timedelta(days=avg)
+    result["next_date"] = next_date.isoformat()
+    result["days_until"] = (next_date - today).days
+
+    # 判断阶段
+    in_period = False
+    if last_end_str:
+        try:
+            last_end = datetime.date.fromisoformat(last_end_str)
+            if last_start <= today <= last_end:
+                in_period = True
+        except (ValueError, TypeError):
+            pass
+    else:
+        if 0 <= days_since <= 6:
+            in_period = True
+
+    if in_period:
+        result["phase"] = "经期"
+    elif days_since <= 13:
+        result["phase"] = "卵泡期"
+    elif days_since <= 16:
+        result["phase"] = "排卵期"
+    else:
+        result["phase"] = "黄体期"
+
+    return result
+
+
+async def _period_fetch_all():
+    """读取全部经期记录（按 start_date 倒序）-> (rows, err)。"""
+    def _fetch():
+        return (
+            supabase_service.table("period_records")
+            .select("*")
+            .order("start_date", desc=True)
+            .execute()
+        )
+
+    try:
+        res = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        print(f"⚠️ [经期] 查询失败: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return None, "❌ 读取经期记录失败：数据库暂不可用或 period_records 表尚未创建。"
+    return list(res.data) if res and res.data else [], ""
+
+
+@mcp.tool()
+@mcp_error_handler
+async def add_period(start_date: str, end_date: str = "", flow: str = "medium", symptoms: str = "", notes: str = ""):
+    """【记录经期】帮用户记一次经期。
+    start_date: 经期开始日期，YYYY-MM-DD 格式（如 2026-09-10），必填。
+    end_date: 经期结束日期，YYYY-MM-DD 格式，可空（空=进行中或只记开始）。
+    flow: 流量，light/medium/heavy 之一，默认 medium。
+    symptoms: 症状描述（如 痛经/腰酸/乏力），可空。
+    notes: 自由备注，可空。
+    记录成功后会返回当前周期状态和预测。"""
+    if not supabase_service:
+        return "❌ 数据库未连接，无法记录经期。"
+
+    # 校验 start_date
+    sd = (start_date or "").strip()
+    try:
+        datetime.date.fromisoformat(sd)
+    except (ValueError, TypeError):
+        return "❌ start_date 格式不对，要用 YYYY-MM-DD 格式，比如 2026-09-10。"
+
+    # 校验 end_date（可空）
+    ed = (end_date or "").strip()
+    if ed:
+        try:
+            datetime.date.fromisoformat(ed)
+        except (ValueError, TypeError):
+            return "❌ end_date 格式不对，要用 YYYY-MM-DD 格式或留空。"
+        if ed < sd:
+            return "❌ end_date 不能早于 start_date。"
+
+    # 校验 flow
+    flow_clean = (flow or "medium").strip().lower()
+    if flow_clean not in ("light", "medium", "heavy"):
+        return "❌ flow 必须是 light / medium / heavy 之一。"
+
+    payload = {
+        "start_date": sd,
+        "end_date": ed if ed else None,
+        "flow": flow_clean,
+        "symptoms": (symptoms or "").strip()[:500],
+        "notes": (notes or "").strip()[:1000],
+    }
+
+    def _insert():
+        return supabase_service.table("period_records").insert(payload).execute()
+
+    try:
+        await asyncio.to_thread(_insert)
+    except Exception as e:
+        print(f"⚠️ [经期] add 写库失败 start_date={sd}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return "❌ 保存经期记录失败：数据库暂不可用，请稍后重试。"
+
+    # 查询全部记录计算周期
+    rows, err = await _period_fetch_all()
+    if err:
+        return f"✅ 已记录 {sd} 的经期。\n（周期状态查询失败：{err}）"
+
+    st = _period_compute(rows)
+    fmt_sd = _period_fmt_date(sd)
+
+    if st["record_count"] < 2:
+        return f"✅ 已记录 {fmt_sd} 的经期。\n\n这是第 1 条记录，再记一次就能计算周期了。"
+
+    cycles_str = "、".join(str(c) for c in st["cycles"])
+    next_fmt = _period_fmt_date(st["next_date"]) if st["next_date"] else "?"
+    return (
+        f"✅ 已记录 {fmt_sd} 的经期。\n\n"
+        f"平均周期：{st['avg_cycle']} 天（历史：{cycles_str}天）\n"
+        f"预测下次：{next_fmt}\n"
+        f"当前阶段：{st['phase']}"
+    )
+
+
+@mcp.tool()
+@mcp_error_handler
+async def list_periods(limit: int = 10):
+    """【查看经期记录】看看用户之前的经期记录。
+    limit: 返回条数，默认 10，最大 50。"""
+    if not supabase_service:
+        return "❌ 数据库未连接。"
+
+    limit = max(1, min(int(limit or 10), 50))
+
+    def _fetch():
+        return (
+            supabase_service.table("period_records")
+            .select("*")
+            .order("start_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+
+    try:
+        res = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        print(f"⚠️ [经期] list 查询失败: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return "❌ 读取经期记录失败：数据库暂不可用或 period_records 表尚未创建。"
+
+    rows = list(res.data) if res and res.data else []
+    if not rows:
+        return "📭 还没有记录过经期。"
+
+    lines = []
+    for i, r in enumerate(rows):
+        sd = r.get("start_date", "?")
+        ed = r.get("end_date")
+        flow = r.get("flow", "")
+        symptoms = (r.get("symptoms") or "").strip()
+        notes = (r.get("notes") or "").strip()
+
+        date_range = _period_fmt_date(sd)
+        if ed:
+            date_range += f" ~ {_period_fmt_date(ed)}"
+
+        extras = []
+        flow_cn = {"light": "量少", "medium": "正常", "heavy": "量多"}.get(flow, "")
+        if flow_cn:
+            extras.append(flow_cn)
+        if symptoms:
+            extras.append(symptoms)
+        if notes:
+            extras.append(notes)
+
+        suffix = f"（{'、'.join(extras)}）" if extras else ""
+        lines.append(f"{i + 1}. {date_range}{suffix}")
+
+    # 周期统计
+    st = _period_compute(rows)
+    cycle_info = ""
+    if st["cycles"]:
+        cycles_str = "、".join(str(c) for c in st["cycles"])
+        cycle_info = f"\n\n周期记录：{cycles_str} 天\n平均周期：{st['avg_cycle']} 天"
+
+    return "\n".join(lines) + cycle_info
+
+
+@mcp.tool()
+@mcp_error_handler
+async def delete_period(start_date: str):
+    """【删除经期记录】删掉一条记错了的经期记录。
+    start_date: 要删除的经期开始日期，YYYY-MM-DD 格式（如 2026-09-10）。"""
+    if not supabase_service:
+        return "❌ 数据库未连接。"
+
+    sd = (start_date or "").strip()
+    try:
+        datetime.date.fromisoformat(sd)
+    except (ValueError, TypeError):
+        return "❌ start_date 格式不对，要用 YYYY-MM-DD 格式。"
+
+    def _delete():
+        return (
+            supabase_service.table("period_records")
+            .delete()
+            .eq("start_date", sd)
+            .execute()
+        )
+
+    try:
+        res = await asyncio.to_thread(_delete)
+    except Exception as e:
+        print(f"⚠️ [经期] delete 失败 start_date={sd}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return "❌ 删除失败：数据库暂不可用，请稍后重试。"
+
+    if not res or not res.data:
+        return f"❌ 没找到 {sd} 的经期记录。"
+
+    return f"✅ 已删除 {_period_fmt_date(sd)} 的经期记录。"
+
+
+@mcp.tool()
+@mcp_error_handler
+async def get_cycle_status():
+    """【查看周期状态】看看用户现在在周期的哪个阶段，预测下次经期大概什么时候来。
+    返回当前阶段（经期/卵泡期/排卵期/黄体期）、距上次天数、平均周期、预测下次日期。"""
+    if not supabase_service:
+        return "❌ 数据库未连接。"
+
+    rows, err = await _period_fetch_all()
+    if err:
+        return err
+    if not rows:
+        return "📭 还没有记录过经期，无法预测。先记录一次经期吧。"
+
+    st = _period_compute(rows)
+    last = rows[0]
+    last_start = st["last_start"]
+    last_end = last.get("end_date")
+    last_notes = (last.get("notes") or "").strip()
+    last_symptoms = (last.get("symptoms") or "").strip()
+
+    if st["record_count"] < 2:
+        return (
+            f"上次经期：{_period_fmt_date(last_start)}\n"
+            f"今天距上次：{st['days_since']} 天\n\n"
+            f"只有 1 条记录，无法预测周期。再记录一次就能算了。"
+        )
+
+    next_fmt = _period_fmt_date(st["next_date"]) if st["next_date"] else "?"
+    days_until = st["days_until"]
+
+    if days_until is not None:
+        if days_until < 0:
+            when = f"已过期 {-days_until} 天，可能已经来了或要来了"
+        elif days_until == 0:
+            when = "就是今天！"
+        elif days_until <= 5:
+            when = f"还有 {days_until} 天，快到了"
+        else:
+            when = f"还有 {days_until} 天"
+    else:
+        when = "无法预测"
+
+    extras = []
+    if last_symptoms:
+        extras.append(f"症状：{last_symptoms}")
+    if last_notes:
+        extras.append(f"备注：{last_notes}")
+    extras_str = f"\n{'；'.join(extras)}" if extras else ""
+
+    end_str = f" ~ {_period_fmt_date(last_end)}" if last_end else "（进行中）"
+
+    return (
+        f"上次经期：{_period_fmt_date(last_start)}{end_str}{extras_str}\n"
+        f"今天距上次：{st['days_since']} 天\n"
+        f"平均周期：{st['avg_cycle']} 天\n"
+        f"预测下次：{next_fmt}\n"
+        f"状态：{when}\n"
+        f"当前阶段：{st['phase']}（周期第 {st['days_since'] + 1} 天）"
+    )
+
+
 # Phase 6 安全收口：list_private_diary 不再注册为 MCP 工具。
 # 原因：私密日记标题/心情/时间属于 AI 私密元数据，FastMCP v1 无法区分调用者身份。
 # 统一索引通过内部 service 函数或 API_SECRET 保护的管理 API 提供。
