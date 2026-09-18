@@ -900,7 +900,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     与网页渠道 /v1/chat/completions 的 _inject_context 对齐，统一注入：
     - AI 人设（AI_PERSONA，含数据库动态人设 sys_ai_persona）
     - 用户画像（user_facts，排除系统配置键）
-    - 阶段总结（memories tags=Core_Cognition 最近 3 条）
+    - 最新日总结（memories tags=Core_Cognition 且 title=📅 昨日回溯，仅 1 条）
     - Pinecone 向量记忆（按 query 检索，可选）
     - 近期跨渠道对话流水（Web/TG/QQ/邮件，最近 8 条）
     - 设备状态快照（device_data 最新一条，复用 gateway 渲染，可开关）
@@ -912,7 +912,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     now_bj = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     time_str = now_bj.strftime("%Y-%m-%d %H:%M")
 
-    # ⚡ 并行化：人设 / 画像 / 阶段总结 / 向量记忆 / 历史流水 / 设备快照 全部并发拉取，
+    # ⚡ 并行化：人设 / 画像 / 日总结 / 向量记忆 / 历史流水 / 设备快照 全部并发拉取，
     #    总耗时 ≈ 最慢的一个请求（原串行 6 连发，Supabase 抖动时容易整体失败拖垮回复）
     async def _safe(fn):
         """把阻塞调用丢到线程池，任何失败都降级为 None（不阻断回复）。"""
@@ -932,9 +932,9 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
         tasks["profile"] = _safe(lambda: supabase.table("user_facts").select("key, value")
                                  .neq("key", "sys_config").neq("key", "llm_settings").neq("key", "sys_ai_persona")
                                  .neq("key", "llm_models").order("key").execute())
-        # 3. 阶段总结（长期记忆 Core_Cognition）
-        tasks["summaries"] = _safe(lambda: supabase.table("memories").select("content")
-                                   .eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
+        # 3. 最新日总结（仅「📅 昨日回溯」，排除全渠道阶段总结）
+        import gateway as _gw_sum
+        tasks["summaries"] = _safe(lambda: _gw_sum._fetch_latest_daily_summary(supabase))
         # 5. 近期跨渠道对话流水（最近 8 条）
         _TAGS = [channel_tag, "Web_Chat", "TG_MSG", "QQ_MSG", "QQ_Chat", "QQ_Group", "Email_Process"]
         _TAGS = list(dict.fromkeys(_TAGS))  # 去重保序
@@ -990,8 +990,11 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
 
     core_summaries = "无长期记忆"
     sr = r.get("summaries")
-    if sr and sr.data:
-        core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
+    if isinstance(sr, str) and sr.strip():
+        core_summaries = sr
+    elif sr and getattr(sr, "data", None):
+        # 兼容旧查询结果形态（若有）
+        core_summaries = "\n".join([f"- {s['content']}" for s in sr.data if s.get("content")])
 
     pinecone_context = "无相关深层记忆"
     shared_context = ""  # Phase 6：shared_experience 共同经历短摘要
@@ -1051,7 +1054,7 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
 
     volatile_parts = [
         f"关于{user_name}：\n{user_prof}",
-        f"【近3次阶段总结】:\n{core_summaries}",
+        f"【最新日总结】:\n{core_summaries}",
         "[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]",
         f"【深层关联记忆】:\n{pinecone_context}",
     ]

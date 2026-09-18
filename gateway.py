@@ -1053,6 +1053,26 @@ def _stable_set(key: str, value: str) -> None:
     _stable_prefix_cache[key] = {"value": value, "ts": time.time()}
 
 
+def _fetch_latest_daily_summary(sb) -> str:
+    """只取最新一条「📅 昨日回溯」日总结；排除「📚 全渠道阶段总结」等其它 Core_Cognition。"""
+    if not sb:
+        return "无长期记忆"
+    try:
+        sr = sb.table("memories").select("title, content").eq(
+            "tags", "Core_Cognition"
+        ).order("created_at", desc=True).limit(20).execute()
+        for row in (sr.data or []) if sr else []:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "")
+            content = str(row.get("content") or "").strip()
+            if title.startswith("📅 昨日回溯") and content:
+                return f"- {content}"
+    except Exception:
+        pass
+    return "无长期记忆"
+
+
 # ==========================================
 # 📦 静态常驻提示词文件（prompts/*.md）
 #   世界书 / 回复规则等静态常驻内容从 rikkahub 客户端迁到网关，
@@ -2751,7 +2771,7 @@ class HostFixMiddleware:
         智能体上下文注入（全部变量化，无硬编码）：
         - 系统当前状态（北京时间 / 沉默时长）
         - 用户画像（user_facts 表）
-        - 阶段总结（memories 表 tags=Core_Cognition）
+        - 最新日总结（memories 表 tags=Core_Cognition 且 title=📅 昨日回溯，仅 1 条）
         - Pinecone 向量记忆（可选）
         - 最近 N 条对话历史（按 tag 拉，转成 user/assistant 交替）
         """
@@ -2794,22 +2814,17 @@ class HostFixMiddleware:
         )
         core_summaries = "无长期记忆"
         if not _skip_core_summaries:
-            # 阶段总结（带 TTL 缓存 —— 内容不变才能维持 prompt cache 前缀稳定）
-            core_summaries = _stable_cached("core_summaries", _CORE_SUMMARIES_TTL)
+            # 最新日总结（带 TTL 缓存 —— 内容不变才能维持 prompt cache 前缀稳定）
+            # 缓存键用 daily_summary，避免旧「近3条混注」缓存残留
+            core_summaries = _stable_cached("daily_summary", _CORE_SUMMARIES_TTL)
             if core_summaries is not None:
-                _log(f"📦 [Cache] core_summaries 命中 TTL 缓存（{_CORE_SUMMARIES_TTL}s）")
+                _log(f"📦 [Cache] daily_summary 命中 TTL 缓存（{_CORE_SUMMARIES_TTL}s）")
             else:
-                core_summaries = "无长期记忆"
-                try:
-                    sr = await asyncio.to_thread(lambda: sb.table("memories").select("content").eq("tags", "Core_Cognition").order("created_at", desc=True).limit(3).execute())
-                    if sr and sr.data:
-                        core_summaries = "\n".join([f"- {s['content']}" for s in sr.data])
-                except Exception:
-                    pass
-                _stable_set("core_summaries", core_summaries)
+                core_summaries = await asyncio.to_thread(_fetch_latest_daily_summary, sb)
+                _stable_set("daily_summary", core_summaries)
         else:
             if _inject_core_summaries_mode == "auto" and _client_msg_count > 1:
-                _log(f"📦 [Cache] 客户端已带 {_client_msg_count} 条历史消息，跳过阶段总结注入（维持缓存前缀稳定）")
+                _log(f"📦 [Cache] 客户端已带 {_client_msg_count} 条历史消息，跳过日总结注入（维持缓存前缀稳定）")
 
         # 用户画像（带 TTL 缓存 —— 同理）
         user_prof = _stable_cached("user_prof", _STABLE_PREFIX_TTL)
@@ -2942,7 +2957,7 @@ class HostFixMiddleware:
         # 原来拼接 stable_parts 的位置改成 volatile
         volatile_block = (
             f"关于{user_name}：\n{user_prof}\n"
-            f"【近3次阶段总结】:\n{core_summaries}\n"
+            f"【最新日总结】:\n{core_summaries}\n"
             f"[注：以下是历史参考片段，仅作事实核对，与当前对话无关时忽略。]\n"
             f"【深层关联记忆】:\n{pinecone_context}\n"
         )
@@ -4706,17 +4721,12 @@ class HostFixMiddleware:
             _log(f"⚠️ [ContextPreview] 画像基底获取失败（跳过）: "
                  f"exception_type={type(e).__name__}")
 
-        try:  # 阶段总结行
-            sr = await asyncio.to_thread(lambda: _srv.supabase_service.table(
-                "memories").select("content").eq(
-                "tags", "Core_Cognition").order(
-                "created_at", desc=True).limit(3).execute())
-            sum_lines = [f"- {str(r.get('content', '')).strip()}"
-                         for r in ((sr.data or []) if sr else [])
-                         if isinstance(r, dict) and str(r.get("content", "")).strip()]
-            if sum_lines:
-                existing_texts.append("\n".join(sum_lines))
-                dedup_basis["summary_lines"] = len(sum_lines)
+        try:  # 最新日总结行（与聊天注入一致，不含全渠道阶段总结）
+            daily = await asyncio.to_thread(
+                _fetch_latest_daily_summary, _srv.supabase_service)
+            if daily and daily != "无长期记忆":
+                existing_texts.append(daily)
+                dedup_basis["summary_lines"] = 1
         except Exception as e:
             _log(f"⚠️ [ContextPreview] 总结基底获取失败（跳过）: "
                  f"exception_type={type(e).__name__}")
