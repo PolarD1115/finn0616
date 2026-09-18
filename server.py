@@ -219,7 +219,11 @@ class PineconeMemoryClient:
             print(f"❌ Pinecone 相似度查询失败: {e}")
             return []
 
-    def add(self, messages, user_id=None, metadata=None):
+    def add(self, messages, user_id=None, metadata=None, skip_dedup=False):
+        """写入一条向量。默认先做语义去重：与库内近邻 cosine ≥ MEMORY_DEDUP_THRESHOLD
+        （默认 0.90）则跳过 upsert，返回 True（视为成功的幂等 no-op）。
+        skip_dedup=True 可强制写入。受 MEMORY_DEDUP_ENABLED 门控。
+        """
         user_id = user_id or _resolve_pinecone_user_id()
         if not self.index:
             return False
@@ -228,6 +232,24 @@ class PineconeMemoryClient:
             vec = _get_embedding(text)
             if not vec:
                 return False
+            # 写入前语义去重：复用本次 embedding，避免二次调用；失败则放行写入。
+            if not skip_dedup and _memory_dedup_enabled():
+                try:
+                    thr = _memory_dedup_threshold()
+                    near = self.index.query(
+                        vector=vec, top_k=3, include_metadata=False,
+                        filter={"user_id": user_id},
+                    )
+                    for m in (near.matches or []):
+                        score = getattr(m, "score", None)
+                        if score is not None and float(score) >= thr:
+                            print(
+                                f"⏭️ Pinecone 语义去重跳过"
+                                f"(score={float(score):.3f}≥{thr})"
+                            )
+                            return True
+                except Exception as e:
+                    print(f"⚠️ Pinecone 去重检查失败，继续写入: {type(e).__name__}")
             # metadata 合并：text 和 user_id 由 add() 统一生成，调用方不可覆盖。
             meta = {"text": text, "user_id": user_id}
             if isinstance(metadata, dict):
@@ -254,6 +276,111 @@ class PineconeMemoryClient:
 
 
 pinecone_memory = PineconeMemoryClient()
+
+# ── Pinecone 注入：多取 → 文本去重 → 截断，尽量保持目标条数 ──
+# FETCH_K 给近重复向量留余量；TOP_K 为最终注入条数。
+def _pinecone_inject_top_k() -> int:
+    try:
+        n = int(os.environ.get("PINECONE_INJECT_TOP_K", "5"))
+    except (ValueError, TypeError):
+        n = 5
+    return max(1, min(n, 20))
+
+
+def _pinecone_inject_fetch_k() -> int:
+    top_k = _pinecone_inject_top_k()
+    try:
+        n = int(os.environ.get("PINECONE_INJECT_FETCH_K", str(max(top_k * 3, 15))))
+    except (ValueError, TypeError):
+        n = max(top_k * 3, 15)
+    return max(top_k, min(n, 50))
+
+
+_PINECONE_DEDUP_MIN_SUBSTR = 5  # 与 memory_context_injection.DEDUP_MIN_SUBSTR_LEN 对齐
+
+
+def _pinecone_text_norm(text) -> str:
+    """注入去重归一化：lowercase + 仅保留字母数字/CJK（去空白与标点）。"""
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
+def _pinecone_norm_is_dup(cand_norm: str, seen_norms) -> bool:
+    """归一化精确相等，或双向子串包含（被包含侧 ≥ _PINECONE_DEDUP_MIN_SUBSTR）。"""
+    if not cand_norm:
+        return True
+    for other in seen_norms:
+        if not other:
+            continue
+        if cand_norm == other:
+            return True
+        if len(cand_norm) >= _PINECONE_DEDUP_MIN_SUBSTR and cand_norm in other:
+            return True
+        if len(other) >= _PINECONE_DEDUP_MIN_SUBSTR and other in cand_norm:
+            return True
+    return False
+
+
+def dedupe_pinecone_results(results, max_items=None):
+    """按召回顺序（相似度降序）做正文近重复去重，截断到 max_items。
+
+    只做文本归一化/子串去重，不调 embedding；用于注入侧清掉重 roll 灌进库的重复向量。
+    """
+    if max_items is None:
+        max_items = _pinecone_inject_top_k()
+    if not isinstance(results, list) or max_items <= 0:
+        return []
+    out, seen = [], []
+    for m in results:
+        if not isinstance(m, dict):
+            continue
+        mem = m.get("memory", "")
+        if not isinstance(mem, str):
+            mem = str(mem) if mem is not None else ""
+        norm = _pinecone_text_norm(mem)
+        if _pinecone_norm_is_dup(norm, seen):
+            continue
+        seen.append(norm)
+        out.append(m)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def format_pinecone_inject_contexts(results, max_items=None):
+    """分区 + 去重 + 渲染【深层关联记忆】与共同经历块。
+
+    返回 (pinecone_context, shared_context)。results 为空时返回默认文案与 ""。
+    """
+    if max_items is None:
+        max_items = _pinecone_inject_top_k()
+    if not isinstance(results, list) or not results:
+        return "无相关深层记忆", ""
+    from shared_experience import partition_recall, render_shared_context
+    regular, shared = partition_recall(results)
+    regular = dedupe_pinecone_results(regular, max_items=max_items)
+    shared = dedupe_pinecone_results(shared, max_items=max_items)
+    if regular:
+        pinecone_context = "\n".join(
+            f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}"
+            for m in regular
+        )
+    else:
+        pinecone_context = "无相关深层记忆"
+    return pinecone_context, render_shared_context(shared)
+
+
+def _memory_dedup_enabled() -> bool:
+    return os.environ.get("MEMORY_DEDUP_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _memory_dedup_threshold() -> float:
+    try:
+        return float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.90"))
+    except (ValueError, TypeError):
+        return 0.90
+
 
 # 候选观察线（不是阈值，只是统计分桶）
 _RECALL_SCORE_LINES = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.90)
@@ -750,12 +877,9 @@ def _memory_is_duplicate(title: str, content: str) -> tuple[bool, str]:
     需要 Pinecone 可用；不可用时不拦截（返回 False）。
     """
     # 去重开关 + 阈值（0~1，越高越严格；默认 0.90 只拦几乎重复的）
-    if os.environ.get("MEMORY_DEDUP_ENABLED", "true").strip().lower() in ("0", "false", "no"):
+    if not _memory_dedup_enabled():
         return False, "去重已关闭"
-    try:
-        threshold = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.90"))
-    except (ValueError, TypeError):
-        threshold = 0.90
+    threshold = _memory_dedup_threshold()
 
     probe = f"{title}: {content}"
     similar = pinecone_memory.find_similar(probe, top_k=3)
@@ -953,7 +1077,8 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
             vec_enabled = True
         if vec_enabled:
             tasks["pinecone"] = _safe(lambda: pinecone_memory.search(query=str(query),
-                                     user_id=_resolve_pinecone_user_id(), limit=5, source=source))
+                                     user_id=_resolve_pinecone_user_id(),
+                                     limit=_pinecone_inject_fetch_k(), source=source))
 
     # 6. 设备状态快照（复用 gateway 渲染，可开关）
     #    inject_device=None（后台自主活动调用）→ 沿用环境变量 DEVICE_CONTEXT_ENABLED，保持后台行为不变；
@@ -1002,15 +1127,8 @@ async def _build_channel_context(query: str = "", channel_tag: str = "TG_MSG", i
     if mr:
         rl = mr.get("results", mr) if isinstance(mr, dict) else mr
         if isinstance(rl, list) and rl:
-            from shared_experience import partition_recall, render_shared_context
-            _regular, _shared = partition_recall(rl)
-            if _regular:
-                pinecone_context = "\n".join(
-                    [f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in _regular]
-                )
-            shared_context = render_shared_context(_shared)
-            # 脱敏召回观测日志由 search() 内部 _log_pinecone_recall() 统一生成
-            # 此处不再重复记录简单 score 范围
+            # 多取 → 正文近重复去重 → 截断到 TOP_K，尽量保持条数
+            pinecone_context, shared_context = format_pinecone_inject_contexts(rl)
 
     history_text = ""
     hr = r.get("history")

@@ -2858,16 +2858,20 @@ class HostFixMiddleware:
             try:
                 import server as _srv_uid
                 def _s():
-                    return mc.search(query=str(current_query), user_id=_srv_uid._resolve_pinecone_user_id(), limit=5, source="web_user")
+                    return mc.search(
+                        query=str(current_query),
+                        user_id=_srv_uid._resolve_pinecone_user_id(),
+                        limit=_srv_uid._pinecone_inject_fetch_k(),
+                        source="web_user",
+                    )
                 mr = await asyncio.to_thread(_s)
                 if mr:
                     rl = mr.get("results", mr) if isinstance(mr, dict) else mr
                     if isinstance(rl, list) and rl:
-                        from shared_experience import partition_recall, render_shared_context
-                        _regular, _shared = partition_recall(rl)
-                        if _regular:
-                            pinecone_context = "\n".join([f"- {m.get('memory', str(m))}" if isinstance(m, dict) else f"- {str(m)}" for m in _regular])
-                        shared_context = render_shared_context(_shared)
+                        # 多取 → 正文近重复去重 → 截断到 TOP_K，尽量保持条数
+                        pinecone_context, shared_context = (
+                            _srv_uid.format_pinecone_inject_contexts(rl)
+                        )
                     else:
                         _log("🧠 Pinecone 召回 0 条")
                 else:
@@ -4737,21 +4741,20 @@ class HostFixMiddleware:
                 dedup_basis["pinecone_available"] = True
 
                 def _psearch():
-                    return mc.search(query=query_text, user_id=user_id,
-                                     limit=5, source="web_user")
+                    return mc.search(
+                        query=query_text, user_id=user_id,
+                        limit=_srv._pinecone_inject_fetch_k(),
+                        source="web_user",
+                    )
 
                 mr = await asyncio.to_thread(_psearch)
                 if mr:
                     rl = mr.get("results", mr) if isinstance(mr, dict) else mr
                     if isinstance(rl, list) and rl:
-                        from shared_experience import partition_recall
-                        _regular, _shared = partition_recall(rl)
-                        pc_lines = [
-                            f"- {m.get('memory', str(m))}" if isinstance(m, dict)
-                            else f"- {str(m)}" for m in _regular]
-                        if pc_lines:
-                            existing_texts.append("\n".join(pc_lines))
-                            dedup_basis["pinecone_lines"] = len(pc_lines)
+                        pc_ctx, _ = _srv.format_pinecone_inject_contexts(rl)
+                        if pc_ctx and pc_ctx != "无相关深层记忆":
+                            existing_texts.append(pc_ctx)
+                            dedup_basis["pinecone_lines"] = pc_ctx.count("\n") + 1
         except Exception as e:
             _log(f"⚠️ [ContextPreview] Pinecone 基底获取失败（跳过）: "
                  f"exception_type={type(e).__name__}")
