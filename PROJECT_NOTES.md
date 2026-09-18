@@ -6332,3 +6332,27 @@ Home 页面能看到信件标题和摘要，但没有拆信入口；未拆信正
    看 `🧠 长期记忆注入：… injected=N` 行复核，随后可常开。
 6. 任何异常情况：把 `ACTIVE_MEMORY_INJECTION_ENABLED` 移除或设回 false 重启，
    即完全回到接入前行为（注入逻辑零执行）。
+
+---
+
+## 2026-09-18 — 注入提示词面板：隐藏画像/日总结，可视化 memory_items
+
+### 目标
+控制台 / miniapp「注入提示词」页只改**展示**：去掉画像与【最新日总结】显示，新增 memory_items（长期记忆 · 事实参考）注入可视化。真实聊天注入逻辑不变。
+
+### 改动
+| 文件 | 内容 |
+|------|------|
+| gateway.py | _capture_injected_prompt 增补 display_volatile（完整 volatile 去掉画像+日总结前缀）、memory_items_block（active memory 独立 system 正文）、stats.display_volatile / stats.memory_items；完整 olatile_block 仍保留兼容。 |
+| console.html | 页面副标题与 loadPrompts()：展示 display_volatile + 独立 memory_items 区块与字数 chip。 |
+| miniapp.html | 与 console 同步。 |
+
+### 未改
+- 真实 _inject_context 拼装与注入顺序（画像/日总结仍进模型）。
+- 无新环境变量。
+- QQ/TG 渠道仍不写入 /api/prompts 缓冲（既有行为）。
+
+### 验证
+- python -m py_compile gateway.py 通过。
+- 前缀剥离单测脚本：display_volatile 不含「关于…」与「最新日总结」。
+- 端到端面板：需重启网关后发一轮 Web 对话再刷新「注入提示词」页确认（门控 ACTIVE_MEMORY_INJECTION_ENABLED 关时 memory_items 区块显示「本轮未注入」属预期）。

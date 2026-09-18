@@ -3097,6 +3097,7 @@ class HostFixMiddleware:
         #    不破坏既有缓存前缀语义；绝不伪装 user/assistant）。失败安全：模块内部
         #    已全捕获降级为"无注入"，此处兜底除插入动作外的任何意外异常，只记日志
         #    跳过，绝不打断聊天主链路。
+        _am_block_for_snapshot = ""  # 供 /api/prompts 单独可视化 memory_items 注入
         if (_active_memory_injection_enabled()
                 and current_query and current_query.strip()):
             try:
@@ -3135,6 +3136,9 @@ class HostFixMiddleware:
                 # 防御：只插入模块承诺的 system 消息（绝不插入任何其他角色）
                 if (isinstance(_am_message, dict)
                         and _am_message.get("role") == "system"):
+                    _am_content = _am_message.get("content")
+                    if isinstance(_am_content, str) and _am_content.strip():
+                        _am_block_for_snapshot = _am_content
                     _am_idx = None
                     for i in range(len(msgs) - 1, -1, -1):
                         if msgs[i].get("role") == "user":
@@ -3149,21 +3153,35 @@ class HostFixMiddleware:
                      f"exception_type={type(e).__name__}")
 
         _summ_tag = "跳过" if _skip_core_summaries else f"{len(core_summaries)}字"
-        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{_summ_tag} + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字")
+        _log(f"🧠 [智能体] 注入完成：画像{len(user_prof)}字 + 总结{_summ_tag} + Pinecone{len(pinecone_context)}字 + 上文{len(history_msgs)}条" + (f" + 设备快照{len(device_snapshot)}字" if device_snapshot else "") + f" ｜ 稳定前缀{len(stable_system)}字 + 易变尾块{len(volatile_block)}字" + (f" + memory_items{len(_am_block_for_snapshot)}字" if _am_block_for_snapshot else ""))
 
-        # 📝 记录本轮注入的 volatile_block 快照（供 /api/prompts 调试面板查看，只留最新5条）
+        # 📝 记录本轮注入快照（供 /api/prompts 调试面板，只留最新5条）。
+        #    展示用 display_volatile：去掉画像 + 最新日总结；真实注入仍用完整 volatile_block。
+        #    memory_items_block：独立 system 消息正文（表 memory_items / 长期记忆事实参考）。
         try:
+            _profile_diary_prefix = (
+                f"关于{user_name}：\n{user_prof}\n"
+                f"【最新日总结】:\n{core_summaries}\n"
+            )
+            if volatile_block.startswith(_profile_diary_prefix):
+                _display_volatile = volatile_block[len(_profile_diary_prefix):]
+            else:
+                _display_volatile = volatile_block
             _capture_injected_prompt({
                 "ts": now_bj.strftime("%Y-%m-%d %H:%M:%S"),
                 "channel": channel_display,
                 "model": str(req_data.get("model", "")),
                 "user_preview": (current_query or "")[:300],
                 "volatile_block": volatile_block,
+                "display_volatile": _display_volatile,
+                "memory_items_block": _am_block_for_snapshot,
                 "stats": {
                     "volatile_total": len(volatile_block),
+                    "display_volatile": len(_display_volatile),
                     "pinecone": len(pinecone_context or ""),
                     "device_snapshot": len(device_snapshot or ""),
                     "history_msgs": len(history_msgs),
+                    "memory_items": len(_am_block_for_snapshot or ""),
                 },
             })
         except Exception:
@@ -3578,7 +3596,11 @@ class HostFixMiddleware:
             await _send_json_resp(send, 500, {"error": str(e)})
 
     async def _handle_prompts_api(self, send):
-        """返回最近注入的 volatile_block 快照（只读，最新在前，最多5条）。"""
+        """返回最近注入快照（只读，最新在前，最多5条）。
+
+        每条含：display_volatile（已去掉画像/最新日总结）、memory_items_block
+        （memory_items 长期记忆注入正文）、以及完整 volatile_block（兼容旧字段）。
+        """
         try:
             items = list(reversed(_injected_prompts_buffer))  # 最新在前
             await _send_json_resp(send, 200, {"items": items, "total": len(items)})

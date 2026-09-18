@@ -693,7 +693,7 @@ th,td{padding:10px 9px;}
       <!-- ===== 注入提示词（最新5条） ===== -->
       <section class="page" id="p-prompts">
         <div class="card">
-          <h3><i data-lucide="scroll-text" style="width:16px;height:16px"></i>注入提示词快照 <span class="sub">最近5轮 · volatile_block</span>
+          <h3><i data-lucide="scroll-text" style="width:16px;height:16px"></i>注入提示词快照 <span class="sub">最近5轮 · 易变尾块 + memory_items</span>
             <button class="ghost" style="float:right" onclick="loadPrompts()"><i data-lucide="refresh-cw"></i>刷新</button></h3>
           <div id="promptList"></div>
         </div>
@@ -1449,7 +1449,7 @@ function showLetterModal(it){
   document.getElementById("modalRoot").innerHTML=html;refreshIcons();
 }
 
-/* ============ 注入提示词快照（最近5轮 volatile_block） ============ */
+/* ============ 注入提示词快照（最近5轮：易变尾块去掉画像/日总结 + memory_items） ============ */
 async function loadPrompts(){
   const box=document.getElementById("promptList");
   box.innerHTML='<div class="empty">加载中…</div>';
@@ -1458,19 +1458,28 @@ async function loadPrompts(){
     if(!d)return;
     const list=d.items||[];
     if(!list.length){box.innerHTML='<div class="empty"><i data-lucide="scroll-text"></i><br>暂无注入记录<br><span style="font-size:12px">发起一次对话后点刷新查看</span></div>';refreshIcons();return;}
+    const preStyle="white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:12px;line-height:1.5;max-height:420px;overflow:auto;background:rgba(128,128,128,.1);padding:10px;border-radius:6px;margin-top:6px";
     box.innerHTML=list.map((p,idx)=>{
       const st=p.stats||{};
+      const displayVol=(p.display_volatile!=null?p.display_volatile:(p.volatile_block||""));
+      const memBlock=(p.memory_items_block||"");
       const chips=[
-        "volatile "+(st.volatile_total||0)+"字",
+        "展示尾块 "+(st.display_volatile!=null?st.display_volatile:displayVol.length)+"字",
+        "memory_items "+(st.memory_items!=null?st.memory_items:memBlock.length)+"字",
         "Pinecone "+(st.pinecone||0)+"字",
         "设备快照 "+(st.device_snapshot||0)+"字",
         "上文 "+(st.history_msgs||0)+"条",
       ].map(c=>`<span class="tag mute" style="margin:2px">${esc(c)}</span>`).join("");
+      const memHtml=memBlock
+        ? `<div class="body" style="margin-top:10px"><b>memory_items（长期记忆 · 事实参考）：</b></div><pre style="${preStyle}">${esc(memBlock)}</pre>`
+        : `<div class="body" style="margin-top:10px;color:var(--sub)"><b>memory_items：</b>本轮未注入（门控关 / 召回为空 / 去重后为空）</div>`;
       return `<div class="item">
         <div class="meta"><span>#${idx+1} · ${esc(p.channel||"—")} · ${esc(p.model||"—")}</span><span>${esc(p.ts||"—")}</span></div>
         <div class="body" style="margin-top:4px"><b>用户消息：</b>${esc(p.user_preview||"（空）")}</div>
         <div style="margin:6px 0">${chips}</div>
-        <pre style="white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:12px;line-height:1.5;max-height:420px;overflow:auto;background:rgba(128,128,128,.1);padding:10px;border-radius:6px;margin-top:6px">${esc(p.volatile_block||"")}</pre>
+        <div class="body"><b>易变尾块</b><span style="color:var(--sub);font-size:12px">（已去掉画像 / 最新日总结）</span></div>
+        <pre style="${preStyle}">${esc(displayVol)}</pre>
+        ${memHtml}
       </div>`;
     }).join("");
     refreshIcons();
