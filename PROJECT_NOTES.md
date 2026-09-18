@@ -8,7 +8,8 @@
 
 | 文件 | 角色 |
 |------|------|
-| `server.py` | MCP 工具层（27 个工具），入口文件 |
+| `mcp_http.py` | MCP HTTP 传输组装（SSE 保活 / 会话丢失提示 / Streamable HTTP） |
+| `server.py` | MCP 工具层，入口文件 |
 | `gateway.py` | ASGI 中间件（/v1/* 代理、/api/* 管理、/qq-ws、/console） |
 | `heartbeat.py` | 后台心跳线程（问候/日记/TG/提醒/日程/邮件/热同步） |
 | `napcat.py` | NapCat QQ 接入（反向 WS 被动模式） |
@@ -29,6 +30,20 @@
 - 健康检查通过 ✅（已验证返回 200）
 
 ## 📦 变更日志
+
+### MCP 传输：SSE 保活 + 会话丢失提示 + Streamable HTTP（2026-09-18）
+
+**内容**：
+- 新增 `mcp_http.py`：组装 MCP HTTP 入口。SSE keepalive ping 固定 20 秒（sse-starlette comment ping `: keepalive`）；`POST /messages/` 遇到 SDK 原文 `Could not find session` 时改为 HTTP 409 JSON-RPC（`mcp_session_not_found`，提示重连 `/sse`），不再直接硬 404。不在服务端凭空恢复会话（SSE 协议要求结果从原 GET /sse 推回，POST 无法代回工具结果）。
+- 同时挂载 FastMCP `streamable_http_app()` 到 `/mcp`，lifespan 进入 `session_manager.run()`。原 `/sse` + `/messages/` 保留。
+- `server.py` 启动改为 `build_mcp_http_app(mcp)`。
+- `gateway.py`：`API_SECRET` 保护范围增加 `/mcp`（精确匹配，不误伤其它路径）。
+- 无新增环境变量。`VARIABLES.md` / `.env.example` / `HOME_RUNTIME_GUIDE.md` 同步 `/mcp` 与双传输说明。
+
+**验证**：
+- `python -m unittest test_mcp_http -v`：**7/7 通过**（会话 404→409 JSON-RPC；202/其它 404 不改写；SSE ping=20s；组合路由含 `/sse` `/messages` `/mcp` 且 `/messages` 已包 rewriter；`/mcp` 受 API_SECRET 拦截）
+- `python -m py_compile mcp_http.py gateway.py server.py test_mcp_http.py` 通过
+- 未做：真机 RikkaHub 连生产 SSE/Streamable HTTP 的端到端长连接；未在反代上实测 20s ping 是否足以覆盖平台空闲超时
 
 ### 经期记录 P4 —— 双端 UI（2026-09-18）
 

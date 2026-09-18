@@ -4004,18 +4004,8 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 10000))
 
-    # 🛡️ 获取可挂载的 MCP HTTP app（v1 用 sse_app；若未来 v1 内更名则自动切换）
-    if hasattr(mcp, "sse_app"):
-        mcp_http_app = mcp.sse_app()
-        _mcp_transport = "sse (/sse)"
-    elif hasattr(mcp, "streamable_http_app"):
-        mcp_http_app = mcp.streamable_http_app()
-        _mcp_transport = "streamable-http (/mcp)"
-    elif hasattr(mcp, "http_app"):
-        mcp_http_app = mcp.http_app(transport="sse")
-        _mcp_transport = "http (sse)"
-    else:
-        raise SystemExit("❌ 当前 MCP SDK 不提供任何可挂载的 HTTP app，请锁定 mcp>=1.10,<2.0")
+    from mcp_http import build_mcp_http_app
+    mcp_http_app, _mcp_transport = build_mcp_http_app(mcp)
 
     app = HostFixMiddleware(mcp_http_app)
     print(f"🚀 Generic MCP Gateway running on port {port}... (MCP transport: {_mcp_transport})")

@@ -4,7 +4,7 @@
 特性：
 - 修正反代场景下的 Host 头
 - 统一处理 CORS 预检
-- 🔐 全局 API 安全拦截（校验 API_SECRET，对 /sse /messages /api/* 强制鉴权）
+- 🔐 全局 API 安全拦截（校验 API_SECRET，对 /sse /messages /mcp /api/* 强制鉴权）
 - 暴露一组管理 / 健康检查 / 配置接口
 - 🧠 OpenAI 兼容代理 (/v1/chat/completions, /v1/models)：
     * 支持纯透传模式（无 Supabase 时）
@@ -2067,7 +2067,7 @@ class HostFixMiddleware:
 
         # ---------- 根路径：返回占位（或前端 index.html）----------
         if scope["path"] == "/":
-            html = "<h1>🚪 MCP Gateway</h1><p>Endpoints: <code>/health</code> <code>/sse</code> <code>/v1/chat/completions</code></p>"
+            html = "<h1>🚪 MCP Gateway</h1><p>Endpoints: <code>/health</code> <code>/sse</code> <code>/mcp</code> <code>/v1/chat/completions</code></p>"
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"text/html; charset=utf-8")]})
             await send({"type": "http.response.body", "body": html.encode("utf-8")})
@@ -2086,8 +2086,8 @@ class HostFixMiddleware:
             await self._handle_openai_proxy(scope, receive, send)
             return
 
-        # 🛡️ 全局 API 安全拦截 (涵盖 /api/* /sse /messages)
-        if (scope["path"].startswith("/api/") or scope["path"].startswith("/sse") or scope["path"].startswith("/messages")) and scope["method"] != "OPTIONS":
+        # 🛡️ 全局 API 安全拦截 (涵盖 /api/* /sse /messages /mcp)
+        if _is_mcp_protected_path(scope["path"]) and scope["method"] != "OPTIONS":
             if not await _check_api_secret(scope, send):
                 return
 
@@ -7586,6 +7586,17 @@ def _normalize_letter_key(raw_key: str):
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in key):
         return None
     return key
+
+
+def _is_mcp_protected_path(path: str) -> bool:
+    """受 API_SECRET 保护的 MCP/管理入口。/mcp 只匹配自身，避免误伤其它路径。"""
+    return (
+        path.startswith("/api/")
+        or path.startswith("/sse")
+        or path.startswith("/messages")
+        or path == "/mcp"
+        or path.startswith("/mcp/")
+    )
 
 
 async def _check_api_secret(scope, send):

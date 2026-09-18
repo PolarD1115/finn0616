@@ -27,7 +27,7 @@ MCP（Model Context Protocol，模型上下文协议）是一种让 AI 客户端
 | 进程 A · 消息进程 | `server.py` | `GATEWAY_ROLE=message` | MCP 工具 + `/v1` 聊天代理 + QQ/TG 实时收发，对外提供服务 |
 | 进程 B · 后台进程 | `background.py` | `GATEWAY_ROLE=background` | 主动思考、日记、总结、提醒、日程、宠物 tick、环境热同步 |
 
-> SSE 是一种由服务器持续向客户端发送事件的连接方式，当前网关用它承载 MCP 会话。
+> SSE 是一种由服务器持续向客户端发送事件的连接方式。网关同时提供 SSE（`/sse`）和新版 Streamable HTTP（`/mcp`）两种 MCP 传输。
 
 ### 1.2 Home Runtime（新家庭运行时）
 
@@ -277,7 +277,7 @@ https://你的域名/miniapp
 | 变量 | 是否必填 | 用途 | 缺失时表现 |
 |---|:---:|---|---|
 | `PORT` | 建议填 | 服务监听端口 | 缺省回退 10000 |
-| `API_SECRET` | **必填** | 连接网关的访问密钥（保护 `/api/*`、`/sse`、`/messages`） | 受保护入口返回 **503**；`/v1/*` 在此情况下**不拦截**（见下方说明） |
+| `API_SECRET` | **必填** | 连接网关的访问密钥（保护 `/api/*`、`/sse`、`/messages`、`/mcp`） | 受保护入口返回 **503**；`/v1/*` 在此情况下**不拦截**（见下方说明） |
 | `SUPABASE_URL` | **必填** | Supabase 项目地址 | 数据库功能全部禁用（记忆、画像、Home Runtime、钱包等） |
 | `SUPABASE_KEY` | **必填** | Supabase **anon** key（用于只读查询，受 RLS 保护） | 读查询全部返回空 |
 | `SUPABASE_SERVICE_KEY` | **必填** | Supabase **service_role** key（用于 RPC 写操作：种植/烹饪/钱包等） | 写操作全部返回 `SERVICE_KEY_MISSING`；读操作不受影响 |
@@ -286,7 +286,7 @@ https://你的域名/miniapp
 | `CHAT_MODEL_NAME` | 可填 | 主模型名称 | 缺省 `abab6.5s-chat` |
 
 > ⚠️ **关于 `API_SECRET` 与 `/v1/*` 的一个细节**（以代码为准）：
-> 当 `API_SECRET` 为空时，`/api/*`、`/sse`、`/messages` 返回 503；但 `/v1/*`（OpenAI 兼容代理）的鉴权是"可选"的——仅当 `API_SECRET` 非空时才校验，为空时 `/v1/*` **完全开放**。
+> 当 `API_SECRET` 为空时，`/api/*`、`/sse`、`/messages`、`/mcp` 返回 503；但 `/v1/*`（OpenAI 兼容代理）的鉴权是"可选"的——仅当 `API_SECRET` 非空时才校验，为空时 `/v1/*` **完全开放**。
 > 因此**务必配置 `API_SECRET`**，否则聊天代理将无鉴权暴露。`VARIABLES.md` 中"`/v1/*` 未配置时返回 503"的描述与代码不符，以代码为准。
 
 ### 示例（脱敏，请勿使用这些值）
@@ -343,11 +343,16 @@ https://你的域名/miniapp       （移动端配置面板 HTML）
 
 ### 检查 3：MCP 入口（需要认证）
 
-MCP 使用 **SSE** 传输：
+MCP 同时支持两种传输（二选一，不要混用）：
 
-- **SSE 端点**：`GET https://你的域名/sse`
-- **Messages 端点**：`POST https://你的域名/messages/?session_id=<由 SSE 握手下发>`
-  - 注意：messages 路径带尾部斜杠 `/messages/`，session_id 由 SSE 握手的 `endpoint` 事件下发，不用手填。
+- **SSE（旧版，仍可用）**
+  - SSE 端点：`GET https://你的域名/sse`
+  - Messages 端点：`POST https://你的域名/messages/?session_id=<由 SSE 握手下发>`
+  - messages 路径带尾部斜杠 `/messages/`，session_id 由 SSE 握手的 `endpoint` 事件下发，不用手填。
+  - SSE 长连接会定时发送 keepalive 心跳。若会话已失效，POST 会返回 **409** JSON（`mcp_session_not_found`），请在客户端关闭后重新打开该 MCP 服务。
+- **Streamable HTTP（新版，推荐能选就选）**
+  - 端点：`https://你的域名/mcp`
+  - 客户端传输类型选 Streamable HTTP / HTTP，不要再填 `/sse`。
 
 认证方式（`API_SECRET` 放在以下任一 Header，二者等价）：
 
@@ -359,7 +364,7 @@ MCP 使用 **SSE** 传输：
 - **错误密钥**（或缺失）：返回 HTTP **401** `{"error":"Unauthorized: Missing or invalid API key"}`
 - **空密钥**（`API_SECRET` 未配置）：返回 HTTP **503** `{"error":"Service unavailable: API_SECRET not configured"}`
 - **客户端不支持自定义 Header 时**：部分 MCP 客户端只支持 `Authorization: Bearer`，那就用这个 Header。本网关同时支持 `Authorization` 和 `X-Api-Key`。
-- 当前网关**不支持 Streamable HTTP**（没有 `/mcp` 单一端点）；生产环境只走 SSE。
+- 当前网关同时支持 SSE（`/sse`）和 Streamable HTTP（`/mcp`）。客户端选哪种传输，就填对应地址。
 
 ### 检查 4：工具发现
 
@@ -380,8 +385,8 @@ MCP 客户端连接远程服务通常需要填写以下字段：
 | 字段 | 应填内容 |
 |---|---|
 | 名称 | 自定义，如 `AI Companion Home` |
-| Transport（传输类型） | **SSE** |
-| Server URL（服务地址） | `https://你的域名/sse` |
+| Transport（传输类型） | **SSE** 或 **Streamable HTTP**（与 URL 匹配） |
+| Server URL（服务地址） | SSE 填 `https://你的域名/sse`；Streamable HTTP 填 `https://你的域名/mcp` |
 | Headers（请求头） | `Authorization: Bearer YOUR_API_SECRET`（或 `X-Api-Key: YOUR_API_SECRET`） |
 | 是否启用 | 是 |
 
@@ -399,14 +404,14 @@ MCP 客户端连接远程服务通常需要填写以下字段：
 ```
 
 > 如果你的客户端配置不是 JSON 形式（而是表单字段），按上表对应填写即可，不必强行用 JSON。
-> Transport 类型必须选 **SSE**，不是 Streamable HTTP。
+> Transport 与 URL 必须匹配：SSE 配 `/sse`，Streamable HTTP 配 `/mcp`。
 
 ### 6.2 RikkaHub
 
-> 在 RikkaHub 的 MCP 服务配置中新增远程服务，选择当前网关支持的 **SSE** 传输，填写 Zeabur 域名（`https://你的域名/sse`）和认证 Header（`Authorization: Bearer YOUR_API_SECRET`）。不同版本的菜单名称可能不同，以客户端当前界面为准。
+> 在 RikkaHub 的 MCP 服务配置中新增远程服务。能选 Streamable HTTP 时填 `https://你的域名/mcp`；否则选 SSE，填 `https://你的域名/sse`。认证 Header 都是 `Authorization: Bearer YOUR_API_SECRET`。不同版本的菜单名称可能不同，以客户端当前界面为准。
 
 > 说明：RikkaHub 不同版本的界面布局会变化，本指南不臆测具体按钮名称和位置。
-> 核心是三件事：**选 SSE 传输、填 `/sse` 地址、填 `API_SECRET` 认证头**。
+> 核心是三件事：**传输类型与地址匹配（SSE=`/sse` 或 Streamable HTTP=`/mcp`）、填 `API_SECRET` 认证头**。
 
 ### 6.3 不要填写的内容
 
@@ -633,7 +638,7 @@ action_550e8400e29b41d4a716446655440000
 原因：API_SECRET 未配置（为空）。
 表现：{"error":"Service unavailable: API_SECRET not configured"}
 解决：在 Zeabur 环境变量里配置 API_SECRET，重新部署。
-注意：仅 /api/* /sse /messages 返回 503；/v1/* 在 API_SECRET 为空时不拦截（见第 4 节）。
+注意：仅 /api/* /sse /messages /mcp 返回 503；/v1/* 在 API_SECRET 为空时不拦截（见第 4 节）。
 ```
 
 ### HTTP 401
@@ -650,21 +655,21 @@ action_550e8400e29b41d4a716446655440000
 依次检查：
 
 1. Zeabur 服务是否在线（`/health` 是否返回 200）。
-2. URL 是否正确（应为 `https://你的域名/sse`）。
-3. Transport 是否选了 **SSE**（不是 Streamable HTTP）。
+2. URL 是否与传输类型匹配（SSE 用 `/sse`，Streamable HTTP 用 `/mcp`）。
+3. Transport 是否与 URL 一致（不要 SSE 填 `/mcp`，或 HTTP 填 `/sse`）。
 4. Header 是否正确（`Authorization: Bearer <API_SECRET>`）。
 5. 是否用了 HTTPS（不是 HTTP）。
-6. 路径是否正确（`/sse`，不是 `/mcp`）。
+6. 路径是否完整（不要只填根域名）。
 7. 查看 Zeabur 日志有无报错。
-8. 客户端是否支持远程 MCP（SSE 类型）。
+8. 客户端是否支持远程 MCP（SSE 或 Streamable HTTP）。
 
 ### 工具列表为空
 
 检查：
 
-1. 是否连到了正确的 MCP 入口（`/sse`）。
+1. 是否连到了正确的 MCP 入口（SSE 用 `/sse`，Streamable HTTP 用 `/mcp`）。
 2. 是否通过了认证（401 会导致连不上）。
-3. FastMCP transport 是否匹配（客户端选 SSE）。
+3. 客户端传输类型是否与 URL 匹配。
 4. Zeabur 是否启动了正确入口（`run.py`，不是单独 `server.py`）。
 5. 查看日志是否有 MCP SDK 版本错误（需要 `mcp>=1.10,<2.0`）。
 
@@ -798,6 +803,7 @@ home_notes
 ```text
 SSE 端点：    https://你的域名/sse
 Messages 端点：https://你的域名/messages/?session_id=<由SSE握手下发>
+Streamable HTTP：https://你的域名/mcp
 健康检查：    https://你的域名/health
 控制台：      https://你的域名/console
 移动面板：    https://你的域名/miniapp

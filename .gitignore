@@ -79,6 +79,8 @@ files.txt
 !test_memory_profile_reflect_phaseD2.py
 !test_memory_persona_reflect_phaseD2b.py
 !test_memory_diary_bridge_phaseD3.py
+# MCP HTTP 传输：SSE 保活 / 会话丢失提示 / Streamable HTTP
+!test_mcp_http.py
 
 # 敏感凭据
 credentials.json
