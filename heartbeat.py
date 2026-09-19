@@ -246,6 +246,42 @@ async def async_autonomous_life():
 # 1.5 每日日记生成 (深度睡眠模式)
 # ==========================================
 
+def _parse_diary_hhmm(value, default_h=4, default_m=0):
+    """解析 HH:MM（或 H:MM）为 (hour, minute)；非法则回退默认。"""
+    try:
+        text = str(value or "").strip()
+        parts = text.split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("out of range")
+        return h, m
+    except Exception as e:  # noqa: BLE001 —— 配置容错；回退默认切点
+        print(f"⚠️ [日记日切] 时间解析失败 value={value!r} "
+              f"err={type(e).__name__}，回退 {default_h:02d}:{default_m:02d}")
+        return default_h, default_m
+
+
+def _diary_day_cutoff_hm():
+    """日记「一日」切点（北京时间），默认 04:00。环境变量 DIARY_DAY_CUTOFF。"""
+    return _parse_diary_hhmm(os.environ.get("DIARY_DAY_CUTOFF", "04:00"), 4, 0)
+
+
+def _diary_day_window(now_bj):
+    """计算「昨日回溯」记忆窗口：[昨天切点, 今天切点)。
+
+    半夜聊天归入「尚未切日」的那天，避免 0 点后内容从当日总结里丢掉。
+    返回 (yesterday_date, iso_start, iso_end)。
+    """
+    cutoff_h, cutoff_m = _diary_day_cutoff_hm()
+    yesterday = (now_bj - datetime.timedelta(days=1)).date()
+    today = now_bj.date()
+    hhmm = f"{cutoff_h:02d}:{cutoff_m:02d}:00"
+    iso_start = f"{yesterday.isoformat()}T{hhmm}+08:00"
+    iso_end = f"{today.isoformat()}T{hhmm}+08:00"
+    return yesterday, iso_start, iso_end
+
+
 def _clean_old_memories(supabase_client):
     """🔒 第1阶段（目标D）：旧数据自动清理 —— 安全暂停版，不执行任何删除。
 
@@ -278,14 +314,15 @@ def _layered_summary_enabled() -> bool:
 
 def _fetch_layered_memories(sb_service, user_id, since_iso,
                             memory_types=("long_term", "moment", "memo"),
-                            limit=30, min_importance=None):
-    """读取 since 之后的 active memory_items（指定类型），返回 content 列表。
+                            limit=30, min_importance=None, until_iso=None):
+    """读取 since 之后（可选 until 之前）的 active memory_items，返回 content 列表。
 
     阶段 C1：给四级总结叠加结构化分层记忆（事实/情感坐标/备忘）。
     - 只读 SELECT（service_role 客户端 server.supabase_service），不新建客户端；
     - 时间过滤列用 created_at（写入时刻，NOT NULL 带时区）：语义是「这一期产生了
       哪些记忆」，与日/周/月/年叙事窗口一致；valid_at 是「事实生效时刻」、可空
       且可能远早于当期（如长期偏好），不适合做当期窗口过滤；
+    - until_iso 可选：日总结传入切点上界，与 memories 流水窗口对齐；周/月/年可不传；
     - 排序 importance DESC, valid_at DESC；limit 防爆（默认 30）；
     - current（会过期的临时状态）与 core（固定画像）由调用方通过 memory_types
       参数排除，本函数不硬编码排除；
@@ -309,6 +346,8 @@ def _fetch_layered_memories(sb_service, user_id, since_iso,
              # D3 隐私：私密日记 moment 不得进入周/月/年总结 prompt，
              # 否则提炼结果会写入普通 memories 被通用搜索读到。
              .neq("source", "private_diary"))
+        if until_iso:
+            q = q.lt("created_at", until_iso)
         if min_importance is not None:
             q = q.gte("importance", int(min_importance))
         res = (q.order("importance", desc=True)
@@ -347,12 +386,12 @@ async def _perform_deep_dreaming():
     print("🌌 进入深度睡眠：正在整理昨日记忆，准备生成日记...")
     try:
         now_bj = _get_now_bj()
-        yesterday = (now_bj - datetime.timedelta(days=1)).date()
-        # 精确范围：[昨天0点, 今天0点)，避免拉到今天的数据
+        # 精确范围：[昨天切点, 今天切点)，默认 04:00（DIARY_DAY_CUTOFF）。
+        # 半夜聊天归入「尚未切日」的那天，避免 0 点后内容从当日总结丢掉。
         # ⚠️ created_at 是 timestamptz 列：查询字符串必须带时区(+08:00)，
         # 否则无时区字符串会被按会话时区(UTC)解释，导致日记日期错 8 小时。
-        iso_start = f"{yesterday.isoformat()}T00:00:00+08:00"
-        iso_end = f"{now_bj.date().isoformat()}T00:00:00+08:00"
+        yesterday, iso_start, iso_end = _diary_day_window(now_bj)
+        print(f"🌌 日记窗口 [{iso_start}, {iso_end}) → 昨日回溯 {yesterday}")
 
         # 拉取昨日全部记忆（流水 + 已归档总结）
         def _fetch_yesterday():
@@ -377,11 +416,12 @@ async def _perform_deep_dreaming():
         # 🧠 阶段 C1：日总结顺带附加昨日沉淀的 moment/memo 分层记忆（情感坐标/
         #    备忘；importance>=6 前 10 条防爆）。读取失败/为空则不附加，日记
         #    输入源仍是昨日 memories 流水（此处只是增强，不改主输入）。
+        #    until_iso=iso_end：与流水窗口对齐，避免切点之后的记忆混入。
         if _layered_summary_enabled():
             layered_daily = await asyncio.to_thread(
                 _fetch_layered_memories,
                 supabase_service, _resolve_pinecone_user_id(),
-                iso_start, ("moment", "memo"), 10, 6)
+                iso_start, ("moment", "memo"), 10, 6, iso_end)
             if layered_daily:
                 context += ("【昨日分层记忆 · 情感坐标/备忘】:\n"
                             + "\n".join(f"- {c}" for c in layered_daily)
@@ -993,13 +1033,24 @@ async def async_diary_worker():
     """
     📔 每日日记生成器：独立协程，到指定时间自动触发深度日记生成。
     - 启动时检查并补写昨日缺失的日记
-    - 每天到 DIARY_TIME（默认凌晨3点）自动触发
+    - 每天到 DIARY_TIME（默认凌晨 4 点）自动触发
+    - 记忆窗口由 DIARY_DAY_CUTOFF（默认 04:00）决定：[昨天切点, 今天切点)
     - 与主动问候循环解耦，互不干扰
     """
     from server import supabase
 
     print("📔 每日日记生成神经已上线...")
-    diary_time = os.environ.get("DIARY_TIME", "03:00")
+    diary_time = os.environ.get("DIARY_TIME", "04:00").strip() or "04:00"
+    cutoff_h, cutoff_m = _diary_day_cutoff_hm()
+    cutoff_hm = f"{cutoff_h:02d}:{cutoff_m:02d}"
+    try:
+        dt_h, dt_m = _parse_diary_hhmm(diary_time, 4, 0)
+        if (dt_h, dt_m) < (cutoff_h, cutoff_m):
+            print(f"⚠️ [日记] DIARY_TIME={diary_time} 早于 DIARY_DAY_CUTOFF={cutoff_hm}，"
+                  f"切点前一小时窗口可能漏记；建议 DIARY_TIME ≥ {cutoff_hm}")
+    except Exception as e:  # noqa: BLE001 —— 仅告警，不阻断启动
+        print(f"⚠️ [日记] DIARY_TIME/CUTOFF 比对失败: {type(e).__name__}")
+    print(f"📔 日记配置 DIARY_TIME={diary_time} DIARY_DAY_CUTOFF={cutoff_hm}")
     last_run_date = ""
 
     # 启动时补写昨日日记（如果还没写过）
